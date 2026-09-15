@@ -1,0 +1,4 @@
+# Generated artifacts: frames, intermediates, and compiled models.
+# Only a hardware-validated cvimodel belongs in the repo, under the board overlay.
+work/
+__pycache__/

@@ -1,0 +1,11 @@
+# Everything here is staged by apps/tinytag_detect/build.sh from sources kept in
+# apps/tinytag_detect/ and tools/tinytag_cvimodel/. Regenerate rather than
+# commit, so the staged copies cannot drift from their sources.
+usr/local/bin/tinytag_detect
+usr/local/bin/run_tinytag.sh
+mnt/cvimodel/*.ttgold
+
+# The cvimodel is left untracked on purpose: per tools/tinytag_cvimodel/README.md
+# only a *hardware-validated* model should be committed, and this one has so far
+# only passed host simulation. Remove this line once it has run on a board.
+mnt/cvimodel/*.cvimodel
