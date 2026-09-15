@@ -4,6 +4,8 @@
 usr/local/bin/tinytag_detect
 usr/local/bin/run_tinytag.sh
 mnt/cvimodel/*.ttgold
+mnt/data/tinytag-samples/
+root/.ssh/
 
 # The cvimodel is left untracked on purpose: per tools/tinytag_cvimodel/README.md
 # only a *hardware-validated* model should be committed, and this one has so far

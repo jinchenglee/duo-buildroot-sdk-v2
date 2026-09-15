@@ -1,0 +1,3 @@
+# Public keys are not secret, but they identify your machines and this repo
+# has a public remote. Remove this line if you want them tracked -- see README.md.
+*.pub

@@ -69,6 +69,29 @@ cmake --install "${BUILD_DIR}"
 # --- stage the launcher and the model -------------------------------------
 install -Dm755 "${APP_DIR}/run.sh" "${OVERLAY_DIR}/usr/local/bin/run_tinytag.sh"
 
+# Sample frames ship with the app, so a freshly flashed board can run the
+# detector immediately. See samples/README.md for what each one exercises.
+if [ -d "${APP_DIR}/samples" ]; then
+    SAMPLES_DST="${OVERLAY_DIR}/mnt/data/tinytag-samples"
+    install -d "${SAMPLES_DST}"
+    rm -f "${SAMPLES_DST}"/*
+    sample_count=0
+    for sample in "${APP_DIR}"/samples/*; do
+        case "${sample}" in *.md) continue ;; esac
+        [ -f "${sample}" ] || continue
+        install -m 0644 "${sample}" "${SAMPLES_DST}/"
+        sample_count=$((sample_count + 1))
+    done
+    info "Staged ${sample_count} sample image(s) -> /mnt/data/tinytag-samples/"
+fi
+
+# cmake --install and install(1) create parent directories using the caller's
+# umask, which in this repo is 0007 -- that would put mode 0770 directories into
+# the image. Force the conventional 0755 so the overlay does not depend on the
+# destination happening to exist already in the rootfs skeleton.
+find "${OVERLAY_DIR}" -type d -exec chmod 0755 {} +
+chmod 0700 "${OVERLAY_DIR}/root/.ssh" 2>/dev/null || true
+
 CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${TOP_DIR}/tools/tinytag_cvimodel/work/tinytag-v40c.int8.cvimodel}"
 if [ -f "${CVIMODEL_SRC}" ]; then
     install -Dm644 "${CVIMODEL_SRC}" "${OVERLAY_DIR}/mnt/cvimodel/$(basename "${CVIMODEL_SRC}")"
