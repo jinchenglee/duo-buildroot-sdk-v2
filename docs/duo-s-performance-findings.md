@@ -41,16 +41,46 @@ Reproduce with:
 network could run 3-4x per frame and the pipeline would still be CV-bound.
 Optimization effort belongs in stage two, or in reducing how many ROIs reach it.
 
-## Cheapest available wins
+## The frame time is bounded, and N is the knob
 
-1. **Fewer crops.** 7 proposals produced 4 tags; the other 3 were neural false
-   positives that still cost 0.93 ms each -- ~2.8 ms, a quarter of the frame.
-   `--thres` above 0.35 and `--iou` below 0.5 trade recall for throughput
-   linearly and need no code changes. Sweep them with `--repeat 50`.
-2. **A newer OpenCV.** The board ships OpenCV **3.2** (2016). 4.x has
+Proposals without a real tag inside are inherent -- the neural stage proposes,
+the CV stage disposes, and some proposals will always decode to nothing. That
+is not waste to be eliminated; it is the cost of recall.
+
+What matters is that the cost is **bounded**. `decode_proposals()` sorts peaks
+by confidence, truncates to `max_proposals` (`--max`, default 8), and only then
+runs IoU suppression, so the number of crops reaching the decoder is capped
+regardless of scene content. Worst-case frame time is therefore deterministic:
+
+    fixed = pre_process 1.73 + inference 2.11 + decode 0.90 = 4.74 ms
+    total = fixed + N x 0.93 ms
+
+| N (`--max`) | crop_decode | total | guaranteed fps |
+|---|---|---|---|
+| 4 | 3.72 ms | 8.46 ms | 118 |
+| 6 | 5.58 ms | 10.32 ms | 97 |
+| **8** (current default) | **7.44 ms** | **12.18 ms** | **82** |
+| 12 | 11.16 ms | 15.90 ms | 63 |
+| 16 | 14.88 ms | 19.62 ms | 51 |
+| 20 (training repo default) | 18.60 ms | 23.34 ms | 43 |
+
+The 11.25 ms measured above was 7 crops, one under the cap.
+
+**`--max` is the latency knob; `--thres` is the recall knob**, and they
+interact in only one direction. Once enough peaks clear the threshold to fill
+the cap, lowering the threshold further costs nothing -- it only changes which
+candidates win the top-N slots. On K230, threshold 0.20 yielded ~14
+proposals/frame against ~7 at 0.35; with N=8 both saturate, so the lower
+threshold buys recall for free. Pick N from the latency budget, then pick the
+threshold as low as precision tolerates.
+
+## Other levers
+
+1. **A newer OpenCV.** The board ships OpenCV **3.2** (2016). 4.x has
    substantially better aarch64 NEON coverage in exactly the functions ArUco
    Nano leans on. Untested here; listed as the next lever, not a promise.
-3. Algorithmic work on the decoder, last.
+2. Algorithmic work on the decoder, last. Note there is no thread parallelism
+   to exploit -- see "Machine characteristics".
 
 ## Comparison with K230 -- read carefully
 

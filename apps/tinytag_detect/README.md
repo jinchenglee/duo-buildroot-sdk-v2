@@ -123,6 +123,14 @@ run_tinytag.sh frame.jpg --repeat 20             # extra args pass through
 `0.35` roughly halves the proposal count versus the training repo's frozen
 `0.20`, for only a slight drop in recall.
 
+With `--decode` on, note that `TINYTAG_MAX` is the **latency** knob and
+`TINYTAG_THRES` the **recall** knob. `decode_proposals` truncates to
+`max_proposals` before IoU suppression, so the number of crops the decoder sees
+is capped regardless of scene, and worst-case frame time is
+`4.74 ms + N x 0.93 ms`. Once enough peaks clear the threshold to fill the cap,
+lowering the threshold further is free -- it only changes which candidates take
+the top-N slots. See `docs/duo-s-performance-findings.md` for the table.
+
 Or call the binary directly:
 
 ```
