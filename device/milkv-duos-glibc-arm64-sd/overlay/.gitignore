@@ -7,7 +7,13 @@ mnt/cvimodel/*.ttgold
 mnt/data/tinytag-samples/
 root/.ssh/
 
-# The cvimodel is left untracked on purpose: per tools/tinytag_cvimodel/README.md
-# only a *hardware-validated* model should be committed, and this one has so far
-# only passed host simulation. Remove this line once it has run on a board.
-mnt/cvimodel/*.cvimodel
+# The cvimodel IS tracked. Per tools/tinytag_cvimodel/README.md only a
+# hardware-validated model belongs in the repo, and this one qualifies: it ran
+# on a Duo S and reproduced tpu-mlir's simulator bit-exactly (worst element
+# 0.000000) -- see docs/duo-s-performance-findings.md. Committing it means a
+# fresh clone can build a working detector without the ONNX model, the
+# calibration footage, or the tpu-mlir container.
+#
+# The ONNX and .pt sources stay external, as does the .ttgold golden bundle
+# (3.2 MB, regenerate with tools/tinytag_cvimodel/make_golden.py when needed
+# for --selftest).
