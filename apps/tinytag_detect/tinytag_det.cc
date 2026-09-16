@@ -399,3 +399,92 @@ void TinyTagDet::draw_proposals(cv::Mat &bgr, const std::vector<Proposal> &propo
                     cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 0), 1);
     }
 }
+
+void TinyTagDet::post_process(const cv::Mat &full_res_gray,
+                              const std::vector<Proposal> &proposals,
+                              std::vector<TinyTagResult> &results)
+{
+    const double started = now_ms();
+    results.clear();
+    crop_count_ = 0;
+
+    if (!decoder_)
+    {
+        crop_decode_ms_ = 0.0;
+        return;
+    }
+    if (full_res_gray.empty() || full_res_gray.type() != CV_8UC1)
+        throw std::runtime_error("post_process expects a non-empty CV_8UC1 image");
+
+    for (const auto &proposal : proposals)
+    {
+        // Clamp to integer pixels inside the frame. decode_proposals() already
+        // clamped to the band, but rounding can still push a box one pixel out.
+        const int x0 = std::max(0, static_cast<int>(std::floor(proposal.roi.x)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(proposal.roi.y)));
+        const int x1 = std::min(full_res_gray.cols,
+                                static_cast<int>(std::ceil(proposal.roi.x + proposal.roi.width)));
+        const int y1 = std::min(full_res_gray.rows,
+                                static_cast<int>(std::ceil(proposal.roi.y + proposal.roi.height)));
+        if (x1 - x0 < 8 || y1 - y0 < 8)
+            continue; // too small for the decoder's minSize to ever accept
+
+        // Zero-copy view; the decoder respects .step so no clone is needed.
+        const cv::Mat crop = full_res_gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+        ++crop_count_;
+
+        for (const auto &tag : decoder_->detect(crop))
+        {
+            TinyTagResult result{};
+            result.id = tag.id;
+            result.proposal_confidence = proposal.confidence;
+            result.roi = proposal.roi;
+            result.center = tag.center + cv::Point2f(static_cast<float>(x0), static_cast<float>(y0));
+            for (int corner = 0; corner < 4; ++corner)
+                result.corners[corner] =
+                    tag.corners[corner] + cv::Point2f(static_cast<float>(x0), static_cast<float>(y0));
+            results.push_back(result);
+        }
+    }
+
+    // Two proposals can overlap the same physical tag, so the same id decodes
+    // twice. Proposals arrive in descending confidence order, so keeping the
+    // first occurrence keeps the one backed by the stronger proposal.
+    std::vector<TinyTagResult> deduped;
+    deduped.reserve(results.size());
+    for (const auto &candidate : results)
+    {
+        bool duplicate = false;
+        for (const auto &kept : deduped)
+        {
+            if (kept.id != candidate.id)
+                continue;
+            const float dx = kept.center.x - candidate.center.x;
+            const float dy = kept.center.y - candidate.center.y;
+            if (std::sqrt(dx * dx + dy * dy) < kDedupeDistPx)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+            deduped.push_back(candidate);
+    }
+    results.swap(deduped);
+
+    crop_decode_ms_ = now_ms() - started;
+}
+
+void TinyTagDet::draw_detections(cv::Mat &bgr, const std::vector<TinyTagResult> &results)
+{
+    for (const auto &result : results)
+    {
+        for (int corner = 0; corner < 4; ++corner)
+            cv::line(bgr, result.corners[corner], result.corners[(corner + 1) % 4],
+                     cv::Scalar(0, 0, 255), 2);
+        char label[32];
+        std::snprintf(label, sizeof(label), "id %d", result.id);
+        cv::putText(bgr, label, result.center + cv::Point2f(-14.f, -6.f),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 255), 1);
+    }
+}

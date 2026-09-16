@@ -7,6 +7,7 @@
 
 #include "tinytag_det.h"
 #include "golden.h"
+#include "tag_crop_decoder.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -35,6 +36,8 @@ void usage(const char *argv0)
     printf("  --repeat <n>      inference runs, for timing (default 1)\n");
     printf("  --warmup <n>      untimed runs first       (default 2)\n");
     printf("  --max-mae <f>     self-test error gate     (default 0.05)\n");
+    printf("  --decode [mode]   run the ArUco Nano tag decoder on each proposal\n");
+    printf("                    mode: strict (default) or tolerant\n");
     printf("  --debug <0|1|2>   verbosity                (default 1)\n");
     printf("\nThe detection defaults match the K230 production operating point.\n");
 }
@@ -238,6 +241,8 @@ int main(int argc, char **argv)
     float roi_expand = 1.5f;
     float roi_iou_thres = 0.5f;
     std::string output_path = "tinytag_det.jpg";
+    bool decode = false;
+    bool decode_tolerant = false;
     int repeat = 1;
     int warmup = 2;
     double max_mae = 0.05;
@@ -255,6 +260,18 @@ int main(int argc, char **argv)
         else if (flag == "--repeat" && has_value) repeat = std::atoi(argv[++i]);
         else if (flag == "--warmup" && has_value) warmup = std::atoi(argv[++i]);
         else if (flag == "--max-mae" && has_value) max_mae = std::atof(argv[++i]);
+        else if (flag == "--decode")
+        {
+            decode = true;
+            // Optional mode word; anything starting with '-' is the next flag.
+            if (has_value && argv[i + 1][0] != '-')
+            {
+                const std::string mode = argv[++i];
+                if (mode == "tolerant")      decode_tolerant = true;
+                else if (mode == "strict")   decode_tolerant = false;
+                else { printf("--decode mode must be 'strict' or 'tolerant'\n"); return 1; }
+            }
+        }
         else if (flag == "--debug" && has_value)  debug_mode = std::atoi(argv[++i]);
         else
         {
@@ -289,23 +306,41 @@ int main(int argc, char **argv)
         TinyTagDet detector(cvimodel_path, heatmap_thres, max_proposals, roi_expand,
                             roi_iou_thres, debug_mode);
 
+        if (decode)
+        {
+            detector.set_decoder(make_aruco_nano_decoder(decode_tolerant));
+            if (debug_mode > 0)
+                printf("decoder: ArUco Nano, AprilTag 36h11, %s\n",
+                       decode_tolerant ? "tolerant" : "strict");
+        }
+
         std::vector<Proposal> proposals;
+        std::vector<TinyTagResult> results;
         // The first inference pays one-off setup the steady state does not, so
         // warm up before measuring; otherwise a --repeat 1 figure overstates the
         // per-frame cost a real application would see.
         for (int i = 0; i < warmup; ++i)
+        {
             detector.detect(gray, proposals);
+            if (decode)
+                detector.post_process(gray, proposals, results);
+        }
 
-        std::vector<double> preprocess_samples, inference_samples, decode_samples, total_samples;
+        std::vector<double> preprocess_samples, inference_samples, decode_samples;
+        std::vector<double> crop_decode_samples, total_samples;
         for (int i = 0; i < repeat; ++i)
         {
             detector.detect(gray, proposals);
+            if (decode)
+                detector.post_process(gray, proposals, results);
             preprocess_samples.push_back(detector.last_preprocess_ms());
             inference_samples.push_back(detector.last_inference_ms());
             decode_samples.push_back(detector.last_decode_ms());
+            crop_decode_samples.push_back(decode ? detector.last_crop_decode_ms() : 0.0);
             total_samples.push_back(detector.last_preprocess_ms() +
                                     detector.last_inference_ms() +
-                                    detector.last_decode_ms());
+                                    detector.last_decode_ms() +
+                                    (decode ? detector.last_crop_decode_ms() : 0.0));
         }
 
         printf("\n%zu proposal(s) at threshold %.2f\n", proposals.size(), heatmap_thres);
@@ -316,12 +351,24 @@ int main(int argc, char **argv)
                    i, p.confidence, p.roi.x, p.roi.y, p.roi.width, p.roi.height);
         }
 
+        if (decode)
+        {
+            printf("\n%zu tag(s) decoded from %zu crop(s)\n",
+                   results.size(), detector.last_crop_count());
+            for (size_t i = 0; i < results.size(); ++i)
+                printf("  [%zu] id %-4d  center (%.1f, %.1f)  proposal conf %.3f\n",
+                       i, results[i].id, results[i].center.x, results[i].center.y,
+                       results[i].proposal_confidence);
+        }
+
         if (debug_mode > 0)
         {
             printf("\n---- timing, ms over %d run(s) after %d warmup ----\n", repeat, warmup);
             print_stats("pre_process", summarize(preprocess_samples));
             print_stats("inference", summarize(inference_samples));
             print_stats("decode", summarize(decode_samples));
+            if (decode)
+                print_stats("crop_decode", summarize(crop_decode_samples));
             print_stats("total", summarize(total_samples));
 
             const Stats inference_stats = summarize(inference_samples);
@@ -332,8 +379,20 @@ int main(int argc, char **argv)
             if (total_stats.median > 0.0)
                 printf("  this pipeline    : %.1f frames/s at the median\n",
                        1000.0 / total_stats.median);
-            printf("  NOTE: a full two-stage detector adds a per-ROI CV decode stage,\n");
-            printf("        which dominated the K230 budget (~10.7 of ~15.25 ms/frame).\n");
+            if (decode)
+            {
+                const Stats crop_stats = summarize(crop_decode_samples);
+                const size_t crops = detector.last_crop_count();
+                if (crops > 0)
+                    printf("  per-ROI decode   : %.2f ms over %zu crop(s)\n",
+                           crop_stats.median / crops, crops);
+                printf("  This is the full two-stage pipeline, minus camera capture.\n");
+            }
+            else
+            {
+                printf("  NOTE: pass --decode to add the per-ROI CV decode stage, which\n");
+                printf("        dominated the K230 budget (~10.7 of ~15.25 ms/frame).\n");
+            }
         }
 
         if (!output_path.empty())
@@ -341,6 +400,8 @@ int main(int argc, char **argv)
             cv::Mat annotated;
             cv::cvtColor(gray, annotated, cv::COLOR_GRAY2BGR);
             TinyTagDet::draw_proposals(annotated, proposals);
+            if (decode)
+                TinyTagDet::draw_detections(annotated, results);
             if (cv::imwrite(output_path, annotated))
                 printf("\nwrote %s\n", output_path.c_str());
             else

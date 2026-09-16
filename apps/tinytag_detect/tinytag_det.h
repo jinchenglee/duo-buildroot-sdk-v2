@@ -1,9 +1,12 @@
 #ifndef TINYTAG_DET_H
 #define TINYTAG_DET_H
 
+#include "tag_crop_decoder.h"
+
 #include <cviruntime.h>
 #include <opencv2/core.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,6 +22,16 @@ struct Proposal
 {
     float confidence; // sigmoid(heatmap) at the peak cell
     cv::Rect2f roi;   // full-frame pixel coords, after roi_expand + clamp
+};
+
+// One tag confirmed by the CV decoder, in full-frame pixel coordinates.
+struct TinyTagResult
+{
+    int id;
+    float proposal_confidence; // the neural proposal this came from
+    cv::Rect2f roi;
+    cv::Point2f center;
+    cv::Point2f corners[4];
 };
 
 // TinyTag proposal detector on the cv181x/SG2000 TPU.
@@ -74,7 +87,21 @@ public:
     // Convenience: pre_process + inference + decode_proposals.
     void detect(const cv::Mat &ori_img_gray, std::vector<Proposal> &proposals);
 
+    // Stage two: crop each proposal out of the full-resolution frame and run
+    // the CV tag decoder over it. `full_res_gray` must be CV_8UC1 and the same
+    // size as the image passed to pre_process(). Crops are zero-copy sub-Mat
+    // views -- the decoder reads .step as a stride, so nothing is cloned.
+    //
+    // Only meaningful with a decoder installed; without one this is a no-op.
+    void post_process(const cv::Mat &full_res_gray,
+                      const std::vector<Proposal> &proposals,
+                      std::vector<TinyTagResult> &results);
+
+    void set_decoder(std::shared_ptr<TagCropDecoder> decoder) { decoder_ = std::move(decoder); }
+    bool has_decoder() const { return decoder_ != nullptr; }
+
     static void draw_proposals(cv::Mat &bgr, const std::vector<Proposal> &proposals);
+    static void draw_detections(cv::Mat &bgr, const std::vector<TinyTagResult> &results);
 
     cv::Size input_size() const { return cv::Size(input_w_, input_h_); }
     int output_channels() const { return output_c_; }
@@ -86,6 +113,8 @@ public:
     double last_preprocess_ms() const { return preprocess_ms_; }
     double last_inference_ms() const { return inference_ms_; }
     double last_decode_ms() const { return decode_ms_; }
+    double last_crop_decode_ms() const { return crop_decode_ms_; }
+    size_t last_crop_count() const { return crop_count_; }
 
 private:
     static float rect_iou(const cv::Rect2f &a, const cv::Rect2f &b);
@@ -123,6 +152,10 @@ private:
     double preprocess_ms_ = 0.0;
     double inference_ms_ = 0.0;
     double decode_ms_ = 0.0;
+    double crop_decode_ms_ = 0.0;
+    size_t crop_count_ = 0;
+
+    std::shared_ptr<TagCropDecoder> decoder_;
 
     // Head geometry. Keep in sync with tools/tinytag_cvimodel/prepare_calibration.py.
     static constexpr int kStride = 8;
@@ -133,6 +166,10 @@ private:
     // Channels 0-4 are the trained head (heatmap, offset_x, offset_y, scale_w,
     // scale_h); 5-20 are dormant corner/visibility outputs, deliberately unread.
     static constexpr int kTrainedChannels = 5;
+    // Two proposals overlapping one physical tag decode to the same id; treat
+    // hits closer than this as the same tag. Not a value from the training
+    // repo -- a reasonable default, retune against real footage.
+    static constexpr float kDedupeDistPx = 20.0f;
 };
 
 #endif // TINYTAG_DET_H

@@ -11,6 +11,7 @@
 # arguments are passed straight through to the binary:
 #
 #   TINYTAG_THRES=0.20 run_tinytag.sh frame.jpg
+#   TINYTAG_DECODE=strict run_tinytag.sh frame.jpg    # full two-stage pipeline
 #   run_tinytag.sh frame.jpg --repeat 20
 set -eu
 
@@ -30,6 +31,10 @@ TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/mnt/cvimodel/tinytag-v40c.ttgold}"
 TINYTAG_REPEAT="${TINYTAG_REPEAT:-20}"
 TINYTAG_WARMUP="${TINYTAG_WARMUP:-2}"
 TINYTAG_MAX_MAE="${TINYTAG_MAX_MAE:-0.05}"
+# Empty disables stage two. Set to "strict" or "tolerant" to run the ArUco Nano
+# AprilTag 36h11 decoder over every proposal -- i.e. the full two-stage
+# pipeline, minus camera capture.
+TINYTAG_DECODE="${TINYTAG_DECODE:-}"
 # --------------------------------------------------------------------------
 
 usage() {
@@ -54,6 +59,7 @@ Environment overrides (current values shown):
   TINYTAG_REPEAT  ${TINYTAG_REPEAT}
   TINYTAG_WARMUP  ${TINYTAG_WARMUP}
   TINYTAG_MAX_MAE ${TINYTAG_MAX_MAE}
+  TINYTAG_DECODE  ${TINYTAG_DECODE:-(off)}
 USAGE
 }
 
@@ -98,6 +104,12 @@ shift
 
 set_library_path
 
+decode_args=""
+if [ -n "${TINYTAG_DECODE}" ]; then
+    decode_args="--decode ${TINYTAG_DECODE}"
+fi
+
+# shellcheck disable=SC2086 -- decode_args is intentionally word-split
 exec "${TINYTAG_BIN}" \
     "${TINYTAG_MODEL}" \
     "${image}" \
@@ -109,4 +121,5 @@ exec "${TINYTAG_BIN}" \
     --repeat "${TINYTAG_REPEAT}" \
     --warmup "${TINYTAG_WARMUP}" \
     --debug "${TINYTAG_DEBUG}" \
+    ${decode_args} \
     "$@"
