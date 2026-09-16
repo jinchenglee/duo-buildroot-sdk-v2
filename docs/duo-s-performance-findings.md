@@ -41,11 +41,29 @@ Reproduce with:
 network could run 3-4x per frame and the pipeline would still be CV-bound.
 Optimization effort belongs in stage two, or in reducing how many ROIs reach it.
 
+## Over-proposing is the architecture, not a defect
+
+Proposals with no tag inside are a **design feature**, not an inefficiency to
+be trained away. The two-stage split exists because precision is expensive in a
+network and cheap in a verifier. Stage one's job is not to be right; it is to
+reduce a 1280x800 = 1.02M-pixel search to at most 8 crops of roughly 60x80.
+Stage two then buys precision at 0.93 ms per candidate -- less than half what
+the whole network costs at 2.11 ms.
+
+The measured numbers make the trade explicit. Eliminating the 3 non-decoding
+proposals in the sample frame would save 2.8 ms, but would require a materially
+larger network: even a 2x model costs +2.11 ms, would still not reach zero
+false positives (no network does), and would therefore still need the verifier
+for the residue. Most of the saving is spent, and the worst case gets worse.
+
+This also inverts with verifier cost: the *cheaper* stage two is per ROI, the
+*more* stage one should be allowed to over-propose. At 0.93 ms against a
+2.11 ms network, the verifier is cheap here, which argues for pushing recall
+up -- consistent with the threshold being free below the cap, below.
+
 ## The frame time is bounded, and N is the knob
 
-Proposals without a real tag inside are inherent -- the neural stage proposes,
-the CV stage disposes, and some proposals will always decode to nothing. That
-is not waste to be eliminated; it is the cost of recall.
+The cost of over-proposing is bounded, which is what makes it safe.
 
 What matters is that the cost is **bounded**. `decode_proposals()` sorts peaks
 by confidence, truncates to `max_proposals` (`--max`, default 8), and only then
