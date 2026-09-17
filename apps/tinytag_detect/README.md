@@ -14,9 +14,28 @@ ArUco Nano is the decoder, matching the K230 production default.
 
 ## Build and install
 
+Run this **in the Docker container**, like every other build in this tree --
+see "Always build in Docker" in the top-level README. Mixing host and
+container builds leaves root-owned files that later break the SDK build with
+what look like toolchain errors.
+
 ```sh
-apps/tinytag_detect/build.sh [board]        # defaults to the board in device/target
+docker exec -it duodocker /bin/bash -c \
+    "cd /home/work && ./apps/tinytag_detect/build.sh milkv-duos-glibc-arm64-sd"
 ```
+
+The board argument defaults to whatever `device/target` points at, but a fresh
+clone has no `device/target` (it is gitignored), so pass it explicitly until a
+full build has been run once.
+
+This is step 2 of 3. It must be preceded by a full `./build.sh` (which produces
+the TPU SDK this links against) and followed by another (which bakes the staged
+overlay into the image). Skipping it is silent: the image builds fine and
+simply contains no detector.
+
+A **failed** SDK build runs `clean_all` first and therefore wipes
+`install/soc_<project>/`, TPU SDK included. If this script reports the SDK
+missing, run a full successful build before retrying.
 
 Cross-compiles against the cvitek TPU SDK that a full `./build.sh <board>` drops
 in `install/soc_<project>/tpu_64bit/`, then installs into
