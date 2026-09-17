@@ -68,6 +68,8 @@ link against yet.
 overlay layout.** Skipping step 2 is silent — the image builds successfully and
 simply has no detector in it.
 
+New to this work? Start with [docs/handover.md](docs/handover.md).
+
 See [apps/tinytag_detect/README.md](apps/tinytag_detect/README.md) for usage,
 [tools/tinytag_cvimodel/README.md](tools/tinytag_cvimodel/README.md) for the
 model conversion toolchain, and [docs/](docs/) for performance findings and the

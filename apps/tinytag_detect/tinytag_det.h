@@ -76,10 +76,29 @@ public:
 
     void inference();
 
+    // Bind an aligned VPSS luma plane directly as the TPU input. The caller
+    // retains ownership and must keep the physical buffer alive until this
+    // synchronous call returns. Available only for an --aligned_input model.
+    void detect_physical(uint64_t luma_paddr, cv::Size full_frame_size,
+                         std::vector<Proposal> &proposals);
+
+    // Experimental exception to the general aligned-input rule. A compact
+    // model may be rebound directly only when the caller proves that the
+    // external grayscale plane is byte-for-byte the model's dense tensor:
+    // identical dimensions, stride == width, and sufficient plane length.
+    // This keeps detect_physical()'s aligned-model safety contract intact.
+    void detect_compact_physical(uint64_t luma_paddr, cv::Size input_frame_size,
+                                 size_t input_stride, size_t input_length,
+                                 const uint8_t *validation_copy,
+                                 cv::Size full_frame_size,
+                                 std::vector<Proposal> &proposals);
+    bool uses_aligned_input() const { return input_->aligned; }
+
     // Copy the whole output tensor out as float, dequantizing if needed.
     void copy_output(std::vector<float> &out) const;
 
-    // sigmoid -> 3x3 max-pool NMS -> threshold -> top-K -> center/size decode
+    // logit threshold -> 3x3 max-pool NMS -> top-K -> sigmoid only for the
+    // surviving confidences -> center/size decode
     // -> roi_expand -> clamp -> optional IoU suppression. Proposals come back
     // in the coordinate space of the image passed to pre_process().
     void decode_proposals(cv::Size frame_size, std::vector<Proposal> &proposals);
@@ -130,6 +149,7 @@ public:
     double last_decode_ms() const { return decode_ms_; }
     double last_crop_decode_ms() const { return crop_decode_ms_; }
     size_t last_crop_count() const { return crop_count_; }
+    const TagDecoderProfile &last_decoder_profile() const { return decoder_profile_; }
 
 private:
     static float rect_iou(const cv::Rect2f &a, const cv::Rect2f &b);
@@ -152,7 +172,7 @@ private:
     int output_h_ = 0;
     int output_w_ = 0;
 
-    float heatmap_thres_;
+    float heatmap_logit_thres_;
     int max_proposals_;
     float roi_expand_;
     float roi_iou_thres_;
@@ -160,8 +180,7 @@ private:
 
     // Scratch reused across frames so a steady-state loop does no allocation.
     cv::Mat resized_;
-    std::vector<float> score_;
-    std::vector<uint8_t> is_peak_;
+    std::vector<std::pair<float, int>> peak_logits_;
     std::vector<float> dequantized_;
 
     double preprocess_ms_ = 0.0;
@@ -171,6 +190,8 @@ private:
     size_t crop_count_ = 0;
     int crop_align_ = 4;
     std::vector<cv::Rect> crop_rects_;
+    TagDecoderProfile decoder_profile_;
+    bool physical_input_bound_ = false;
 
     std::shared_ptr<TagCropDecoder> decoder_;
 

@@ -75,6 +75,7 @@ cmake --install "${BUILD_DIR}"
 # symlink keeps `run_tinytag.sh` on PATH for the documented one-liner usage.
 install -Dm755 "${APP_DIR}/run.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_tinytag.sh"
 install -Dm755 "${APP_DIR}/run_live.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_live.sh"
+install -Dm755 "${APP_DIR}/run_dma_bench.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_dma_bench.sh"
 install -d "${OVERLAY_DIR}/usr/local/bin"
 ln -sfn /app/tinytag_detect/run_tinytag.sh "${OVERLAY_DIR}/usr/local/bin/run_tinytag.sh"
 

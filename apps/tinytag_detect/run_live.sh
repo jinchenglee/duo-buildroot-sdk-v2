@@ -12,6 +12,18 @@ EXPAND="${TINYTAG_LIVE_EXPAND:-1.5}"
 IOU="${TINYTAG_LIVE_IOU:-0.5}"
 DECODE="${TINYTAG_LIVE_DECODE:-strict}"
 DEBUG="${TINYTAG_LIVE_DEBUG:-1}"
+# Per-tag stdout is a debug/result-export policy, not part of the real-time
+# detector path. Keep it off by default: a slow terminal or pipe otherwise
+# stalls acquisition. Set to 1 when the textual stream is explicitly needed.
+TAG_OUTPUT="${TINYTAG_LIVE_TAG_OUTPUT:-0}"
+
+# Direct binding is the verified default for the ordinary compact v40c model.
+# It is accepted only when the VPSS luma plane exactly matches the dense tensor.
+# Set 0 only for a copied-input A/B baseline.
+DIRECT_COMPACT_INPUT="${TINYTAG_LIVE_DIRECT_COMPACT_INPUT:-1}"
+# Diagnostic-only same-frame copied/direct bit comparison. The production
+# default is off now that the board has passed exact validation.
+VALIDATE_COMPACT_INPUT="${TINYTAG_LIVE_VALIDATE_COMPACT_INPUT:-0}"
 
 # Sensor orientation, applied once in VI hardware (no per-frame cost).
 # MIRROR defaults to 1: the OV5647 module on this board delivers a
@@ -26,6 +38,10 @@ FLIP="${TINYTAG_LIVE_FLIP:-0}"
 # every crop row starts 4-byte aligned and spans whole 32-bit words. Set 0 or 1
 # to disable and compare. Aligned regions show pink on the preview.
 CROP_ALIGN="${TINYTAG_LIVE_CROP_ALIGN:-4}"
+
+# For ownership/backlog testing only: TINYTAG_LIVE_PREVIEW_DELAY_MS adds a
+# worker-side delay while it owns a preview surface. The binary reads this
+# environment variable directly; normal operation leaves it unset or zero.
 
 [ -x "${BIN}" ] || { echo "Error: ${BIN} not found or not executable" >&2; exit 1; }
 [ -f "${MODEL}" ] || { echo "Error: model ${MODEL} not found" >&2; exit 1; }
@@ -47,5 +63,8 @@ exec "${BIN}" "${MODEL}" \
     --flip "${FLIP}" \
     --crop-align "${CROP_ALIGN}" \
     --debug "${DEBUG}" \
+    --tag-output "${TAG_OUTPUT}" \
+    --direct-compact-input "${DIRECT_COMPACT_INPUT}" \
+    --validate-compact-input "${VALIDATE_COMPACT_INPUT}" \
     --rtsp \
     "$@"

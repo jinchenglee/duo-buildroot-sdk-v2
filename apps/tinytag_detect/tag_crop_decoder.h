@@ -14,6 +14,14 @@ struct TagDetection
     cv::Point2f corners[4];
 };
 
+// Behavior-neutral instrumentation for one decoder call. Times partition the
+// ArUco Nano pipeline; counts explain scene-dependent cost.
+struct TagDecoderProfile
+{
+    double threshold_ms = 0, contour_ms = 0, quad_ms = 0, decode_ms = 0, refine_ms = 0;
+    size_t pixels = 0, contours = 0, candidates = 0, attempts = 0, markers = 0;
+};
+
 // Stage two of the two-stage detector: crop each neural proposal out of the
 // full-resolution frame and hand it to a *traditional* CV tag decoder --
 // nothing neural past this point.
@@ -32,6 +40,7 @@ public:
     // sub-Mat view is expected, and implementations must respect .step rather
     // than assuming packed rows.
     virtual std::vector<TagDetection> detect(const cv::Mat &crop) = 0;
+    virtual const TagDecoderProfile &last_profile() const = 0;
 };
 
 // ArUco Nano reading AprilTag 36h11, the K230 production default.

@@ -65,6 +65,9 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(expand_dilated_depthwise=True)
     parser.add_argument("--allow-small-calibration", action="store_true",
                         help="allow fewer than 100 calibration frames (experimental builds only)")
+    parser.add_argument("--aligned-input", action="store_true",
+                        help="compile an input tensor that can bind a width-aligned VPSS "
+                             "physical frame directly (experimental live-camera path)")
     parser.add_argument("--workdir", type=Path,
                         help="keep intermediates here instead of a temporary directory")
     return parser.parse_args()
@@ -269,13 +272,15 @@ def main() -> int:
             "--quantize", args.quantize,
             "--chip", args.chip,
             # fuse_preprocess folds the /255 into the network and makes the input
-            # tensor uint8 GRAYSCALE, so the board can memcpy a luma plane in
-            # directly. No --aligned_input: this application feeds a plain
-            # contiguous buffer, not a VPSS width-aligned frame.
+            # tensor uint8 GRAYSCALE. The default model accepts a plain
+            # contiguous CPU buffer; the experimental aligned variant binds a
+            # VPSS physical frame directly on the board.
             "--fuse_preprocess",
             "--customization_format", "GRAYSCALE",
             "--model", args.output,
         ]
+        if args.aligned_input:
+            deploy.append("--aligned_input")
         if args.quantize == "INT8":
             deploy += ["--calibration_table", calibration_table]
         if reference_image is not None:

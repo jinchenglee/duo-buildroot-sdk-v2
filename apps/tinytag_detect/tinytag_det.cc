@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -30,11 +31,28 @@ const char *fmt_name(CVI_FMT fmt)
     }
 }
 
+float probability_to_logit(float probability)
+{
+    if (std::isnan(probability))
+        return probability;
+    if (probability <= 0.f)
+        return -std::numeric_limits<float>::infinity();
+    if (probability >= 1.f)
+        return std::numeric_limits<float>::infinity();
+    return std::log(probability / (1.f - probability));
+}
+
+float sigmoid(float logit)
+{
+    return 1.f / (1.f + std::exp(-logit));
+}
+
 } // namespace
 
 TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, int max_proposals,
                        float roi_expand, float roi_iou_thres, int debug_mode)
-    : heatmap_thres_(heatmap_thres), max_proposals_(max_proposals), roi_expand_(roi_expand),
+    : heatmap_logit_thres_(probability_to_logit(heatmap_thres)),
+      max_proposals_(max_proposals), roi_expand_(roi_expand),
       roi_iou_thres_(roi_iou_thres), debug_mode_(debug_mode)
 {
     int ret = CVI_NN_RegisterModel(cvimodel_path.c_str(), &model_);
@@ -71,8 +89,7 @@ TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, in
     output_w_ = out_shape.dim[3];
 
     const int plane = output_h_ * output_w_;
-    score_.resize(plane);
-    is_peak_.resize(plane);
+    peak_logits_.reserve(plane);
 
     if (debug_mode_ > 0)
     {
@@ -86,24 +103,27 @@ TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, in
                output_h_, output_w_, fmt_name(output_->fmt));
     }
 
-    // A width-aligned input tensor means the model was built with
-    // --aligned_input, which expects VPSS-padded rows. This application feeds a
-    // plain contiguous buffer, so the rows would be misinterpreted.
-    if (input_->aligned)
-        throw std::runtime_error(
-            "cvimodel was compiled with --aligned_input; rebuild without it, or feed "
-            "this model from the VPSS pipeline instead of a plain buffer");
 }
 
 TinyTagDet::~TinyTagDet()
 {
     if (model_ != nullptr)
+    {
+        // A direct-input live run rebinds this tensor to a VPSS-owned block.
+        // Do not leave an external physical address installed during cleanup.
+        if (input_ != nullptr && physical_input_bound_)
+            CVI_NN_SetTensorPhysicalAddr(input_, 0);
         CVI_NN_CleanupModel(model_);
+    }
 }
 
 void TinyTagDet::pre_process(const cv::Mat &ori_img_gray)
 {
     const double started = now_ms();
+
+    if (input_->aligned)
+        throw std::runtime_error(
+            "pre_process cannot feed an aligned-input model; use a direct VPSS frame");
 
     if (ori_img_gray.empty() || ori_img_gray.type() != CV_8UC1)
         throw std::runtime_error("pre_process expects a non-empty CV_8UC1 image");
@@ -178,6 +198,9 @@ void TinyTagDet::store_input_plane(const uint8_t *src, size_t src_stride)
 
 void TinyTagDet::set_input(const uint8_t *gray, size_t count)
 {
+    if (input_->aligned)
+        throw std::runtime_error(
+            "set_input cannot feed an aligned-input model; use a direct VPSS frame");
     const size_t expected = static_cast<size_t>(input_w_) * input_h_;
     if (count != expected)
         throw std::runtime_error("set_input expects " + std::to_string(expected) +
@@ -258,17 +281,22 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
     const float *scale_w = out + 3 * plane;
     const float *scale_h = out + 4 * plane;
 
-    for (int i = 0; i < plane; ++i)
-        score_[i] = 1.f / (1.f + std::exp(-heatmap[i]));
-
-    // 3x3 max-pool local-maxima NMS: a cell survives only if it equals the max
-    // of its own 3x3 neighborhood (clamped at the border). Reads score_ only --
-    // never mutated mid-scan, so neighbor reads stay correct in any scan order.
+    // Sigmoid is monotonic, so threshold and local-max NMS are equivalent in
+    // logit space. This avoids evaluating exp() for all H*W cells; sigmoid is
+    // needed only for the at-most max_proposals_ reported confidences.
+    //
+    // A cell survives if it equals the maximum of its 3x3 neighborhood
+    // (clamped at the border). Equal logits retain the previous behavior: both
+    // survive this stage and the existing full sort determines their order.
+    peak_logits_.clear();
     for (int y = 0; y < H; ++y)
     {
         for (int x = 0; x < W; ++x)
         {
-            const float v = score_[y * W + x];
+            const int idx = y * W + x;
+            const float v = heatmap[idx];
+            if (!(v >= heatmap_logit_thres_))
+                continue;
             bool peak = true;
             for (int dy = -1; dy <= 1 && peak; ++dy)
             {
@@ -280,26 +308,23 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
                     const int nx = x + dx;
                     if (nx < 0 || nx >= W)
                         continue;
-                    if (score_[ny * W + nx] > v)
+                    if (heatmap[ny * W + nx] > v)
                     {
                         peak = false;
                         break;
                     }
                 }
             }
-            is_peak_[y * W + x] = peak ? 1 : 0;
+            if (peak)
+                peak_logits_.emplace_back(v, idx);
         }
     }
 
-    std::vector<std::pair<float, int>> peaks;
-    for (int i = 0; i < plane; ++i)
-        if (is_peak_[i] && score_[i] >= heatmap_thres_)
-            peaks.emplace_back(score_[i], i);
-    std::sort(peaks.begin(), peaks.end(),
+    std::sort(peak_logits_.begin(), peak_logits_.end(),
               [](const std::pair<float, int> &a, const std::pair<float, int> &b)
               { return a.first > b.first; });
-    if (static_cast<int>(peaks.size()) > max_proposals_)
-        peaks.resize(max_proposals_);
+    if (static_cast<int>(peak_logits_.size()) > max_proposals_)
+        peak_logits_.resize(max_proposals_);
 
     // The network was fed the bottom-left 16:9 band, so map network coordinates
     // into that band's space and then offset back to full-frame coordinates.
@@ -311,8 +336,8 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
     const float x_factor = static_cast<float>(band_w) / input_w_;
     const float y_factor = static_cast<float>(band_h) / input_h_;
 
-    proposals.reserve(peaks.size());
-    for (const auto &pk : peaks)
+    proposals.reserve(peak_logits_.size());
+    for (const auto &pk : peak_logits_)
     {
         const int idx = pk.second;
         const int gy = idx / W;
@@ -341,7 +366,7 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
         if (x1 <= x0 || y1 <= y0)
             continue;
 
-        proposals.push_back({pk.first, cv::Rect2f(x0, y0, x1 - x0, y1 - y0)});
+        proposals.push_back({sigmoid(pk.first), cv::Rect2f(x0, y0, x1 - x0, y1 - y0)});
     }
 
     // Greedy box-level IoU suppression. `proposals` is already in descending
@@ -380,6 +405,92 @@ void TinyTagDet::detect(const cv::Mat &ori_img_gray, std::vector<Proposal> &prop
     decode_proposals(ori_img_gray.size(), proposals);
 }
 
+void TinyTagDet::detect_physical(uint64_t luma_paddr, cv::Size full_frame_size,
+                                 std::vector<Proposal> &proposals)
+{
+    if (!input_->aligned)
+        throw std::runtime_error("detect_physical requires an aligned-input cvimodel");
+    if (luma_paddr == 0)
+        throw std::runtime_error("detect_physical received a null physical address");
+
+    const double started = now_ms();
+    const CVI_RC ret = CVI_NN_SetTensorPhysicalAddr(input_, luma_paddr);
+    if (ret != CVI_RC_SUCCESS)
+        throw std::runtime_error("CVI_NN_SetTensorPhysicalAddr failed (err " +
+                                 std::to_string(ret) + ")");
+    physical_input_bound_ = true;
+    preprocess_ms_ = now_ms() - started;
+    inference();
+    decode_proposals(full_frame_size, proposals);
+}
+
+void TinyTagDet::detect_compact_physical(uint64_t luma_paddr, cv::Size input_frame_size,
+                                         size_t input_stride, size_t input_length,
+                                         const uint8_t *validation_copy,
+                                         cv::Size full_frame_size,
+                                         std::vector<Proposal> &proposals)
+{
+    if (input_->aligned)
+        throw std::runtime_error(
+            "detect_compact_physical is only for a compact cvimodel; use detect_physical");
+    if (luma_paddr == 0)
+        throw std::runtime_error("detect_compact_physical received a null physical address");
+    if (input_->fmt != CVI_FMT_UINT8 || input_->pixel_format != CVI_NN_PIXEL_GRAYSCALE)
+        throw std::runtime_error(
+            "compact physical input requires a fused uint8 GRAYSCALE model tensor");
+    if (input_frame_size.width != input_w_ || input_frame_size.height != input_h_)
+        throw std::runtime_error("compact physical frame dimensions do not match the model input");
+
+    const size_t dense_size = static_cast<size_t>(input_w_) * input_h_;
+    if (input_stride != static_cast<size_t>(input_w_) || input_length < dense_size ||
+        input_->mem_size != dense_size)
+        throw std::runtime_error(
+            "compact physical frame is not byte-for-byte the dense model tensor");
+
+    std::vector<float> copied_output;
+    if (validation_copy != nullptr)
+    {
+        // This happens exactly once, before SetTensorPhysicalAddr releases the
+        // model's original input allocation. It proves the physical binding
+        // against the ordinary copied-input path using the same frame bytes.
+        set_input(validation_copy, dense_size);
+        inference();
+        copy_output(copied_output);
+    }
+
+    const double started = now_ms();
+    const CVI_RC ret = CVI_NN_SetTensorPhysicalAddr(input_, luma_paddr);
+    if (ret != CVI_RC_SUCCESS)
+        throw std::runtime_error("CVI_NN_SetTensorPhysicalAddr failed (err " +
+                                 std::to_string(ret) + ")");
+    physical_input_bound_ = true;
+    preprocess_ms_ = now_ms() - started;
+    inference();
+
+    if (validation_copy != nullptr)
+    {
+        std::vector<float> physical_output;
+        copy_output(physical_output);
+        const bool exact = copied_output.size() == physical_output.size() &&
+                           std::memcmp(copied_output.data(), physical_output.data(),
+                                       copied_output.size() * sizeof(float)) == 0;
+        float max_abs = 0.0f;
+        if (copied_output.size() == physical_output.size())
+        {
+            for (size_t i = 0; i < copied_output.size(); ++i)
+                max_abs = std::max(max_abs, std::abs(copied_output[i] - physical_output[i]));
+        }
+        fprintf(stderr,
+                "[model-input] compact physical same-frame validation exact=%d "
+                "max-abs=%.9g elements=%zu\n",
+                exact ? 1 : 0, max_abs, physical_output.size());
+        if (!exact)
+            throw std::runtime_error(
+                "compact physical input differs from the ordinary copied-input result");
+    }
+    decode_proposals(full_frame_size, proposals);
+}
+
 float TinyTagDet::rect_iou(const cv::Rect2f &a, const cv::Rect2f &b)
 {
     const float inter = (a & b).area();
@@ -407,6 +518,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     const double started = now_ms();
     results.clear();
     crop_count_ = 0;
+    decoder_profile_ = TagDecoderProfile{};
 
     crop_rects_.clear();
 
@@ -451,7 +563,20 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         crop_rects_.push_back(crop_rect);
         ++crop_count_;
 
-        for (const auto &tag : decoder_->detect(crop))
+        const auto tags = decoder_->detect(crop);
+        const TagDecoderProfile &profile = decoder_->last_profile();
+        decoder_profile_.threshold_ms += profile.threshold_ms;
+        decoder_profile_.contour_ms += profile.contour_ms;
+        decoder_profile_.quad_ms += profile.quad_ms;
+        decoder_profile_.decode_ms += profile.decode_ms;
+        decoder_profile_.refine_ms += profile.refine_ms;
+        decoder_profile_.pixels += profile.pixels;
+        decoder_profile_.contours += profile.contours;
+        decoder_profile_.candidates += profile.candidates;
+        decoder_profile_.attempts += profile.attempts;
+        decoder_profile_.markers += profile.markers;
+
+        for (const auto &tag : tags)
         {
             TinyTagResult result{};
             result.id = tag.id;

@@ -73,6 +73,11 @@ Runs `model_transform.py` -> `run_calibration.py` -> `model_deploy.py`.
 `--validation-dir` additionally feeds one held-out frame to tpu-mlir's own
 per-layer similarity check during deploy.
 
+`--aligned-input` builds the experimental live-camera variant whose input can
+be rebound to a width-aligned VPSS physical frame with
+`CVI_NN_SetTensorPhysicalAddr`. Do not use that model with the ordinary CPU
+buffer path; validate it through the paired VPSS experiment first.
+
 ### Dilated-depthwise rewrite (on by default)
 
 The v40c ONNX contains 3x3 depthwise convolutions with dilation 2 and 3.

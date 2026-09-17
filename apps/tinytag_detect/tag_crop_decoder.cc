@@ -34,7 +34,19 @@ public:
         if (crop.type() != CV_8UC1)
             throw std::runtime_error("TagCropDecoder::detect expects CV_8UC1");
 
-        const auto markers = aruco_nano::MarkerDetector::detect(crop, parameters_);
+        aruco_nano::DetectionProfile measured;
+        const auto markers = aruco_nano::MarkerDetector::detect(
+            crop, parameters_, nullptr, &measured);
+        profile_.threshold_ms = measured.threshold_ms;
+        profile_.contour_ms = measured.contour_ms;
+        profile_.quad_ms = measured.quad_ms;
+        profile_.decode_ms = measured.decode_ms;
+        profile_.refine_ms = measured.refine_ms;
+        profile_.pixels = crop.total();
+        profile_.contours = measured.contours;
+        profile_.candidates = measured.candidates;
+        profile_.attempts = measured.attempts;
+        profile_.markers = measured.markers;
 
         std::vector<TagDetection> out;
         out.reserve(markers.size());
@@ -55,8 +67,11 @@ public:
         return out;
     }
 
+    const TagDecoderProfile &last_profile() const override { return profile_; }
+
 private:
     aruco_nano::DetectorParameters parameters_;
+    TagDecoderProfile profile_;
 };
 
 } // namespace

@@ -139,6 +139,16 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       dl stdc++ pthread z m)
 
   install(TARGETS tinytag_detect_live DESTINATION app/tinytag_detect)
+
+  # Standalone IVE DMA characterization tool. Keep this dynamically linked and
+  # separate from the live path: preview borrows VPSS luma and does not copy.
+  add_executable(tinytag_ive_dma_bench ive_dma_bench.cc)
+  set_target_properties(tinytag_ive_dma_bench PROPERTIES SKIP_BUILD_RPATH TRUE)
+  target_link_libraries(tinytag_ive_dma_bench
+      ${MIDDLEWARE_SDK_ROOT}/lib/libcvi_ive.so
+      ${MIDDLEWARE_SDK_ROOT}/lib/libsys.so
+      pthread m)
+  install(TARGETS tinytag_ive_dma_bench DESTINATION app/tinytag_detect)
 else()
   message(STATUS "MIDDLEWARE_SDK_ROOT not set -- skipping tinytag_detect_live (camera capture)")
 endif()

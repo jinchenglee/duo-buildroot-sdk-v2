@@ -152,6 +152,7 @@
 #endif
 #include <opencv2/core/hal/intrin.hpp>
 #include <opencv2/objdetect/aruco_dictionary.hpp> // only the dictionary is needed
+#include <chrono>
 #include <vector>
 
 namespace aruco_nano  {
@@ -185,11 +186,15 @@ struct DetectorParameters {
     double maxErroneousBitsInBorderRate=0;//maximum rate of erroneous bits in the border. Default 0 means no error allowed.
     bool detectInvertedMarker=false;//if the markers are printed in white over black background
 };
+struct DetectionProfile {
+    double threshold_ms=0, contour_ms=0, quad_ms=0, decode_ms=0, refine_ms=0;
+    size_t contours=0, candidates=0, attempts=0, markers=0;
+};
 /** @brief The MarkerDetector class is detecting the markers in the image passed */
 class MarkerDetector{
 public:
     // The only function you need to call
-    static inline std::vector<Marker> detect(const cv::Mat &img, const DetectorParameters &params=DetectorParameters(),std::vector<Marker> *candidatesOut=nullptr);
+    static inline std::vector<Marker> detect(const cv::Mat &img, const DetectorParameters &params=DetectorParameters(),std::vector<Marker> *candidatesOut=nullptr, DetectionProfile *profile=nullptr);
 private:
     static inline Marker sort( const  Marker &marker);
     static inline float  getSubpixelValue(const cv::Mat &im_grey,const cv::Point2f &p);
@@ -321,7 +326,13 @@ void ArucoDetector::detectMarkers(cv::InputArray _image, cv::OutputArrayOfArrays
     _ids.create((int)idsVec.size(), 1, CV_32SC1);
     cv::Mat(idsVec).copyTo(_ids);
 }
-std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorParameters &params,std::vector<Marker> *candidatesOut){
+std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorParameters &params,std::vector<Marker> *candidatesOut, DetectionProfile *profile){
+    using ProfileClock = std::chrono::steady_clock;
+    const auto profileStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+    auto profileMs = [](ProfileClock::time_point begin, ProfileClock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    if (profile) *profile = DetectionProfile{};
     cv::Mat bwimage,thresImage;
     std::vector<Marker> DetectedMarkers;
     //first, convert to bw
@@ -334,6 +345,7 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
     cv::boxFilter( bwimage, thresImage, bwimage.type(), cv::Size(params.boxFilterSize, params.boxFilterSize),cv::Point(-1,-1), true, cv::BORDER_REPLICATE|cv::BORDER_ISOLATED );
     thresImage=thresImage-bwimage;
     cv::threshold(thresImage, thresImage, params.thres, 255, cv::THRESH_BINARY);
+    const auto thresholdDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
     /////////////////// compute marker candidates by detecting contours
     std::vector<std::vector<cv::Point>> contours;
     std::vector<cv::Point> approxCurve;
@@ -341,6 +353,7 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
     //cv::findContours(thresImage, contours, cv::noArray(), cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
     int  minSizeSq=params.minSize*params.minSize,minSize4=4*params.minSize;
     contours=visitedAwareTracingContour(thresImage,minSize4,params.maxTimesRevisited);
+    const auto contourDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
 
     //decide where to store the candidates. If candidatesOut is not null, store there, otherwise use a local variable
     std::vector<Marker> candidateslocal;
@@ -369,11 +382,13 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
         marker=sort(marker);
         candidatesOut->push_back(marker);
     }
+    const size_t candidateCount = candidatesOut->size();
+    const auto quadDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
 
 
     //now, for each candidate check bits inside
     int dictIndex=-1;
-    for(auto dict:params.dicts){
+    for(const auto &dict:params.dicts){
         std::vector<Marker> currDirMarkerDetected;
         dictIndex++;
         cv::Mat bits(dict.markerSize+2,dict.markerSize+2,CV_8UC1),bitadaptive(dict.markerSize+2,dict.markerSize+2,CV_8UC1);
@@ -383,6 +398,7 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
 
             ////// extract the code. Obtain the intensities of the bits using  homography
             for(int i=0;i<int(params.maxAttemptsPerCandidate) && marker.id==-1;i++){
+                if (profile) profile->attempts++;
                 //if not first attempt, we may wanna produce small random alteration of the corners
                 auto marker2=marker;
                 if( i!=0) for(int c=0;c<4;c++) {marker2[c].x+=rand.gaussian(0.75);marker2[c].y+=rand.gaussian(0.75);}//if not first, alter corner location
@@ -436,6 +452,7 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
 
         }
     }
+    const auto decodeDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
 
 
     ////// finally subpixel corner refinement
@@ -448,6 +465,17 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
         // copy back to the markers
         for (unsigned int i = 0; i < DetectedMarkers.size(); i++)
             for (int c = 0; c < 4; c++) DetectedMarkers[i][c] = Corners[i * 4 + c];
+    }
+    if (profile) {
+        const auto refineDone = ProfileClock::now();
+        profile->threshold_ms = profileMs(profileStart, thresholdDone);
+        profile->contour_ms = profileMs(thresholdDone, contourDone);
+        profile->quad_ms = profileMs(contourDone, quadDone);
+        profile->decode_ms = profileMs(quadDone, decodeDone);
+        profile->refine_ms = profileMs(decodeDone, refineDone);
+        profile->contours = contours.size();
+        profile->candidates = candidateCount;
+        profile->markers = DetectedMarkers.size();
     }
     return DetectedMarkers;//DONE
 }
