@@ -25,8 +25,8 @@ crop-decode, everything except camera capture -- runs in **11.25 ms
 
 Reproduce with:
 
-    tinytag_detect /mnt/cvimodel/tinytag-v40c.int8.cvimodel \
-        /mnt/data/tinytag-samples/arena-1280x800.jpg --decode --repeat 20
+    tinytag_detect /app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel \
+        /app/tinytag_detect/samples/arena-1280x800.jpg --decode --repeat 20
 
 ## Budget breakdown
 

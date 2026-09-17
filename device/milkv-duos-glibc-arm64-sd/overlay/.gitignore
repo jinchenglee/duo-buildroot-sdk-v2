@@ -1,10 +1,12 @@
 # Everything here is staged by apps/tinytag_detect/build.sh from sources kept in
 # apps/tinytag_detect/ and tools/tinytag_cvimodel/. Regenerate rather than
 # commit, so the staged copies cannot drift from their sources.
-usr/local/bin/tinytag_detect
+app/tinytag_detect/tinytag_detect
+app/tinytag_detect/tinytag_detect_live
+app/tinytag_detect/run_tinytag.sh
+app/tinytag_detect/cvimodel/*.ttgold
+app/tinytag_detect/samples/
 usr/local/bin/run_tinytag.sh
-mnt/cvimodel/*.ttgold
-mnt/data/tinytag-samples/
 root/.ssh/
 
 # The cvimodel IS tracked. Per tools/tinytag_cvimodel/README.md only a

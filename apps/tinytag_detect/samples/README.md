@@ -1,6 +1,6 @@
 # Sample frames
 
-Installed to `/mnt/data/tinytag-samples/` in the image by `build.sh`, so a
+Installed to `/app/tinytag_detect/samples/` in the image by `build.sh`, so a
 freshly flashed board has something to run the detector against without any
 copying.
 

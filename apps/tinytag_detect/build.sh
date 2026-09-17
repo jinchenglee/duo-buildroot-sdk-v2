@@ -62,17 +62,26 @@ cmake -S "${APP_DIR}" -B "${BUILD_DIR}" \
     -DHOST_TOOLS_PATH="${HOST_TOOLS_PATH}" \
     -DTPU_SDK_PATH="${TPU_SDK_PATH}" \
     -DOPENCV_PATH="${TPU_SDK_PATH}/opencv" \
+    -DMIDDLEWARE_SDK_ROOT="${TOP_DIR}/cvi_mpi" \
+    -DTDL_SDK_INCLUDE_PATH="${TOP_DIR}/tdl_sdk/include" \
+    -DCVI_RTSP_ROOT="${TOP_DIR}/cvi_rtsp" \
     -DCMAKE_INSTALL_PREFIX="${OVERLAY_DIR}"
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 cmake --install "${BUILD_DIR}"
 
 # --- stage the launcher and the model -------------------------------------
-install -Dm755 "${APP_DIR}/run.sh" "${OVERLAY_DIR}/usr/local/bin/run_tinytag.sh"
+# Everything lives under one directory on the board, /app/tinytag_detect/, so
+# nothing else scatters across /usr/local, /mnt/cvimodel and /mnt/data. A
+# symlink keeps `run_tinytag.sh` on PATH for the documented one-liner usage.
+install -Dm755 "${APP_DIR}/run.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_tinytag.sh"
+install -Dm755 "${APP_DIR}/run_live.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_live.sh"
+install -d "${OVERLAY_DIR}/usr/local/bin"
+ln -sfn /app/tinytag_detect/run_tinytag.sh "${OVERLAY_DIR}/usr/local/bin/run_tinytag.sh"
 
 # Sample frames ship with the app, so a freshly flashed board can run the
 # detector immediately. See samples/README.md for what each one exercises.
 if [ -d "${APP_DIR}/samples" ]; then
-    SAMPLES_DST="${OVERLAY_DIR}/mnt/data/tinytag-samples"
+    SAMPLES_DST="${OVERLAY_DIR}/app/tinytag_detect/samples"
     install -d "${SAMPLES_DST}"
     rm -f "${SAMPLES_DST}"/*
     sample_count=0
@@ -82,7 +91,7 @@ if [ -d "${APP_DIR}/samples" ]; then
         install -m 0644 "${sample}" "${SAMPLES_DST}/"
         sample_count=$((sample_count + 1))
     done
-    info "Staged ${sample_count} sample image(s) -> /mnt/data/tinytag-samples/"
+    info "Staged ${sample_count} sample image(s) -> /app/tinytag_detect/samples/"
 fi
 
 # cmake --install and install(1) create parent directories using the caller's
@@ -95,12 +104,13 @@ chmod 0700 "${OVERLAY_DIR}/root/.ssh" 2>/dev/null || true
 # A hardware-validated cvimodel is committed to the overlay, so a fresh clone
 # already has one. Only stage over it when a freshly built model is present in
 # the toolchain work directory (or TINYTAG_CVIMODEL points somewhere).
+CVIMODEL_DST="${OVERLAY_DIR}/app/tinytag_detect/cvimodel"
 CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${TOP_DIR}/tools/tinytag_cvimodel/work/tinytag-v40c.int8.cvimodel}"
 if [ -f "${CVIMODEL_SRC}" ]; then
-    install -Dm644 "${CVIMODEL_SRC}" "${OVERLAY_DIR}/mnt/cvimodel/$(basename "${CVIMODEL_SRC}")"
+    install -Dm644 "${CVIMODEL_SRC}" "${CVIMODEL_DST}/$(basename "${CVIMODEL_SRC}")"
     info "Staged model: $(basename "${CVIMODEL_SRC}")"
-elif ls "${OVERLAY_DIR}"/mnt/cvimodel/*.cvimodel >/dev/null 2>&1; then
-    for staged in "${OVERLAY_DIR}"/mnt/cvimodel/*.cvimodel; do
+elif ls "${CVIMODEL_DST}"/*.cvimodel >/dev/null 2>&1; then
+    for staged in "${CVIMODEL_DST}"/*.cvimodel; do
         info "Model already in overlay (tracked in git): $(basename "${staged}")"
     done
 else
@@ -113,9 +123,9 @@ fi
 # enables --selftest. Detection works without it.
 GOLDEN_SRC="${TINYTAG_GOLDEN:-${TOP_DIR}/tools/tinytag_cvimodel/work/tinytag-v40c.ttgold}"
 if [ -f "${GOLDEN_SRC}" ]; then
-    install -Dm644 "${GOLDEN_SRC}" "${OVERLAY_DIR}/mnt/cvimodel/$(basename "${GOLDEN_SRC}")"
+    install -Dm644 "${GOLDEN_SRC}" "${CVIMODEL_DST}/$(basename "${GOLDEN_SRC}")"
     info "Staged golden bundle: $(basename "${GOLDEN_SRC}") ($(du -h "${GOLDEN_SRC}" | cut -f1))"
-elif ls "${OVERLAY_DIR}"/mnt/cvimodel/*.ttgold >/dev/null 2>&1; then
+elif ls "${CVIMODEL_DST}"/*.ttgold >/dev/null 2>&1; then
     info "Golden bundle already in overlay"
 else
     info "No golden bundle (optional) -- --selftest unavailable; detection works."

@@ -23,11 +23,12 @@ in `install/soc_<project>/tpu_64bit/`, then installs into
 `device/<board>/overlay/`:
 
 ```
-usr/local/bin/tinytag_detect             the binary                  (284 KB)
-usr/local/bin/run_tinytag.sh             launcher with defaults baked in
-mnt/cvimodel/tinytag-v40c.int8.cvimodel  the model                    (43 KB)
-mnt/cvimodel/tinytag-v40c.ttgold         golden references            (3.2 MB)
-mnt/data/tinytag-samples/                sample frames from samples/  (740 KB)
+app/tinytag_detect/tinytag_detect             the binary                  (284 KB)
+app/tinytag_detect/run_tinytag.sh             launcher with defaults baked in
+app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel  the model          (43 KB)
+app/tinytag_detect/cvimodel/tinytag-v40c.ttgold         golden references  (3.2 MB)
+app/tinytag_detect/samples/                   sample frames from samples/  (740 KB)
+usr/local/bin/run_tinytag.sh -> /app/tinytag_detect/run_tinytag.sh  (symlink, keeps it on PATH)
 ```
 
 `TINYTAG_CVIMODEL` and `TINYTAG_GOLDEN` select different artifacts to stage.
@@ -47,7 +48,7 @@ Then rebuild the image; the overlay is picked up automatically:
 SDK's own `device/generic/{rootfs_overlay,br_overlay}` layers:
 
 ```make
-ifneq ($(wildcard $(TOP_DIR)/device/$(MV_BOARD)/overlay),)
+ifneq ($(wildcard $(TOP_DIR)/device/$(MV_BOARD)/overlay/*),)
         ${Q}cp -arf $(TOP_DIR)/device/$(MV_BOARD)/overlay/* $(BR_ROOTFS_DIR)/
 endif
 ```
@@ -81,14 +82,17 @@ init scripts, cron).
 
 ## Usage on the board
 
-Sample frames ship with the app, so there is nothing to copy over:
+Sample frames ship with the app, so there is nothing to copy over. With no
+arguments at all it runs against the bundled `arena-1280x800.jpg` sample, so
+every other option already has a working default:
 
 ```sh
-run_tinytag.sh /mnt/data/tinytag-samples/arena-1280x800.jpg   # proposals only
-run_tinytag.sh /mnt/data/tinytag-samples/frame-640x360.png    # no resize
+run_tinytag.sh                                                  # bundled sample, all defaults
+run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg   # proposals only
+run_tinytag.sh /app/tinytag_detect/samples/frame-640x360.png    # no resize
 
 # full two-stage pipeline: proposals + AprilTag 36h11 ids
-TINYTAG_DECODE=strict run_tinytag.sh /mnt/data/tinytag-samples/arena-1280x800.jpg
+TINYTAG_DECODE=strict run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg
 ```
 
 Or any image of your own:
@@ -102,7 +106,7 @@ environment:
 
 | variable | default | meaning |
 |---|---|---|
-| `TINYTAG_MODEL` | `/mnt/cvimodel/tinytag-v40c.int8.cvimodel` | cvimodel to load |
+| `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel` | cvimodel to load |
 | `TINYTAG_THRES` | `0.35` | heatmap threshold |
 | `TINYTAG_MAX` | `8` | max proposals per frame |
 | `TINYTAG_EXPAND` | `1.5` | ROI expansion factor |
@@ -111,7 +115,7 @@ environment:
 | `TINYTAG_DEBUG` | `1` | 0 quiet, 1 timing, 2 verbose |
 | `TINYTAG_REPEAT` | `20` | timed inference runs |
 | `TINYTAG_WARMUP` | `2` | untimed runs before measuring |
-| `TINYTAG_GOLDEN` | `/mnt/cvimodel/tinytag-v40c.ttgold` | self-test bundle |
+| `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/tinytag-v40c.ttgold` | self-test bundle |
 | `TINYTAG_MAX_MAE` | `0.05` | self-test error gate |
 | `TINYTAG_DECODE` | *(off)* | `strict` or `tolerant` — enables stage two |
 
