@@ -408,6 +408,8 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     results.clear();
     crop_count_ = 0;
 
+    crop_rects_.clear();
+
     if (!decoder_)
     {
         crop_decode_ms_ = 0.0;
@@ -429,8 +431,24 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         if (x1 - x0 < 8 || y1 - y0 < 8)
             continue; // too small for the decoder's minSize to ever accept
 
+        // Widen to the alignment grid, then re-clamp. Expanding outward keeps
+        // the whole proposal and only ever adds context.
+        int ax0 = x0, ax1 = x1;
+        if (crop_align_ > 1)
+        {
+            const int a = crop_align_;
+            ax0 = (x0 / a) * a;
+            ax1 = ((x1 + a - 1) / a) * a;
+            if (ax0 < 0)
+                ax0 = 0;
+            if (ax1 > full_res_gray.cols)
+                ax1 = full_res_gray.cols;
+        }
+
         // Zero-copy view; the decoder respects .step so no clone is needed.
-        const cv::Mat crop = full_res_gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+        const cv::Rect crop_rect(ax0, y0, ax1 - ax0, y1 - y0);
+        const cv::Mat crop = full_res_gray(crop_rect);
+        crop_rects_.push_back(crop_rect);
         ++crop_count_;
 
         for (const auto &tag : decoder_->detect(crop))
@@ -439,10 +457,11 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             result.id = tag.id;
             result.proposal_confidence = proposal.confidence;
             result.roi = proposal.roi;
-            result.center = tag.center + cv::Point2f(static_cast<float>(x0), static_cast<float>(y0));
+            const cv::Point2f origin(static_cast<float>(crop_rect.x),
+                                     static_cast<float>(crop_rect.y));
+            result.center = tag.center + origin;
             for (int corner = 0; corner < 4; ++corner)
-                result.corners[corner] =
-                    tag.corners[corner] + cv::Point2f(static_cast<float>(x0), static_cast<float>(y0));
+                result.corners[corner] = tag.corners[corner] + origin;
             results.push_back(result);
         }
     }

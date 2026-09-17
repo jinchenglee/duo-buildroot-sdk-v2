@@ -41,6 +41,7 @@ extern "C" {
 #include <cvi_awb.h>
 #include <cvi_comm.h>
 #include <cvi_isp.h>
+#include <cvi_vi.h>
 #include <rtsp.h>
 #include <sample_comm.h>
 }
@@ -91,10 +92,59 @@ constexpr VENC_CHN kVencChn = 0;
 constexpr int kPreviewBitrateKbps = 3000;
 constexpr size_t kLumaRtspQueueDepth = 4;
 
+// A preview surface owns an NV21 frame the detector copies luma into. Two of
+// them ping-pong so the worker can still be drawing frame N while the detector
+// copies frame N+1. Allocated once at init; nothing here is allocated or freed
+// in the frame loop.
+//
+// The scene stays monochrome -- luma is a byte-exact copy of the plane the
+// detector ran on -- while the chroma plane starts neutral and is written only
+// where the overlay draws, so boxes and text render in colour over a grey
+// image. `dirty` records the chroma rectangles written last time round so they
+// can be reset to neutral without touching the whole plane.
+constexpr size_t kPreviewSurfaceCount = 2;
+struct PreviewSurface
+{
+    CVI_U64 y_phy = 0, c_phy = 0;
+    CVI_VOID *y_vir = nullptr;
+    CVI_VOID *c_vir = nullptr;
+    CVI_U32 y_len = 0, c_len = 0;
+    CVI_U32 y_stride = 0, c_stride = 0;
+    std::vector<cv::Rect> dirty;
+};
+
+// Single-frame "latest value" slot between the capture thread and the
+// detector. The capture thread blocks on GetChnFrame and always overwrites the
+// slot, releasing whatever it displaces, so the detector never polls, never
+// drains a queue, and always picks up the freshest frame the camera has
+// produced -- at most one capture period old, whatever the capture rate.
+//
+// Faster capture therefore lowers latency rather than building a backlog: at
+// 130 fps the slot refreshes every 7.7 ms, so a 20 ms detection starts on a
+// frame at most 7.7 ms stale instead of 33 ms.
+struct CaptureSlot
+{
+    std::mutex mutex;
+    std::condition_variable not_empty;
+    VIDEO_FRAME_INFO_S frame{};
+    bool full = false;
+    bool stopping = false;
+    size_t dropped = 0; // superseded before the detector could take them
+};
+
 struct LumaRtspItem
 {
     VIDEO_FRAME_INFO_S source{};
     VIDEO_FRAME_INFO_S encoded{};
+    // Set when the item carries a copied preview surface rather than a
+    // borrowed VPSS frame; the worker then draws and the detector has already
+    // released the VPSS buffer.
+    PreviewSurface *surface = nullptr;
+    std::vector<Proposal> proposals;
+    std::vector<TinyTagResult> tags;
+    std::vector<cv::Rect> crops;
+    double fps = 0.0;
+    double busy_ms = 0.0;
 };
 
 struct LumaRtspQueue
@@ -117,6 +167,7 @@ struct Overlay
     std::mutex mutex;
     std::vector<Proposal> proposals;
     std::vector<TinyTagResult> tags;
+    std::vector<cv::Rect> crops;
     double fps = 0.0;
     double busy_ms = 0.0;
 } g_overlay;
@@ -132,6 +183,17 @@ void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
             "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png] [--rtsp]\n"
+            "       [--mirror 0|1] [--flip 0|1] [--crop-align N]\n"
+            "\n"
+            "  --mirror 1  correct a horizontally mirrored sensor. Mirrored frames decode\n"
+            "              ZERO tags (AprilTag markers are chiral) while proposals still\n"
+            "              look correct. Applied in VI hardware: no per-frame cost.\n"
+            "  --flip 1    same, vertically.\n"
+            "  --crop-align N  widen each decode crop horizontally to a multiple of N\n"
+            "              pixels (default 4, so every crop row starts 4-byte aligned\n"
+            "              and is a whole number of 32-bit words). 0 or 1 disables.\n"
+            "              Aligned regions are drawn in pink on the preview.\n"
+
             "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n",
             argv0);
 }
@@ -305,10 +367,14 @@ struct CameraContext
     uint32_t height = 0;
     bool preview = false;
     bool preview_luma = false;
-    CVI_U64 rtsp_chroma_phy = 0;
-    CVI_VOID *rtsp_chroma_vir = nullptr;
-    CVI_U32 rtsp_chroma_len = 0;
-    CVI_U32 rtsp_chroma_stride = 0;
+    // Applied once to the VI channel at setup, so the capture hardware
+    // delivers corrected pixels and the per-frame cost is zero. A software
+    // cv::flip would cost a full pass over the ~900 KB luma plane every frame.
+    bool mirror = false;
+    bool flip = false;
+    CaptureSlot capture;
+    std::thread capture_worker;
+    PreviewSurface preview_surfaces[kPreviewSurfaceCount];
     std::vector<VENC_PACK_S> venc_packs;
     LumaRtspQueue luma_rtsp_queue;
     std::thread luma_rtsp_worker;
@@ -483,19 +549,37 @@ bool setup_camera(CameraContext &ctx)
         COMMON_GetPicBufferConfig(kDetWidth, kDetHeight, VI_PIXEL_FORMAT,
                                   DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN,
                                   &chroma_cfg);
-        ctx.rtsp_chroma_len = chroma_cfg.u32MainCSize;
-        ctx.rtsp_chroma_stride = chroma_cfg.u32CStride;
-        if (CVI_SYS_IonAlloc(&ctx.rtsp_chroma_phy, &ctx.rtsp_chroma_vir,
-                             "tinytag_rtsp_chroma", ctx.rtsp_chroma_len) != CVI_SUCCESS)
+        // Two NV21 surfaces the detector copies luma into, so drawing and
+        // encoding happen on the preview thread against a private buffer and
+        // the detector's VPSS frame can be released immediately. Allocated
+        // once here; the frame loop never allocates.
+        for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
         {
-            fprintf(stderr, "[camera] neutral RTSP chroma allocation failed\n");
-            return false;
+            PreviewSurface &sfc = ctx.preview_surfaces[i];
+            sfc.y_len = chroma_cfg.u32MainYSize;
+            sfc.y_stride = chroma_cfg.u32MainStride;
+            sfc.c_len = chroma_cfg.u32MainCSize;
+            sfc.c_stride = chroma_cfg.u32CStride;
+            char name[32];
+            snprintf(name, sizeof(name), "tinytag_preview_y%zu", i);
+            if (CVI_SYS_IonAlloc(&sfc.y_phy, &sfc.y_vir, name, sfc.y_len) != CVI_SUCCESS)
+            {
+                fprintf(stderr, "[camera] preview luma allocation failed\n");
+                return false;
+            }
+            snprintf(name, sizeof(name), "tinytag_preview_c%zu", i);
+            if (CVI_SYS_IonAlloc(&sfc.c_phy, &sfc.c_vir, name, sfc.c_len) != CVI_SUCCESS)
+            {
+                fprintf(stderr, "[camera] preview chroma allocation failed\n");
+                return false;
+            }
+            // 128/128 is neutral: the scene renders grey. The overlay writes
+            // real chroma only where it draws, and those rectangles are reset
+            // here on the next pass -- see PreviewSurface::dirty.
+            std::memset(sfc.c_vir, 128, sfc.c_len);
+            CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+            sfc.dirty.reserve(64);
         }
-        // 128/128 is neutral chroma. It is initialized once and never
-        // modified in the frame loop, so the encoded image remains luma-only.
-        std::memset(ctx.rtsp_chroma_vir, 128, ctx.rtsp_chroma_len);
-        CVI_SYS_IonFlushCache(ctx.rtsp_chroma_phy, ctx.rtsp_chroma_vir,
-                              ctx.rtsp_chroma_len);
     }
 
     VI_VPSS_MODE_S vi_vpss_mode{};
@@ -512,6 +596,23 @@ bool setup_camera(CameraContext &ctx)
     CVI_ISP_GetPubAttr(0, &pub_attr);
     pub_attr.f32FrameRate = 30;
     CVI_ISP_SetPubAttr(0, &pub_attr);
+
+    // Orientation is fixed in the VI channel rather than per frame. Mirroring
+    // matters beyond cosmetics here: AprilTag/ArUco markers are chiral, so a
+    // mirrored frame decodes to nothing at all -- the network still proposes
+    // ROIs on tag-like texture, but no quad ever matches the dictionary.
+    // Runtime-selectable because which setting is correct depends on the
+    // camera module, and getting it wrong is silent apart from zero decodes.
+    if (ctx.mirror || ctx.flip)
+    {
+        const CVI_S32 rc = CVI_VI_SetChnFlipMirror(
+            0, 0, ctx.flip ? CVI_TRUE : CVI_FALSE, ctx.mirror ? CVI_TRUE : CVI_FALSE);
+        if (rc != CVI_SUCCESS)
+            fprintf(stderr, "[camera] CVI_VI_SetChnFlipMirror(flip=%d mirror=%d) failed: %#x\n",
+                    ctx.flip, ctx.mirror, rc);
+        else
+            fprintf(stderr, "[camera] orientation: flip=%d mirror=%d\n", ctx.flip, ctx.mirror);
+    }
 
     // VPSS device/mode setup. u8VpssDev is only meaningful in VPSS_MODE_DUAL
     // (see cvi_comm_vpss.h), and this board's VI runs offline-into-VPSS, so a
@@ -596,12 +697,22 @@ struct Nv21Color
 };
 constexpr Nv21Color kProposalColor{210, 16, 146}; // yellow
 constexpr Nv21Color kTagColor{145, 54, 34};       // green
+constexpr Nv21Color kAlignColor{158, 140, 197};   // pink
 
-void draw_box(cv::Mat &y, cv::Mat &vu, const cv::Rect &r, Nv21Color c, int thickness)
+void draw_box(cv::Mat &y, cv::Mat &vu, const cv::Rect &r, Nv21Color c, int thickness,
+              std::vector<cv::Rect> *dirty = nullptr)
 {
     cv::rectangle(y, r, cv::Scalar(c.y), thickness);
     cv::Rect half(r.x / 2, r.y / 2, std::max(1, r.width / 2), std::max(1, r.height / 2));
-    cv::rectangle(vu, half, cv::Scalar(c.v, c.u), std::max(1, thickness / 2));
+    const int half_thick = std::max(1, thickness / 2);
+    cv::rectangle(vu, half, cv::Scalar(c.v, c.u), half_thick);
+    if (dirty != nullptr)
+    {
+        // Widen by the stroke so the reset covers the whole drawn outline.
+        const int pad = half_thick + 1;
+        dirty->push_back(cv::Rect(half.x - pad, half.y - pad,
+                                  half.width + 2 * pad, half.height + 2 * pad));
+    }
 }
 
 // Dark outline under light text so labels read on any background.
@@ -610,6 +721,84 @@ void draw_label(cv::Mat &y, const std::string &text, cv::Point org, double scale
     cv::putText(y, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0), 4);
     cv::putText(y, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255), 2);
 }
+
+// Pulls frames as fast as the camera produces them and keeps only the newest.
+void capture_loop(CameraContext *ctx)
+{
+    CaptureSlot &slot = ctx->capture;
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        // Blocking is fine here: this thread exists precisely so the detector
+        // never has to wait on the driver.
+        if (CVI_VPSS_GetChnFrame(kVpssGrp, kVpssChn, &frame, 1000) != CVI_SUCCESS)
+            continue;
+
+        VIDEO_FRAME_INFO_S superseded{};
+        bool release_superseded = false;
+        {
+            std::lock_guard<std::mutex> lock(slot.mutex);
+            if (slot.stopping)
+            {
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+                return;
+            }
+            if (slot.full)
+            {
+                // The detector is still busy; this older frame is now stale.
+                superseded = slot.frame;
+                release_superseded = true;
+                ++slot.dropped;
+            }
+            slot.frame = frame;
+            slot.full = true;
+        }
+        // Released outside the lock so the detector is never blocked by an
+        // ioctl it has no interest in.
+        if (release_superseded)
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &superseded);
+        slot.not_empty.notify_one();
+    }
+}
+
+// Blocks only when the camera has not produced a frame yet -- the healthy case
+// when detection outruns capture.
+bool take_latest_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &out)
+{
+    CaptureSlot &slot = ctx.capture;
+    std::unique_lock<std::mutex> lock(slot.mutex);
+    slot.not_empty.wait(lock, [&slot] { return slot.full || slot.stopping || g_stop; });
+    if (!slot.full)
+        return false;
+    out = slot.frame;
+    slot.full = false;
+    return true;
+}
+
+void stop_capture(CameraContext &ctx)
+{
+    {
+        std::lock_guard<std::mutex> lock(ctx.capture.mutex);
+        ctx.capture.stopping = true;
+    }
+    ctx.capture.not_empty.notify_all();
+    if (ctx.capture_worker.joinable())
+        ctx.capture_worker.join();
+    // Whatever the detector never collected still belongs to VPSS.
+    std::lock_guard<std::mutex> lock(ctx.capture.mutex);
+    if (ctx.capture.full)
+    {
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &ctx.capture.frame);
+        ctx.capture.full = false;
+    }
+}
+
+// Defined below, next to the preview loop; declared here because the luma RTSP
+// worker draws before that point in the file.
+void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+                       const std::vector<TinyTagResult> &tags,
+                       const std::vector<cv::Rect> &crops, double fps, double busy_ms,
+                       std::vector<cv::Rect> *dirty);
 
 // Encode one NV21 frame and hand the bitstream to the RTSP server. Same
 // sequence as SAMPLE_TDL_Send_Frame_RTSP in tdl_sdk's middleware_utils.c.
@@ -642,18 +831,26 @@ void send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
     CVI_VENC_ReleaseStream(kVencChn, &stream);
 }
 
-bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &source,
-                       const VIDEO_FRAME_INFO_S &encoded)
+bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
+                       PreviewSurface *surface, const std::vector<Proposal> &proposals,
+                       const std::vector<TinyTagResult> &tags,
+                       const std::vector<cv::Rect> &crops, double fps, double busy_ms)
 {
     LumaRtspQueue &queue = ctx.luma_rtsp_queue;
     std::unique_lock<std::mutex> lock(queue.mutex);
-    queue.not_full.wait(lock, [&queue] { return queue.count < kLumaRtspQueueDepth || queue.stopping; });
-    if (queue.stopping)
+    // Never block the detector: if the encoder has fallen behind, drop this
+    // preview frame rather than stalling detection for it.
+    if (queue.count >= kLumaRtspQueueDepth || queue.stopping)
         return false;
 
     LumaRtspItem &item = queue.items[queue.tail];
-    item.source = source;
     item.encoded = encoded;
+    item.surface = surface;
+    item.proposals = proposals;
+    item.tags = tags;
+    item.crops = crops;
+    item.fps = fps;
+    item.busy_ms = busy_ms;
     queue.tail = (queue.tail + 1) % kLumaRtspQueueDepth;
     ++queue.count;
     lock.unlock();
@@ -679,8 +876,31 @@ void luma_rtsp_loop(CameraContext *ctx)
         }
         queue.not_full.notify_one();
 
+        if (item.surface != nullptr)
+        {
+            PreviewSurface &sfc = *item.surface;
+            const VIDEO_FRAME_S &vf = item.encoded.stVFrame;
+            cv::Mat y(vf.u32Height, vf.u32Width, CV_8UC1,
+                      static_cast<uint8_t *>(sfc.y_vir), sfc.y_stride);
+            cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
+                       static_cast<uint8_t *>(sfc.c_vir), sfc.c_stride);
+
+            // Reset only the chroma this surface coloured last time, so the
+            // scene returns to neutral grey without rewriting the whole plane.
+            for (const auto &r : sfc.dirty)
+                vu(r & cv::Rect(0, 0, vu.cols, vu.rows)).setTo(cv::Scalar(128, 128));
+            sfc.dirty.clear();
+
+            draw_overlay_nv21(y, vu, item.proposals, item.tags, item.crops, item.fps,
+                              item.busy_ms, &sfc.dirty);
+
+            CVI_SYS_IonFlushCache(sfc.y_phy, sfc.y_vir, sfc.y_len);
+            CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+        }
+
         send_to_rtsp(*ctx, item.encoded);
-        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &item.source);
+        if (item.surface == nullptr)
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &item.source);
     }
 }
 
@@ -698,11 +918,61 @@ void stop_luma_rtsp(CameraContext &ctx)
 }
 
 // Pulls preview frames, draws the newest detections on them, and streams.
+// Draws the overlay into an NV21 pair. Boxes and text go into Y; colour comes
+// from writing the chroma plane, so this works over a monochrome scene.
+// When `dirty` is non-null every chroma rectangle touched is appended to it, so
+// the caller can reset exactly those regions next frame instead of clearing the
+// whole plane.
+void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+                       const std::vector<TinyTagResult> &tags,
+                       const std::vector<cv::Rect> &crops, double fps, double busy_ms,
+                       std::vector<cv::Rect> *dirty)
+{
+    // Aligned crop regions actually handed to the decoder -- at most --max of
+    // them. Drawn first and thin so the proposal boxes stay readable on top.
+    for (const auto &c : crops)
+        draw_box(y, vu, c, kAlignColor, 1, dirty);
+
+    // One label per ROI: a decoded tag appends " id N" to its proposal's
+    // confidence rather than drawing a second label at the same anchor, which
+    // used to overprint and leave both unreadable.
+    for (const auto &p : proposals)
+    {
+        const TinyTagResult *hit = nullptr;
+        for (const auto &t : tags)
+        {
+            if (t.roi == p.roi)
+            {
+                hit = &t;
+                break;
+            }
+        }
+
+        draw_box(y, vu, p.roi, hit ? kTagColor : kProposalColor, hit ? 4 : 2, dirty);
+        const int label_x = std::max(0, static_cast<int>(p.roi.x));
+        const int label_y = p.roi.y >= 28.0f
+                                ? static_cast<int>(p.roi.y) - 8
+                                : std::min(y.rows - 4, static_cast<int>(p.roi.y + p.roi.height) + 22);
+        char label[48];
+        if (hit)
+            snprintf(label, sizeof(label), "%.2f id %d", p.confidence, hit->id);
+        else
+            snprintf(label, sizeof(label), "%.2f", p.confidence);
+        draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), hit ? 0.9 : 0.65);
+    }
+
+    char status[96];
+    snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop  %zu tags", fps, busy_ms,
+             proposals.size(), tags.size());
+    draw_label(y, status, cv::Point(16, 40), 0.9);
+}
+
 // Runs beside the detector loop, which only has to publish into g_overlay.
 void preview_loop(CameraContext *ctx)
 {
     std::vector<Proposal> proposals;
     std::vector<TinyTagResult> tags;
+    std::vector<cv::Rect> crops;
     while (!g_stop)
     {
         VIDEO_FRAME_INFO_S frame{};
@@ -731,33 +1001,11 @@ void preview_loop(CameraContext *ctx)
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
             proposals = g_overlay.proposals;
             tags = g_overlay.tags;
+            crops = g_overlay.crops;
             fps = g_overlay.fps;
             busy_ms = g_overlay.busy_ms;
         }
-        for (const auto &p : proposals)
-        {
-            draw_box(y, vu, p.roi, kProposalColor, 2);
-            const int label_x = std::max(0, static_cast<int>(p.roi.x));
-            const int label_y = p.roi.y >= 28.0f
-                                    ? static_cast<int>(p.roi.y) - 8
-                                    : std::min(static_cast<int>(vf.u32Height) - 4,
-                                               static_cast<int>(p.roi.y + p.roi.height) + 22);
-            char label[32];
-            snprintf(label, sizeof(label), "%.2f", p.confidence);
-            draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), 0.65);
-        }
-        for (const auto &t : tags)
-        {
-            cv::Rect r = t.roi;
-            draw_box(y, vu, r, kTagColor, 6);
-            char label[48];
-            snprintf(label, sizeof(label), "id %d %.2f", t.id, t.proposal_confidence);
-            draw_label(y, label, cv::Point(std::max(0, r.x), std::max(24, r.y - 8)), 0.9);
-        }
-        char status[96];
-        snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop  %zu tags", fps, busy_ms,
-                 proposals.size(), tags.size());
-        draw_label(y, status, cv::Point(16, 40), 0.9);
+        draw_overlay_nv21(y, vu, proposals, tags, crops, fps, busy_ms, nullptr);
 
         // We wrote through a cached mapping; flush so VENC, which reads the
         // physical buffer via DMA, sees the boxes.
@@ -767,38 +1015,6 @@ void preview_loop(CameraContext *ctx)
         send_to_rtsp(*ctx, frame);
         CVI_VPSS_ReleaseChnFrame(kVpssGrp, kPreviewChn, &frame);
     }
-}
-
-// Luma-only overlay for --rtsp-luma. The detector frame is sent directly to
-// VENC; only its Y plane is modified. The neutral chroma buffer allocated at
-// setup remains untouched and is reused for every encoded frame.
-void draw_luma_overlay(cv::Mat &y, const std::vector<Proposal> &proposals,
-                       const std::vector<TinyTagResult> &tags, double fps, double busy_ms)
-{
-    for (const auto &p : proposals)
-    {
-        cv::rectangle(y, p.roi, cv::Scalar(210), 2);
-        const int label_x = std::max(0, static_cast<int>(p.roi.x));
-        const int label_y = p.roi.y >= 28.0f
-                                ? static_cast<int>(p.roi.y) - 8
-                                : std::min(y.rows - 4,
-                                           static_cast<int>(p.roi.y + p.roi.height) + 22);
-        char label[32];
-        snprintf(label, sizeof(label), "%.2f", p.confidence);
-        draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), 0.65);
-    }
-    for (const auto &t : tags)
-    {
-        const cv::Rect r = t.roi;
-        cv::rectangle(y, r, cv::Scalar(145), 6);
-        char label[48];
-        snprintf(label, sizeof(label), "id %d %.2f", t.id, t.proposal_confidence);
-        draw_label(y, label, cv::Point(std::max(0, r.x), std::max(24, r.y - 8)), 0.9);
-    }
-    char status[96];
-    snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop  %zu tags", fps, busy_ms,
-             proposals.size(), tags.size());
-    draw_label(y, status, cv::Point(16, 40), 0.9);
 }
 
 void teardown_camera(CameraContext &ctx)
@@ -824,11 +1040,21 @@ void teardown_camera(CameraContext &ctx)
         chn_enable[kPreviewChn] = CVI_TRUE;
     SAMPLE_COMM_VPSS_Stop(kVpssGrp, chn_enable);
 
-    if (ctx.rtsp_chroma_vir)
+    for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
     {
-        CVI_SYS_IonFree(ctx.rtsp_chroma_phy, ctx.rtsp_chroma_vir);
-        ctx.rtsp_chroma_phy = 0;
-        ctx.rtsp_chroma_vir = nullptr;
+        PreviewSurface &sfc = ctx.preview_surfaces[i];
+        if (sfc.y_vir)
+        {
+            CVI_SYS_IonFree(sfc.y_phy, sfc.y_vir);
+            sfc.y_phy = 0;
+            sfc.y_vir = nullptr;
+        }
+        if (sfc.c_vir)
+        {
+            CVI_SYS_IonFree(sfc.c_phy, sfc.c_vir);
+            sfc.c_phy = 0;
+            sfc.c_vir = nullptr;
+        }
     }
 
     CVI_SYS_Exit();
@@ -851,6 +1077,8 @@ int main(int argc, char *argv[])
     bool decode = false, decode_tolerant = false;
     std::string save_frame_path;
     bool rtsp = false, rtsp_luma = false;
+    bool mirror = false, flip = false;
+    int crop_align = 4;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -862,6 +1090,9 @@ int main(int argc, char *argv[])
         else if (flag == "--iou" && has_value) roi_iou_thres = std::atof(argv[++i]);
         else if (flag == "--debug" && has_value) debug_mode = std::atoi(argv[++i]);
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
+        else if (flag == "--crop-align" && has_value) crop_align = std::atoi(argv[++i]);
+        else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
+        else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--decode" && has_value)
@@ -890,8 +1121,12 @@ int main(int argc, char *argv[])
     CameraContext ctx;
     ctx.preview = rtsp;
     ctx.preview_luma = rtsp_luma;
+    ctx.mirror = mirror;
+    ctx.flip = flip;
     if (!setup_camera(ctx))
         return 1;
+
+    ctx.capture_worker = std::thread(capture_loop, &ctx);
 
     pthread_t isp_thread;
     pthread_create(&isp_thread, nullptr, isp_control_thread, nullptr);
@@ -905,6 +1140,9 @@ int main(int argc, char *argv[])
 
     TinyTagDet detector(cvimodel_path, heatmap_thres, max_proposals, roi_expand, roi_iou_thres,
                         debug_mode);
+    detector.set_crop_align(crop_align);
+    if (detector.crop_align() > 1)
+        fprintf(stderr, "[camera] crop align: %d px\n", detector.crop_align());
     if (decode)
     {
         detector.set_decoder(make_aruco_nano_decoder(decode_tolerant));
@@ -925,7 +1163,17 @@ int main(int argc, char *argv[])
         long frames = 0;
         double wait = 0, map = 0, pre = 0, infer = 0, decode = 0, crop = 0, release = 0;
         size_t proposals = 0;
+        // Gap in the camera's own frame counter between consecutive frames the
+        // detector processed. 1 means nothing was skipped; >1 means the capture
+        // thread superseded that many. Summing the gaps over a second should
+        // come out at the capture rate, which is what proves the detector is
+        // taking the newest frame rather than dropping arbitrary ones.
+        unsigned seq_sum = 0;
+        unsigned seq_max = 0;
+        long seq_samples = 0;
     } win;
+    CVI_U32 prev_seq = 0;
+    bool have_prev_seq = false;
     double fps_window_start = now_ms();
     double overlay_fps = 0.0;
     double overlay_busy_ms = 0.0;
@@ -937,19 +1185,31 @@ int main(int argc, char *argv[])
     bool logged_first_frame = false;
     constexpr int kSaveFrameIndex = 30;
     int frames_seen = 0;
+    uint64_t preview_seq = 0;
+    size_t stale_prev = 0;
     while (!g_stop)
     {
         VIDEO_FRAME_INFO_S frame{};
         const double t_wait = now_ms();
-        CVI_S32 ret = CVI_VPSS_GetChnFrame(kVpssGrp, kVpssChn, &frame, 1000);
+        // Always the newest frame the camera has produced; the capture thread
+        // has already discarded anything staler. Blocks only if none exists yet.
+        if (!take_latest_frame(ctx, frame))
+            break;
         const double t_got = now_ms();
-        if (ret != CVI_SUCCESS)
+
+        // u32TimeRef is the camera's frame counter. Unsigned subtraction wraps
+        // correctly, so no special case at the 32-bit boundary.
+        const CVI_U32 seq = frame.stVFrame.u32TimeRef;
+        if (have_prev_seq)
         {
-            // The first call or two time out (0xc006800e) while the ISP is
-            // still starting up; harmless.
-            fprintf(stderr, "[camera] CVI_VPSS_GetChnFrame failed: %#x\n", ret);
-            continue;
+            const unsigned gap = static_cast<unsigned>(seq - prev_seq);
+            win.seq_sum += gap;
+            if (gap > win.seq_max)
+                win.seq_max = gap;
+            ++win.seq_samples;
         }
+        prev_seq = seq;
+        have_prev_seq = true;
 
         // GetChnFrame returns *physical* addresses only -- pu8VirAddr is left
         // NULL. The caller maps the plane itself, then invalidates the CPU
@@ -979,6 +1239,10 @@ int main(int argc, char *argv[])
 
         if (!logged_first_frame)
         {
+            // If u64PTS is non-zero the kernel populates it and true frame age
+            // could be measured directly; nothing in this tree sets it.
+            fprintf(stderr, "[camera] first frame: timeRef=%u pts=%llu\n", vf.u32TimeRef,
+                    (unsigned long long)vf.u64PTS);
             fprintf(stderr, "[camera] first frame: %ux%u stride=%u len=%u fmt=%d\n", vf.u32Width,
                     vf.u32Height, vf.u32Stride[0], map_len, vf.enPixelFormat);
             logged_first_frame = true;
@@ -999,39 +1263,43 @@ int main(int argc, char *argv[])
         const double t_detected = now_ms();
 
         VIDEO_FRAME_INFO_S rtsp_frame{};
+        PreviewSurface *surface = nullptr;
         if (ctx.preview_luma)
         {
-            draw_luma_overlay(gray, proposals, results, overlay_fps, overlay_busy_ms);
-            CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], luma, map_len);
+            // Byte-exact copy of the plane the detector just ran on, into a
+            // surface allocated at init. This is the only per-frame image copy
+            // and it buys back the drawing and the ~900 KB cache flush that
+            // used to sit on this thread. Row-wise because the strides differ.
+            surface = &ctx.preview_surfaces[preview_seq++ % kPreviewSurfaceCount];
+            uint8_t *dst = static_cast<uint8_t *>(surface->y_vir);
+            for (CVI_U32 row = 0; row < vf.u32Height; ++row)
+                std::memcpy(dst + static_cast<size_t>(row) * surface->y_stride,
+                            luma + static_cast<size_t>(row) * vf.u32Stride[0], vf.u32Width);
 
-            // Reuse the detector frame's Y plane directly. Only the frame
-            // descriptor is copied; the neutral chroma plane was allocated
-            // and initialized once during setup.
             rtsp_frame = frame;
             VIDEO_FRAME_S &rf = rtsp_frame.stVFrame;
             rf.enPixelFormat = PIXEL_FORMAT_NV21;
-            rf.u32Stride[1] = ctx.rtsp_chroma_stride;
-            rf.u32Length[1] = ctx.rtsp_chroma_len;
-            rf.u64PhyAddr[1] = ctx.rtsp_chroma_phy;
-            rf.pu8VirAddr[1] = static_cast<CVI_U8 *>(ctx.rtsp_chroma_vir);
+            rf.u32Stride[0] = surface->y_stride;
+            rf.u32Length[0] = surface->y_len;
+            rf.u64PhyAddr[0] = surface->y_phy;
+            rf.pu8VirAddr[0] = static_cast<CVI_U8 *>(surface->y_vir);
+            rf.u32Stride[1] = surface->c_stride;
+            rf.u32Length[1] = surface->c_len;
+            rf.u64PhyAddr[1] = surface->c_phy;
+            rf.pu8VirAddr[1] = static_cast<CVI_U8 *>(surface->c_vir);
             rf.u32Stride[2] = 0;
             rf.u32Length[2] = 0;
             rf.u64PhyAddr[2] = 0;
             rf.pu8VirAddr[2] = nullptr;
         }
 
-        // The luma RTSP worker owns the frame until VENC has finished with it;
-        // the normal path releases it immediately after detection.
+        // The detector no longer lends its buffer to the encoder, so the VPSS
+        // frame goes back to the pool immediately in both modes.
         CVI_SYS_Munmap(luma, map_len);
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
         if (ctx.preview_luma)
-        {
-            if (!enqueue_luma_rtsp(ctx, frame, rtsp_frame))
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
-        }
-        else
-        {
-            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
-        }
+            enqueue_luma_rtsp(ctx, rtsp_frame, surface, proposals, results,
+                              detector.last_crop_rects(), overlay_fps, overlay_busy_ms);
         const double t_released = now_ms();
 
         ++win.frames;
@@ -1048,6 +1316,7 @@ int main(int argc, char *argv[])
         {
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
             g_overlay.proposals = proposals;
+            g_overlay.crops = detector.last_crop_rects();
             if (decode)
                 g_overlay.tags = results;
         }
@@ -1061,14 +1330,22 @@ int main(int argc, char *argv[])
         const double t_now = now_ms();
         if (t_now - fps_window_start >= 1000.0)
         {
+            size_t stale_now;
+            {
+                std::lock_guard<std::mutex> lock(ctx.capture.mutex);
+                stale_now = ctx.capture.dropped;
+            }
             const double n = static_cast<double>(win.frames);
             const double busy = (win.map + win.pre + win.infer + win.decode + win.crop + win.release) / n;
             fprintf(stderr,
                     "[camera] %.1f fps | per frame ms: wait %.2f map %.2f pre %.2f infer %.2f "
-                    "decode %.2f crop %.2f release %.2f = busy %.2f | %.1f proposals\n",
+                    "decode %.2f crop %.2f release %.2f = busy %.2f | %.1f proposals | %zu stale"
+                    " | seq mean %.2f max %u sum %u\n",
                     n * 1000.0 / (t_now - fps_window_start), win.wait / n, win.map / n, win.pre / n,
                     win.infer / n, win.decode / n, win.crop / n, win.release / n, busy,
-                    win.proposals / n);
+                    win.proposals / n, stale_now - stale_prev,
+                    win.seq_samples ? static_cast<double>(win.seq_sum) / win.seq_samples : 0.0,
+                    win.seq_max, win.seq_sum);
             if (ctx.preview && !ctx.preview_luma)
             {
                 if (!ctx.preview_luma)
@@ -1080,6 +1357,7 @@ int main(int argc, char *argv[])
             }
             overlay_fps = n * 1000.0 / (t_now - fps_window_start);
             overlay_busy_ms = busy;
+            stale_prev = stale_now;
             win = StageTotals{};
             fps_window_start = t_now;
         }
@@ -1088,6 +1366,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "[camera] stopping\n");
     if (preview.joinable())
         preview.join();
+    stop_capture(ctx);
     stop_luma_rtsp(ctx);
     teardown_camera(ctx);
     return 0;

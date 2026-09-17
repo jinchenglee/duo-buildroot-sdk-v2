@@ -13,6 +13,20 @@ IOU="${TINYTAG_LIVE_IOU:-0.5}"
 DECODE="${TINYTAG_LIVE_DECODE:-strict}"
 DEBUG="${TINYTAG_LIVE_DEBUG:-1}"
 
+# Sensor orientation, applied once in VI hardware (no per-frame cost).
+# MIRROR defaults to 1: the OV5647 module on this board delivers a
+# horizontally mirrored frame, and because AprilTag markers are chiral a
+# mirrored frame decodes ZERO tags while proposals still look correct.
+# Set TINYTAG_LIVE_MIRROR=0 to see the uncorrected image, e.g. on a module
+# that does not need it.
+MIRROR="${TINYTAG_LIVE_MIRROR:-1}"
+FLIP="${TINYTAG_LIVE_FLIP:-0}"
+
+# Widen each decode crop horizontally to a multiple of this many pixels, so
+# every crop row starts 4-byte aligned and spans whole 32-bit words. Set 0 or 1
+# to disable and compare. Aligned regions show pink on the preview.
+CROP_ALIGN="${TINYTAG_LIVE_CROP_ALIGN:-4}"
+
 [ -x "${BIN}" ] || { echo "Error: ${BIN} not found or not executable" >&2; exit 1; }
 [ -f "${MODEL}" ] || { echo "Error: model ${MODEL} not found" >&2; exit 1; }
 
@@ -29,6 +43,9 @@ exec "${BIN}" "${MODEL}" \
     --expand "${EXPAND}" \
     --iou "${IOU}" \
     --decode "${DECODE}" \
+    --mirror "${MIRROR}" \
+    --flip "${FLIP}" \
+    --crop-align "${CROP_ALIGN}" \
     --debug "${DEBUG}" \
     --rtsp \
     "$@"

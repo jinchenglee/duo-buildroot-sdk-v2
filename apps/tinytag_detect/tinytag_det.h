@@ -98,6 +98,21 @@ public:
                       std::vector<TinyTagResult> &results);
 
     void set_decoder(std::shared_ptr<TagCropDecoder> decoder) { decoder_ = std::move(decoder); }
+
+    // Snap each crop's horizontal extent out to a multiple of `align` pixels.
+    // One luma pixel is one byte, so align=4 starts every row of the crop on a
+    // 4-byte boundary and makes its width a whole number of 32-bit words --
+    // friendlier for the decoder's row scans. Only x is adjusted: each row
+    // already begins at a multiple of the Mat's stride, so aligning y changes
+    // no byte address. Expanding never loses image data, and the extra margin
+    // is harmless to the decoder (it needs a quiet zone anyway). 0 or 1
+    // disables. Default 4.
+    void set_crop_align(int align) { crop_align_ = align > 1 ? align : 1; }
+    int crop_align() const { return crop_align_; }
+
+    // The aligned rectangles actually handed to the decoder on the last
+    // post_process() call, for overlay/diagnostics.
+    const std::vector<cv::Rect> &last_crop_rects() const { return crop_rects_; }
     bool has_decoder() const { return decoder_ != nullptr; }
 
     static void draw_proposals(cv::Mat &bgr, const std::vector<Proposal> &proposals);
@@ -154,6 +169,8 @@ private:
     double decode_ms_ = 0.0;
     double crop_decode_ms_ = 0.0;
     size_t crop_count_ = 0;
+    int crop_align_ = 4;
+    std::vector<cv::Rect> crop_rects_;
 
     std::shared_ptr<TagCropDecoder> decoder_;
 
