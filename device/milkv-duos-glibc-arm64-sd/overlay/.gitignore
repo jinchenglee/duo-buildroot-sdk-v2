@@ -4,6 +4,7 @@
 app/tinytag_detect/tinytag_detect
 app/tinytag_detect/tinytag_detect_live
 app/tinytag_detect/run_tinytag.sh
+app/tinytag_detect/run_live.sh
 app/tinytag_detect/cvimodel/*.ttgold
 app/tinytag_detect/samples/
 usr/local/bin/run_tinytag.sh
