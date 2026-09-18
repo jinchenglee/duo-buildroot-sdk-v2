@@ -679,11 +679,118 @@ accepting that it occupies the Linux CPU for the full operation.
    camera; its state flags use the same audited common unwind path.
 ---
 
-## 10. Native 1280x720 @ 60 fps from OV5647  -- NOT STARTED, LOW PRIORITY
+## Final preview accounting checkpoint -- IMPLEMENTED, HARDWARE RUN PENDING
+
+The apparent colour-versus-luma discrepancy cannot be resolved from detector
+wall buckets alone. A recent colour run showed 8.80 ms acquisition age and
+0.05 ms `release`, while luma showed 3.82 ms acquisition age and 5.56 ms
+`release`; their approximate result ages were nearly equal (19.36 versus
+18.69 ms), detector CPU was also similar, and both sustained 31.3 fps. The
+luma detector thread does not encode or synchronously release the preview
+frame in this path. Its publish wakes the preview worker, which can preempt the
+detector on the single Linux CPU before the next wall timestamp and make work
+appear in `release`. The optional colour channel instead shifts some cost into
+VPSS frame readiness.
+
+The application now reports whole-process `proc-cpu` per frame beside the
+detector-thread `cpu`, accepts a true final `--no-rtsp` override, and provides
+`TINYTAG_LIVE_PREVIEW_NICE=0..19` as an explicit scheduling experiment (default
+zero). `/app/tinytag_detect/run_preview_bench.sh` runs no-RTSP, colour, and luma
+in alternating order for two rounds, discards startup intervals below 25 fps,
+retains every raw log plus TSV output, and summarizes detector CPU, process
+CPU, inferred other-thread CPU, one-core utilization, loop/release/crop time,
+acquisition age, and approximate result age.
+
+**Pending hardware gate.** No result is claimed yet: the board attached to the
+implementation host was powered down. On the accessible Duo-S, run the default
+benchmark, then repeat with
+`TINYTAG_BENCH_PREVIEW_NICE=10`. Compare process CPU and result-age tails as
+well as preview drops, borrowed surfaces, ownership errors, pairing/stale
+counters, and fps. Only then decide whether preview niceness should default
+nonzero and whether colour `--rtsp` should be retired as an exact-luma alias.
+Preview latency and frame drops are secondary, but detection freshness and
+bounded ownership are mandatory.
+
+---
+
+## 10. Hardware lens-distortion correction -- NOT STARTED, MEASURE BEFORE ENABLE
+
+**Goal.** Correct OV5647/lens barrel or pincushion distortion in hardware before
+the proposal/decode split, without adding CPU remap work or breaking geometric
+agreement between the TPU image and full-resolution decode image. This is an
+accuracy/geometry task; keep it disabled unless calibrated images show a real
+benefit and latency/throughput gates pass.
+
+**Authoritative references.** Milk-V's
+[camera tuning page](https://milkv.io/docs/duo/camera/tuning) points to the
+SOPHGO ISP Development Reference, ISP Tuning Guide, PQ Tools, and
+`isp_tool_daemon`. SOPHGO documents hardware GDC/LDC for barrel and pincushion
+correction in the
+[LDC debugging guide](https://doc.sophgo.com/cvitek-develop-docs/master/docs_latest_release/CV180x_CV181x/en/01.software/MPI/LDC_Debugging_Guide/build/html/2_LDC_Function_and_Specification_Description.html).
+
+**Use VPSS LDC, not VI LDC, with the current topology.** The VI API reference
+states that VI-channel LDC does not support either `VI_ONLINE_VPSS_ONLINE` or
+`VI_OFFLINE_VPSS_ONLINE`; this application uses the latter by default. The
+[VPSS API](https://doc.sophgo.com/cvitek-develop-docs/master/docs_latest_release/CV180x_CV181x/en/01.software/MPI/Media_Processing_Software_Development_Reference/build/html/6_Video_Processing_Subsystem/API_Reference.html)
+provides `CVI_VPSS_SetChnLDCAttr()` after channel attributes are set and
+supports both output formats used here, YUV400 and NV21. Local headers expose
+`VPSS_LDC_ATTR_S`/`LDC_ATTR_S`: aspect/field-angle ratios, center offsets, and
+distortion ratio (-300..500).
+
+**The two detector channels are one geometry contract.** Channel 1 proposes in
+640x360 while channel 0 crops/decodes in 1280x720. Applying LDC to only one
+channel, or applying resolution-inconsistent parameters, silently moves ROIs
+away from their tags. Exact-luma preview follows channel 0 automatically; an
+optional colour channel must use matching correction if it remains enabled.
+
+**Plan.**
+
+1. Capture a calibration grid/checkerboard across the full field and quantify
+   baseline reprojection/line-curvature error. Preserve the raw frame and
+   lens/module identity; LDC parameters are lens-specific.
+2. Use Milk-V's PQ Tools/`isp_tool_daemon` workflow and the SOPHGO LDC guide to
+   derive distortion ratio, optical-center offsets, and FOV ratios. Do not tune
+   by visual preference alone.
+3. Add an opt-in `TINYTAG_LIVE_LDC=1` path that calls
+   `CVI_VPSS_SetChnLDCAttr()` after `CVI_VPSS_SetChnAttr()` and before enabling
+   each affected channel. Log read-back attributes and fail closed if either
+   detector channel rejects them. Default remains off until all gates pass.
+4. Configure channel 0 and channel 1 as a matched pair. Validate corrected
+   channel-1 inference against CPU resize/copy from corrected channel 0 on the
+   same `u32TimeRef`. Independent LDC resampling at 640x360 and 1280x720 may not
+   be bit-exact, so compare tensor outputs, proposal peaks/order/ROIs, decoded
+   IDs, and a tag-position sweep across center, edges, and corners. If geometry
+   cannot be matched, reject per-channel LDC or move correction upstream; never
+   decode corrected proposals against uncorrected pixels.
+5. Measure corrected grid error, retained FOV, px-per-tag-module, edge/corner
+   recall, false positives, and crop area. LDC may straighten edges while
+   shrinking/cropping the usable image or softening resampled tag borders.
+6. Run the no-RTSP/colour/luma benchmark with LDC off and on. Gate on detector
+   fps, process CPU, acquisition/result-age tails, sequence freshness, pairing
+   mismatches, VPSS block ownership, and preview behavior. Confirm work is in
+   GDC/VPSS hardware rather than a hidden CPU remap.
+7. Test LDC together with mirror/flip and document operation order. Revalidate
+   saved-frame orientation because optical-center offsets and mirrored
+   coordinates must use the same convention.
+8. Promote calibrated parameters only after reproducible geometry/recall gain
+   with no material detector latency or throughput regression. Store them with
+   the exact sensor mode and lens identity; 720p60 needs separate validation
+   because its crop/binning/FOV changes the calibration.
+
+**Acceptance gates.** Quantified grid error improves; channel pairing remains
+zero-mismatch; proposal-to-crop geometry remains valid across the full image;
+tag recall does not regress; detector fps/freshness and result-age tails remain
+within measurement noise; and disabling LDC restores the current bit-for-bit
+path.
+
+---
+
+## 11. Native 1280x720 @ 60 fps from OV5647  -- NOT STARTED, LOW PRIORITY
 
 **Priority: low.** This needs sensor-driver work against an NDA datasheet.
-Items 3-9 address correctness and remove more immediate latency/throughput
-bottlenecks without changing the sensor. Complete and measure them before this
+Sections 3-9 address correctness and remove more immediate latency/throughput
+bottlenecks without changing the sensor. Complete the final preview accounting
+checkpoint and the section 10 LDC gates before beginning this sensor-mode
 work.
 
 **Why it is still worth doing eventually.** The detector channel is exactly
@@ -756,7 +863,7 @@ supported today and provides no present detector benefit.
 - **One Linux CPU core today; C906 AMP later.** The arm64 build's device tree
   declares a single Cortex-A53, so every Linux thread competes with the
   CPU-bound detector. SG2000 also has a C906 core, running FreeRTOS in the
-  current configuration. Do not move camera work there during items 3-10, but
+  current configuration. Do not move camera work there during items 3-11, but
   keep buffer ownership, physically addressable memory, cache coherency, and
   message boundaries explicit so selected work can later be evaluated under
   AMP. Any offload must include mailbox/cache/handoff latency and retain a

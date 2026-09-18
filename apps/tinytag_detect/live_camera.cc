@@ -52,6 +52,7 @@ extern "C" {
 
 #include <pthread.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -74,6 +75,38 @@ namespace {
 
 volatile sig_atomic_t g_stop = 0;
 void handle_signal(int) { g_stop = 1; }
+
+int preview_nice_value()
+{
+    constexpr int kDefaultPreviewNice = 0;
+    const char *value = std::getenv("TINYTAG_LIVE_PREVIEW_NICE");
+    if (value == nullptr || *value == '\0')
+        return kDefaultPreviewNice;
+
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 19)
+    {
+        fprintf(stderr,
+                "[preview] invalid TINYTAG_LIVE_PREVIEW_NICE=%s; using %d\n",
+                value, kDefaultPreviewNice);
+        return kDefaultPreviewNice;
+    }
+    return static_cast<int>(parsed);
+}
+
+void configure_preview_priority(const char *worker)
+{
+    const int nice_value = preview_nice_value();
+    // On Linux PRIO_PROCESS with who=0 changes the calling thread. This is an
+    // A/B control until hardware shows whether subordinating preview removes
+    // the exact-luma handoff preemption without creating preview backpressure.
+    if (setpriority(PRIO_PROCESS, 0, nice_value) != 0)
+        fprintf(stderr, "[preview] %s worker could not set nice=%d\n",
+                worker, nice_value);
+    else
+        fprintf(stderr, "[preview] %s worker nice=%d\n", worker, nice_value);
+}
 
 constexpr VPSS_GRP kVpssGrp = 0;
 constexpr VPSS_CHN kVpssChn = 0;
@@ -287,6 +320,14 @@ double thread_cpu_ms()
            static_cast<double>(ts.tv_nsec) / 1e6;
 }
 
+double process_cpu_ms()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
 struct TailSummary
 {
     double p50 = 0, p95 = 0, p99 = 0, max = 0;
@@ -313,7 +354,7 @@ void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
-            "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png] [--rtsp]\n"
+            "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png] [--rtsp|--no-rtsp]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
             "\n"
@@ -1330,6 +1371,7 @@ bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
 
 void luma_rtsp_loop(CameraContext *ctx)
 {
+    configure_preview_priority("luma");
     LumaRtspQueue &queue = ctx->luma_rtsp_queue;
     LumaRtspItem item;
     reserve_luma_item(item, ctx->preview_item_capacity);
@@ -1577,6 +1619,7 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
 // Runs beside the detector loop, which only has to publish into g_overlay.
 void preview_loop(CameraContext *ctx)
 {
+    configure_preview_priority("colour");
     std::vector<Proposal> proposals;
     std::vector<TinyTagResult> tags;
     std::vector<cv::Rect> crops;
@@ -1728,6 +1771,7 @@ int main(int argc, char *argv[])
             validate_compact_input = std::atoi(argv[++i]) != 0;
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
+        else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
         else if (flag == "--decode" && has_value)
         {
             decode = true;
@@ -1856,6 +1900,7 @@ int main(int argc, char *argv[])
     bool have_prev_seq = false;
     double fps_window_start = now_ms();
     double tail_window_start = fps_window_start;
+    double process_cpu_window_start = process_cpu_ms();
     double overlay_fps = 0.0;
     double overlay_busy_ms = 0.0;
     std::vector<double> tail_service, tail_cpu, tail_crop, tail_acquisition_age, tail_result_age;
@@ -2218,16 +2263,18 @@ int main(int argc, char *argv[])
             const double busy = (win.pair + win.map + win.pre + win.infer + win.decode +
                                  win.crop + win.release) / n;
             const double loop = busy + win.output / n;
+            const double process_cpu_now = process_cpu_ms();
+            const double process_cpu_per_frame = (process_cpu_now - process_cpu_window_start) / n;
             fprintf(stderr,
                     "[camera] %.1f fps | per frame ms: wait %.2f pair %.2f map %.2f pre %.2f infer %.2f "
-                    "decode %.2f crop %.2f release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f | "
+                    "decode %.2f crop %.2f release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f proc-cpu %.2f | "
                     "%.1f proposals | %zu stale"
                     " | seq mean %.2f max %u sum %u | age mean %.2f max %.2f ms | "
                     "map-cache hit %zu miss %zu blocks %zu\n",
                     n * 1000.0 / (t_now - fps_window_start), win.wait / n, win.pair / n,
                     win.map / n, win.pre / n,
                     win.infer / n, win.decode / n, win.crop / n, win.release / n, win.output / n,
-                    busy, loop, win.service_cpu / n,
+                    busy, loop, win.service_cpu / n, process_cpu_per_frame,
                     win.proposals / n, stale_now - stale_prev,
                     win.seq_samples ? static_cast<double>(win.seq_sum) / win.seq_samples : 0.0,
                     win.seq_max, win.seq_sum,
@@ -2311,6 +2358,7 @@ int main(int argc, char *argv[])
             stale_prev = stale_now;
             win = StageTotals{};
             fps_window_start = t_now;
+            process_cpu_window_start = process_cpu_now;
         }
     }
 
