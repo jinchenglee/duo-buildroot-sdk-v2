@@ -1005,6 +1005,38 @@ void draw_box(cv::Mat &y, cv::Mat &vu, const cv::Rect &r, Nv21Color c, int thick
     }
 }
 
+// A confirmed tag has subpixel-refined decoder corners in full-frame
+// coordinates. Draw that geometry rather than its larger neural proposal ROI.
+void draw_tag_quad(cv::Mat &y, cv::Mat &vu, const TinyTagResult &tag, Nv21Color c,
+                   int thickness, std::vector<cv::Rect> *dirty = nullptr)
+{
+    float min_x = tag.corners[0].x, max_x = tag.corners[0].x;
+    float min_y = tag.corners[0].y, max_y = tag.corners[0].y;
+    for (int corner = 0; corner < 4; ++corner)
+    {
+        const cv::Point p(cvRound(tag.corners[corner].x), cvRound(tag.corners[corner].y));
+        const cv::Point next(cvRound(tag.corners[(corner + 1) % 4].x),
+                             cvRound(tag.corners[(corner + 1) % 4].y));
+        cv::line(y, p, next, cv::Scalar(c.y), thickness);
+        cv::line(vu, cv::Point(p.x / 2, p.y / 2), cv::Point(next.x / 2, next.y / 2),
+                 cv::Scalar(c.v, c.u), std::max(1, thickness / 2));
+        min_x = std::min(min_x, tag.corners[corner].x);
+        max_x = std::max(max_x, tag.corners[corner].x);
+        min_y = std::min(min_y, tag.corners[corner].y);
+        max_y = std::max(max_y, tag.corners[corner].y);
+    }
+    if (dirty != nullptr)
+    {
+        const int pad = std::max(1, thickness / 2) + 1;
+        const int left = static_cast<int>(std::floor(min_x / 2.0f)) - pad;
+        const int top = static_cast<int>(std::floor(min_y / 2.0f)) - pad;
+        const int right = static_cast<int>(std::ceil(max_x / 2.0f)) + pad;
+        const int bottom = static_cast<int>(std::ceil(max_y / 2.0f)) + pad;
+        dirty->push_back(cv::Rect(left, top, std::max(1, right - left + 1),
+                                  std::max(1, bottom - top + 1)));
+    }
+}
+
 // Dark outline under light text so labels read on any background.
 void draw_label(cv::Mat &y, const std::string &text, cv::Point org, double scale)
 {
@@ -1598,7 +1630,7 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
             }
         }
 
-        draw_box(y, vu, p.roi, hit ? kTagColor : kProposalColor, hit ? 4 : 2, dirty);
+        draw_box(y, vu, p.roi, kProposalColor, 2, dirty);
         const int label_x = std::max(0, static_cast<int>(p.roi.x));
         const int label_y = p.roi.y >= 28.0f
                                 ? static_cast<int>(p.roi.y) - 8
@@ -1610,6 +1642,11 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
             snprintf(label, sizeof(label), "%.2f", p.confidence);
         draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), hit ? 0.9 : 0.65);
     }
+
+    // The proposal rectangle is intentionally left yellow; only decoder-
+    // confirmed tags receive the green geometry fitted to their real corners.
+    for (const auto &tag : tags)
+        draw_tag_quad(y, vu, tag, kTagColor, 4, dirty);
 
     char status[96];
     snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop  %zu tags", fps, busy_ms,
