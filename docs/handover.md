@@ -6,20 +6,37 @@ complete as a hardware-verified checkpoint. Section 10, hardware lens
 distortion correction, and section 11, native OV5647 1280x720@60, are
 explicitly not started.
 
-## Immediate follow-up before section 10
+## Preview scheduling checkpoint
 
 The final order-balanced benchmark of no RTSP, colour `--rtsp`, and exact-luma
-`--rtsp-luma` is implemented locally; its hardware run was not performed on
-this host because its board was powered down. Run it on the accessible Duo-S
-before lens correction or 720p60 work. Recent intervals showed similar
-detector-thread CPU and identical 31.3 fps, but
-placed about five milliseconds differently:
+`--rtsp-luma` is hardware verified on the accessible Duo-S. These are the
+order-balanced means from the posted 2026-09-18 runs. Time values are ms;
+`otherCPU` is process CPU minus detector CPU.
 
-- colour: acquisition age 8.80 ms, release 0.05 ms, service 10.56 ms;
-- luma: acquisition age 3.82 ms, release 5.56 ms, service 14.87 ms.
+| Preview nice | Mode | fps | loop | detCPU | procCPU | otherCPU | core% | acqAge | resultAge | release | crop |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | no-rtsp | 30.00 | 9.80 | 7.75 | 9.73 | 1.99 | 29.2 | 3.70 | 13.49 | 0.04 | 7.46 |
+| 0 | colour | 30.01 | 11.00 | 7.99 | 17.05 | 9.05 | 51.1 | 8.88 | 19.88 | 0.04 | 8.50 |
+| 0 | luma | 29.99 | 15.07 | 7.87 | 16.35 | 8.48 | 49.0 | 3.75 | 18.84 | 5.13 | 7.64 |
+| 10 | no-rtsp | 30.01 | 9.40 | 7.38 | 9.38 | 2.00 | 28.1 | 3.70 | 13.10 | 0.03 | 7.08 |
+| 10 | colour | 29.98 | 12.25 | 8.40 | 17.71 | 9.31 | 53.1 | 3.88 | 16.14 | 0.05 | 9.76 |
+| 10 | luma | 29.95 | 10.03 | 7.88 | 16.42 | 8.55 | 49.2 | 3.76 | 13.79 | 0.07 | 7.65 |
 
-Approximate result age was nearly equal (19.36 versus 18.69 ms). Code review
-shows normal luma handoff does not call `CVI_VPSS_ReleaseChnFrame` on the
+All modes remained camera-bound at about 30 fps. Nice 10 lowered exact-luma
+loop time by 5.04 ms and result age by 5.05 ms; it lowered colour result age
+by 3.74 ms. Preview other-thread CPU stayed essentially unchanged, so this is
+a scheduling-latency improvement rather than less work.
+
+Benchmark column guide: `fps` is detector frames per second. All remaining
+time columns are milliseconds per detector frame: `loop` is detector wall time;
+`detCPU` is detector-thread CPU time; `procCPU` is all application-thread CPU
+time; and `otherCPU` is `procCPU - detCPU`. `core%` is whole-process CPU use as
+a percentage of the one Linux core. `acqAge` is capture-to-detector-start
+latency, while `resultAge` is the software approximation `acqAge + loop`.
+`release` is detector-thread frame handoff/release wall time and is not an
+independent preview-cost measure. `crop` is full-resolution AprilTag crop
+decode time and varies with scene content.
+Code review shows normal luma handoff does not call `CVI_VPSS_ReleaseChnFrame` on the
 detector thread: it wakes the preview worker, which can preempt the detector on
 the single Linux core before the next wall timestamp. Colour instead creates a
 third VPSS output, apparently shifting cost into frame readiness. Do not infer
@@ -32,19 +49,15 @@ balances run order over two rounds, and reports fps, loop wall time, detector
 CPU, process CPU, other-thread CPU, one-core utilization, acquisition age,
 approximate result age, release wall time, and crop time.
 
-After deploying the locally built files, run:
+Preview niceness now defaults to 10. Use the default benchmark for a production
+measurement, or explicitly set zero for the historical normal-priority A/B
+baseline:
 
-    /app/tinytag_detect/run_preview_bench.sh
-
-Then test detector-preferred scheduling separately:
-
-    TINYTAG_BENCH_PREVIEW_NICE=10 \
+    TINYTAG_BENCH_PREVIEW_NICE=0 \
       /app/tinytag_detect/run_preview_bench.sh
 
-Preview niceness intentionally defaults to zero until this hardware A/B shows
-that a lower-priority preview reduces detector/result-age tails without unsafe
-backpressure or ownership errors. Do not change the default or collapse colour
-`--rtsp` into luma based only on the old `release` wall bucket.
+Do not collapse colour `--rtsp` into luma based only on the old `release` wall
+bucket; exact-luma remains the production preview.
 
 ## Build and deploy
 
@@ -64,12 +77,13 @@ current development environment SSH execution is unavailable, but SCP works:
 
 Use SCP readback plus `sha256sum` when deployment identity matters.
 
-## Second-machine benchmark checklist
+## Benchmark reproduction checklist
 
 This follow-up is intended directly on top of checkpoint `c9a6f29c4`. The
 current source was cross-built successfully in `duodocker`; shell syntax,
 `git diff --check`, staged-artifact identity, and a synthetic parser run also
-passed. Only the Duo-S measurement is outstanding.
+passed. The Duo-S measurement above completed the original gate; use this
+checklist to reproduce it after material preview or scheduling changes.
 
 1. Build from the new commit using the command above. Do not reuse a binary
    from `c9a6f29c4`, because it lacks `proc-cpu`, `--no-rtsp`, and the preview
@@ -93,16 +107,16 @@ passed. Only the Duo-S measurement is outstanding.
 
 3. Keep the camera, scene, lighting, and RTSP-client state unchanged for both
    runs. Prefer no connected RTSP client; if one is used, it must reconnect
-   consistently for every colour and luma case. Run the default scheduling
+   consistently for every colour and luma case. Run the production-priority
    test on the board:
 
-       TINYTAG_BENCH_OUT_DIR=/tmp/tinytag-preview-nice0 \
+       TINYTAG_BENCH_OUT_DIR=/tmp/tinytag-preview-nice10 \
          /app/tinytag_detect/run_preview_bench.sh
 
-4. Run the same order-balanced test with the preview worker subordinated:
+4. Run the same order-balanced test at normal preview priority for comparison:
 
-       TINYTAG_BENCH_PREVIEW_NICE=10 \
-       TINYTAG_BENCH_OUT_DIR=/tmp/tinytag-preview-nice10 \
+       TINYTAG_BENCH_PREVIEW_NICE=0 \
+       TINYTAG_BENCH_OUT_DIR=/tmp/tinytag-preview-nice0 \
          /app/tinytag_detect/run_preview_bench.sh
 
    Each command runs six 12-second cases: two rounds with reversed
@@ -119,9 +133,10 @@ passed. Only the Duo-S measurement is outstanding.
    and bounded borrowed surfaces. Compare `procCPU` and `otherCPU` against
    no-RTSP to measure actual preview CPU. Compare acquisition plus result age
    and `[tails]` across modes; do not optimize the `release` bucket alone.
-   Adopt nice 10 only if it improves detector/result-age tails without
-   ownership or sustained-backlog problems. Decide whether colour `--rtsp`
-   should become a luma alias only after these measurements.
+   Nice 10 is the production default based on the 2026-09-18 run. Retain it
+   only while these checks continue to show no ownership or sustained-backlog
+   problems. Decide whether colour `--rtsp` should become a luma alias only
+   after separate measurements and an explicit decision.
 
 ## Production command and architecture
 

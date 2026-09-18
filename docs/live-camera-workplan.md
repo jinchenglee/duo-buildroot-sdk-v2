@@ -679,7 +679,7 @@ accepting that it occupies the Linux CPU for the full operation.
    camera; its state flags use the same audited common unwind path.
 ---
 
-## Final preview accounting checkpoint -- IMPLEMENTED, HARDWARE RUN PENDING
+## Final preview accounting checkpoint -- HARDWARE VERIFIED
 
 The apparent colour-versus-luma discrepancy cannot be resolved from detector
 wall buckets alone. A recent colour run showed 8.80 ms acquisition age and
@@ -694,22 +694,34 @@ VPSS frame readiness.
 
 The application now reports whole-process `proc-cpu` per frame beside the
 detector-thread `cpu`, accepts a true final `--no-rtsp` override, and provides
-`TINYTAG_LIVE_PREVIEW_NICE=0..19` as an explicit scheduling experiment (default
-zero). `/app/tinytag_detect/run_preview_bench.sh` runs no-RTSP, colour, and luma
+`TINYTAG_LIVE_PREVIEW_NICE=0..19`; it defaults to 10 so preview yields to
+detection. `/app/tinytag_detect/run_preview_bench.sh` runs no-RTSP, colour, and luma
 in alternating order for two rounds, discards startup intervals below 25 fps,
 retains every raw log plus TSV output, and summarizes detector CPU, process
 CPU, inferred other-thread CPU, one-core utilization, loop/release/crop time,
 acquisition age, and approximate result age.
 
-**Pending hardware gate.** No result is claimed yet: the board attached to the
-implementation host was powered down. On the accessible Duo-S, run the default
-benchmark, then repeat with
-`TINYTAG_BENCH_PREVIEW_NICE=10`. Compare process CPU and result-age tails as
-well as preview drops, borrowed surfaces, ownership errors, pairing/stale
-counters, and fps. Only then decide whether preview niceness should default
-nonzero and whether colour `--rtsp` should be retired as an exact-luma alias.
-Preview latency and frame drops are secondary, but detection freshness and
-bounded ownership are mandatory.
+**Hardware result (2026-09-18).** Two order-balanced 12-second rounds on the
+accessible Duo-S compared nice 0 and nice 10. The complete means are retained
+in `docs/handover.md`; the decision-critical values are:
+
+| Preview nice | Mode | fps | loop ms | result age ms | other CPU ms |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 0 | no-rtsp | 30.00 | 9.80 | 13.49 | 1.99 |
+| 0 | colour | 30.01 | 11.00 | 19.88 | 9.05 |
+| 0 | luma | 29.99 | 15.07 | 18.84 | 8.48 |
+| 10 | no-rtsp | 30.01 | 9.40 | 13.10 | 2.00 |
+| 10 | colour | 29.98 | 12.25 | 16.14 | 9.31 |
+| 10 | luma | 29.95 | 10.03 | 13.79 | 8.55 |
+
+Nice 10 reduced exact-luma loop wall time by 5.04 ms and approximate result
+age by 5.05 ms; it reduced colour result age by 3.74 ms. All modes remained
+camera-bound at about 30 fps. Preview other-thread CPU was essentially
+unchanged, so the gain is scheduling latency rather than less preview work.
+Nice 10 is therefore the production default. Keep nice 0 available through
+`TINYTAG_LIVE_PREVIEW_NICE=0` or `TINYTAG_BENCH_PREVIEW_NICE=0` for future A/B
+baselines. Exact-luma remains the production preview; do not retire colour
+`--rtsp` without a separate decision.
 
 ---
 

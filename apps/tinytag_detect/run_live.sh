@@ -44,9 +44,9 @@ CROP_ALIGN="${TINYTAG_LIVE_CROP_ALIGN:-4}"
 # environment variable directly; normal operation leaves it unset or zero.
 
 # TINYTAG_LIVE_PREVIEW_NICE (0..19) changes only the preview worker priority.
-# It defaults to 0 until run_preview_bench.sh establishes whether a lower
-# priority helps the detector on the single Linux core without harmful preview
-# backpressure. The binary reads this environment variable directly.
+# It defaults to 10 so preview yields to detection on the single Linux core.
+# Set it to 0 only for an A/B baseline. The binary reads this environment
+# variable directly.
 
 [ -x "${BIN}" ] || { echo "Error: ${BIN} not found or not executable" >&2; exit 1; }
 [ -f "${MODEL}" ] || { echo "Error: model ${MODEL} not found" >&2; exit 1; }

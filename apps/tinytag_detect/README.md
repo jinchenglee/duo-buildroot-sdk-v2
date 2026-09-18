@@ -99,6 +99,25 @@ None beyond what the image already ships. The binary needs
 itself as well, so it also works from a non-login shell (`ssh board 'cmd'`,
 init scripts, cron).
 
+## Live preview benchmark
+
+On a Duo S with the live camera application installed, run
+`/app/tinytag_detect/run_preview_bench.sh`. It executes order-balanced
+no-RTSP, colour-RTSP, and exact-luma-RTSP cases and retains raw logs plus a TSV
+file under `/tmp`. Preview workers default to niceness 10; set
+`TINYTAG_BENCH_PREVIEW_NICE=0` to reproduce the normal-priority baseline.
+
+The summary reports per-mode means. `fps` is detector frames per second;
+`loop`, `detCPU`, `procCPU`, `acqAge`, `resultAge`, `release`, and `crop` are
+milliseconds per detector frame. `loop` is detector wall time, while `detCPU`
+is CPU time only for that thread and `procCPU` is CPU time for all application
+threads. `otherCPU` is `procCPU - detCPU`, and `core%` is whole-process CPU
+use as a percentage of the one Linux core. `acqAge` is capture-to-detector
+start latency; `resultAge` is the software approximation `acqAge + loop`.
+`release` measures detector-thread frame handoff/release wall time and should
+not be optimized in isolation. `crop` is full-resolution AprilTag crop-decode
+time, which varies with scene content.
+
 ## Usage on the board
 
 Sample frames ship with the app, so there is nothing to copy over. With no

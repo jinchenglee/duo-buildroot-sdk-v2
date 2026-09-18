@@ -78,7 +78,10 @@ void handle_signal(int) { g_stop = 1; }
 
 int preview_nice_value()
 {
-    constexpr int kDefaultPreviewNice = 0;
+    // The preview worker is deliberately subordinate to detection on the
+    // single Linux core.  Hardware A/B results showed nice 10 reduces
+    // detector/result-age latency without reducing camera-bound throughput.
+    constexpr int kDefaultPreviewNice = 10;
     const char *value = std::getenv("TINYTAG_LIVE_PREVIEW_NICE");
     if (value == nullptr || *value == '\0')
         return kDefaultPreviewNice;
@@ -98,9 +101,7 @@ int preview_nice_value()
 void configure_preview_priority(const char *worker)
 {
     const int nice_value = preview_nice_value();
-    // On Linux PRIO_PROCESS with who=0 changes the calling thread. This is an
-    // A/B control until hardware shows whether subordinating preview removes
-    // the exact-luma handoff preemption without creating preview backpressure.
+    // On Linux PRIO_PROCESS with who=0 changes the calling thread.
     if (setpriority(PRIO_PROCESS, 0, nice_value) != 0)
         fprintf(stderr, "[preview] %s worker could not set nice=%d\n",
                 worker, nice_value);

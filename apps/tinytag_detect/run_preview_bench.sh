@@ -7,7 +7,8 @@ APP_DIR="${TINYTAG_BENCH_APP_DIR:-/app/tinytag_detect}"
 RUN_LIVE="${TINYTAG_BENCH_RUN_LIVE:-${APP_DIR}/run_live.sh}"
 DURATION="${TINYTAG_BENCH_DURATION:-12}"
 REPEATS="${TINYTAG_BENCH_REPEATS:-2}"
-PREVIEW_NICE="${TINYTAG_BENCH_PREVIEW_NICE:-0}"
+# Production preview defaults to nice 10. Set this to 0 for an A/B baseline.
+PREVIEW_NICE="${TINYTAG_BENCH_PREVIEW_NICE:-10}"
 OUT_DIR="${TINYTAG_BENCH_OUT_DIR:-/tmp/tinytag-preview-bench-$(date +%Y%m%d-%H%M%S)}"
 RESULTS="${OUT_DIR}/windows.tsv"
 
