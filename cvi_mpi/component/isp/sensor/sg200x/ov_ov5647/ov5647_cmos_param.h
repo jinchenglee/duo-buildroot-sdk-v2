@@ -54,6 +54,47 @@ static const OV5647_MODE_S g_astOv5647_mode[OV5647_MODE_NUM] = {
 			.u32Step = 1,
 		},
 	},
+	[OV5647_MODE_1280X720P60] = {
+		.name = "1280x720p60",
+		.astImg[0] = {
+			.stSnsSize = {
+				.u32Width = 1280,
+				.u32Height = 720,
+			},
+			.stWndRect = {
+				.s32X = 0,
+				.s32Y = 0,
+				.u32Width = 1280,
+				.u32Height = 720,
+			},
+			.stMaxSize = {
+				.u32Width = 2592,
+				.u32Height = 1944,
+			},
+		},
+		.f32MaxFps = 60,
+		.f32MinFps = 0.732,
+		.u32HtsDef = 1750,
+		.u32VtsDef = 800,
+		.stExp[0] = {
+			.u16Min = 4,
+			.u16Max = 800 - 4,
+			.u16Def = 300,
+			.u16Step = 1,
+		},
+		.stAgain[0] = {
+			.u32Min = 1024,
+			.u32Max = 63448,
+			.u32Def = 1024,
+			.u32Step = 1,
+		},
+		.stDgain[0] = {
+			.u32Min = 1024,
+			.u32Max = 1024,
+			.u32Def = 1024,
+			.u32Step = 1,
+		},
+	},
 };
 
 static ISP_CMOS_BLACK_LEVEL_S g_stIspBlcCalibratio = {
@@ -105,4 +146,3 @@ struct combo_dev_attr_s ov5647_rx_attr = {
 
 
 #endif /* __OV5647_CMOS_PARAM_H_ */
-

@@ -1,3 +1,4 @@
+#include "cvi_comm_video.h"
 #include "sensor_list.h"
 
 

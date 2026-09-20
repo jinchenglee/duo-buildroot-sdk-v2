@@ -3,8 +3,12 @@
 Orientation for picking this work up cold. The detailed experiment log and
 remaining roadmap are in `docs/live-camera-workplan.md`; sections 1-9 are
 complete as a hardware-verified checkpoint. Section 10, hardware lens
-distortion correction, and section 11, native OV5647 1280x720@60, are
-explicitly not started.
+distortion correction, remains calibration-gated. Section 11, native OV5647
+1280x720@60, is an opt-in experiment with a valid K230-derived sensor table.
+In low light, uncapped auto exposure extends frame length and reduces either
+mode to about 10 fps. `--max-exposure-us 15000` retains AE while restoring
+about 58 fps camera delivery, at the cost of higher-gain noise; image/PQ and
+tag-recall validation remain before accepting it as a default.
 
 ## Preview scheduling checkpoint
 
@@ -212,8 +216,9 @@ must not stall acquisition. Set `TINYTAG_LIVE_TAG_OUTPUT=1` only when needed.
   Software acquisition and approximate result-age distributions are available.
 - Hardware VPSS lens-distortion correction is planned in section 10 and must
   pass geometry, recall, and performance gates before enablement.
-- Native OV5647 720p60 and sensor-derived rate plumbing belong to workplan
-  section 11. Do not begin them unless explicitly requested.
+- Native OV5647 720p60 and its exposure policy belong to workplan section 11.
+  The immediate next step is capped-AE image/PQ and tag-recall comparison,
+  rather than further sensor timing changes.
 
 ## Runtime diagnostics
 

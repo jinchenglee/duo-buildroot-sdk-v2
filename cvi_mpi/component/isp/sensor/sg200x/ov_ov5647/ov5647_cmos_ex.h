@@ -25,6 +25,7 @@ enum ov5647_linear_regs_e {
 
 typedef enum _OV5647_MODE_E {
 	OV5647_MODE_1920X1080P30 = 0,
+	OV5647_MODE_1280X720P60,
 	OV5647_MODE_LINEAR_NUM,
 	OV5647_MODE_NUM
 } OV5647_MODE_E;
@@ -79,4 +80,3 @@ extern int ov5647_probe(VI_PIPE ViPipe);
 
 
 #endif /* __OV5647_CMOS_EX_H_ */
-

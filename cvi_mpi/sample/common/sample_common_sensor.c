@@ -1074,6 +1074,20 @@ CVI_S32 SAMPLE_COMM_SNS_GetIspAttrBySns(SAMPLE_SNS_TYPE_E enSnsType, ISP_PUB_ATT
 		break;
 	};
 
+	/* Keep the shipped OV5647 profile at 1080p30. The live-camera app can
+	 * opt into the new native mode for bring-up without changing the boot
+	 * image or sensor_cfg.ini. */
+	if (enSnsType == OV_OV5647_MIPI_2M_30FPS_10BIT) {
+		const char *mode = getenv("TINYTAG_LIVE_OV5647_720P60");
+		if (mode && strcmp(mode, "1") == 0) {
+			pstPubAttr->stSnsSize.u32Width = 1280;
+			pstPubAttr->stSnsSize.u32Height = 720;
+			pstPubAttr->stWndRect.u32Width = 1280;
+			pstPubAttr->stWndRect.u32Height = 720;
+			pstPubAttr->f32FrameRate = 60;
+		}
+	}
+
 	return s32Ret;
 }
 
@@ -2241,4 +2255,3 @@ CVI_S32 SAMPLE_COMM_SNS_ParseIni(SAMPLE_INI_CFG_S *pstIniCfg)
 
 	return CVI_SUCCESS;
 }
- 

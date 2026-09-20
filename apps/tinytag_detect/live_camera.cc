@@ -112,6 +112,7 @@ void configure_preview_priority(const char *worker)
 constexpr VPSS_GRP kVpssGrp = 0;
 constexpr VPSS_CHN kVpssChn = 0;
 constexpr VPSS_CHN kModelChn = 1;
+constexpr VPSS_CHN kNativeCaptureChn = 2;
 
 // VPSS scales the full sensor frame to this in hardware before the detector
 // sees it. 1280x720 is exactly TinyTagDet's crop band, so pre_process() uses
@@ -121,6 +122,13 @@ constexpr VPSS_CHN kModelChn = 1;
 // they would in the cropped view, so very small/distant ones lose some recall.
 constexpr CVI_U32 kDetWidth = 1280;
 constexpr CVI_U32 kDetHeight = 720;
+constexpr int kSaveFrameIndex = 30;
+
+bool ov5647_720p60_requested()
+{
+    const char *value = std::getenv("TINYTAG_LIVE_OV5647_720P60");
+    return value && std::strcmp(value, "1") == 0;
+}
 
 // --rtsp preview: a second channel on the same VPSS group, NV21 at the
 // detector's resolution so boxes need no coordinate scaling, encoded in
@@ -355,7 +363,9 @@ void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
-            "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png] [--rtsp|--no-rtsp]\n"
+            "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png]\n"
+            "       [--save-native-frame frame.png] [--rtsp|--no-rtsp]\n"
+            "       [--capture-only] [--max-exposure-us N]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
             "\n"
@@ -375,6 +385,10 @@ void usage(const char *argv0)
             "              Exact dimensions, stride, format and tensor size are enforced.\n"
             "  --validate-compact-input 1  once, compare copied and direct input outputs\n"
             "              bit-for-bit before continuing (default 0; diagnostic only).\n"
+            "  --capture-only  measure VPSS frame delivery only: no model, decoding, RTSP,\n"
+            "              capture queue, or image processing. Prints one rate per second.\n"
+            "  --max-exposure-us N  retain auto exposure but cap its shutter time. This\n"
+            "              prevents AE slow-shutter from reducing capture cadence.\n"
 
             "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n",
             argv0);
@@ -437,6 +451,29 @@ void isp_set_manual_exptime(CVI_U32 us)
         fprintf(stderr, "[isp] SetExposureAttr failed\n");
     else
         fprintf(stderr, "[isp] exposure time set to %u us\n", us);
+}
+
+bool isp_set_max_auto_exptime(CVI_U32 us)
+{
+    ISP_EXPOSURE_ATTR_S attr;
+    if (CVI_ISP_GetExposureAttr(0, &attr) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[isp] GetExposureAttr failed while applying exposure cap\n");
+        return false;
+    }
+    attr.enOpType = OP_TYPE_AUTO;
+    attr.stManual.enAGainOpType = OP_TYPE_AUTO;
+    attr.stManual.enExpTimeOpType = OP_TYPE_AUTO;
+    attr.stAuto.stExpTimeRange.u32Max = us;
+    if (attr.stAuto.stExpTimeRange.u32Min > us)
+        attr.stAuto.stExpTimeRange.u32Min = us;
+    if (CVI_ISP_SetExposureAttr(0, &attr) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[isp] SetExposureAttr failed while applying exposure cap\n");
+        return false;
+    }
+    fprintf(stderr, "[isp] auto exposure capped at %u us\n", us);
+    return true;
 }
 
 void isp_set_ae_auto()
@@ -565,12 +602,14 @@ struct CameraContext
     bool vi_initialized = false;
     bool vpss_created = false;
     bool vi_vpss_bound = false;
+    bool native_capture_enabled = false;
     bool venc_started = false;
     bool rtsp_started = false;
     VPSS_CHN preview_chn = 1;
     VB_POOL preview_pool = 2;
     size_t preview_item_capacity = 0;
     unsigned preview_delay_ms = 0; // test-only worker delay for backlog stress
+    std::string save_native_frame_path;
     // Applied once to the VI channel at setup, so the capture hardware
     // delivers corrected pixels and the per-frame cost is zero. A software
     // cv::flip would cost a full pass over the ~900 KB luma plane every frame.
@@ -781,6 +820,11 @@ bool setup_camera(CameraContext &ctx)
     }
     ctx.width = sensor_size.u32Width;
     ctx.height = sensor_size.u32Height;
+    if (ov5647_720p60_requested())
+    {
+        ctx.width = 1280;
+        ctx.height = 720;
+    }
     fprintf(stderr, "[camera] sensor %ux%u\n", ctx.width, ctx.height);
 
     // VB pools: pool 0 for VI's native NV21 capture, pool 1 for the 1280x720
@@ -788,6 +832,12 @@ bool setup_camera(CameraContext &ctx)
     // and the next pool for the ordinary color preview channel.
     ctx.preview_chn = ctx.direct_model_input ? 2 : 1;
     ctx.preview_pool = ctx.direct_model_input ? 3 : 2;
+    if (!ctx.save_native_frame_path.empty() && ctx.direct_model_input &&
+        ctx.preview && !ctx.preview_luma)
+    {
+        fprintf(stderr, "[camera] --save-native-frame conflicts with --rtsp and direct compact input\n");
+        return false;
+    }
     VB_CONFIG_S vb_config{};
     vb_config.u32MaxPoolCnt = 2 + (ctx.direct_model_input ? 1 : 0) +
                               ((ctx.preview && !ctx.preview_luma) ? 1 : 0);
@@ -872,7 +922,7 @@ bool setup_camera(CameraContext &ctx)
 
     ISP_PUB_ATTR_S pub_attr{};
     CVI_ISP_GetPubAttr(0, &pub_attr);
-    pub_attr.f32FrameRate = 30;
+    pub_attr.f32FrameRate = ov5647_720p60_requested() ? 60 : 30;
     CVI_ISP_SetPubAttr(0, &pub_attr);
 
     // Orientation is fixed in the VI channel rather than per frame. Mirroring
@@ -937,6 +987,20 @@ bool setup_camera(CameraContext &ctx)
         if (vpss_ret == CVI_SUCCESS)
             vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kModelChn);
     }
+    if (vpss_ret == CVI_SUCCESS && !ctx.save_native_frame_path.empty())
+    {
+        VPSS_CHN_ATTR_S native_attr{};
+        // A native-size VPSS output is an ISP-frame diagnostic: it avoids the
+        // 1920x1080 -> 1280x720 resampler while keeping the normal detector
+        // channel untouched.
+        VPSS_CHN_DEFAULT_HELPER(&native_attr, ctx.width, ctx.height,
+                                PIXEL_FORMAT_YUV_400, CVI_FALSE);
+        vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kNativeCaptureChn, &native_attr);
+        if (vpss_ret == CVI_SUCCESS)
+            vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kNativeCaptureChn);
+        if (vpss_ret == CVI_SUCCESS)
+            ctx.native_capture_enabled = true;
+    }
     if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
     {
         VPSS_CHN_ATTR_S preview_attr{};
@@ -967,6 +1031,8 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kModelChn, kModelPool);
     if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
         vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, ctx.preview_chn, ctx.preview_pool);
+    if (vpss_ret == CVI_SUCCESS && ctx.native_capture_enabled)
+        vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kNativeCaptureChn, 0);
     if (vpss_ret != CVI_SUCCESS)
     {
         fprintf(stderr, "[camera] VPSS attach VB pool failed: %#x\n", vpss_ret);
@@ -977,6 +1043,45 @@ bool setup_camera(CameraContext &ctx)
         return false;
 
     return true;
+}
+
+bool save_native_vpss_frame(CameraContext &ctx)
+{
+    if (ctx.save_native_frame_path.empty())
+        return true;
+
+    bool saved = false;
+    for (int i = 1; i <= kSaveFrameIndex; ++i)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        if (CVI_VPSS_GetChnFrame(kVpssGrp, kNativeCaptureChn, &frame, 3000) != CVI_SUCCESS)
+        {
+            fprintf(stderr, "[camera] native diagnostic frame %d timed out\n", i);
+            break;
+        }
+
+        const VIDEO_FRAME_S &vf = frame.stVFrame;
+        const CVI_U32 map_len = vf.u32Length[0] ? vf.u32Length[0] : vf.u32Stride[0] * vf.u32Height;
+        if (i == kSaveFrameIndex)
+        {
+            uint8_t *luma = static_cast<uint8_t *>(CVI_SYS_MmapCache(vf.u64PhyAddr[0], map_len));
+            if (luma != nullptr)
+            {
+                const cv::Mat gray(vf.u32Height, vf.u32Width, CV_8UC1, luma, vf.u32Stride[0]);
+                saved = cv::imwrite(ctx.save_native_frame_path, gray);
+                CVI_SYS_Munmap(luma, map_len);
+            }
+            fprintf(stderr, "[camera] %s native ISP/VPSS frame %d to %s (%ux%u)\n",
+                    saved ? "saved" : "could not save", i, ctx.save_native_frame_path.c_str(),
+                    vf.u32Width, vf.u32Height);
+        }
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kNativeCaptureChn, &frame);
+    }
+
+    if (CVI_VPSS_DisableChn(kVpssGrp, kNativeCaptureChn) != CVI_SUCCESS)
+        fprintf(stderr, "[camera] could not disable native diagnostic channel\n");
+    ctx.native_capture_enabled = false;
+    return saved;
 }
 
 // NV21 colors (BT.601 limited range). Boxes are drawn into both planes so
@@ -1157,6 +1262,66 @@ void stop_capture(CameraContext &ctx)
     if (ctx.direct_model_input)
         stop_capture_slot(ctx.model_capture, ctx.model_capture_worker, kModelChn);
     stop_capture_slot(ctx.capture, ctx.capture_worker, kVpssChn);
+}
+
+// Keep this deliberately synchronous.  It measures the cadence at which VPSS
+// channel 0 can hand frames to an otherwise idle application, without the
+// capture worker, model, decoder, preview, or their buffer ownership effects.
+int run_capture_only()
+{
+    long frames = 0;
+    long failures = 0;
+    double wait_sum_ms = 0.0;
+    double window_start_ms = now_ms();
+    CVI_U32 previous_sequence = 0;
+    bool have_previous_sequence = false;
+    unsigned sequence_gap_sum = 0;
+    unsigned sequence_gap_max = 0;
+
+    fprintf(stderr, "[capture-only] measuring VPSS channel %d delivery; press Ctrl-C to stop\n",
+            kVpssChn);
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        const double wait_start_ms = now_ms();
+        const CVI_S32 ret = CVI_VPSS_GetChnFrame(kVpssGrp, kVpssChn, &frame, 1000);
+        wait_sum_ms += now_ms() - wait_start_ms;
+        if (ret != CVI_SUCCESS)
+        {
+            ++failures;
+            continue;
+        }
+
+        if (have_previous_sequence)
+        {
+            const unsigned gap = frame.stVFrame.u32TimeRef - previous_sequence;
+            sequence_gap_sum += gap;
+            sequence_gap_max = std::max(sequence_gap_max, gap);
+        }
+        previous_sequence = frame.stVFrame.u32TimeRef;
+        have_previous_sequence = true;
+        ++frames;
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+
+        const double now = now_ms();
+        if (now - window_start_ms >= 1000.0)
+        {
+            fprintf(stderr,
+                    "[capture-only] %.1f fps | get-frame wait %.2f ms | failures %ld | "
+                    "seq mean %.2f max %u sum %u\n",
+                    frames * 1000.0 / (now - window_start_ms), wait_sum_ms / frames,
+                    failures,
+                    frames > 1 ? static_cast<double>(sequence_gap_sum) / (frames - 1) : 0.0,
+                    sequence_gap_max, sequence_gap_sum);
+            frames = 0;
+            failures = 0;
+            wait_sum_ms = 0.0;
+            sequence_gap_sum = 0;
+            sequence_gap_max = 0;
+            window_start_ms = now;
+        }
+    }
+    return 0;
 }
 
 // Defined below, next to the preview loop; declared here because the luma RTSP
@@ -1736,6 +1901,8 @@ void teardown_camera(CameraContext &ctx)
         chn_enable[kVpssChn] = CVI_TRUE;
         if (ctx.direct_model_input)
             chn_enable[kModelChn] = CVI_TRUE;
+        if (ctx.native_capture_enabled)
+            chn_enable[kNativeCaptureChn] = CVI_TRUE;
         if (ctx.preview && !ctx.preview_luma)
             chn_enable[ctx.preview_chn] = CVI_TRUE;
         SAMPLE_COMM_VPSS_Stop(kVpssGrp, chn_enable);
@@ -1782,9 +1949,12 @@ int main(int argc, char *argv[])
     int max_proposals = 8, debug_mode = 1;
     bool decode = false, decode_tolerant = false;
     std::string save_frame_path;
+    std::string save_native_frame_path;
     bool rtsp = false, rtsp_luma = false;
     bool mirror = false, flip = false;
     bool tag_output = true;
+    bool capture_only = false;
+    CVI_U32 max_exposure_us = 0;
     bool direct_compact_input = false;
     bool validate_compact_input = false;
     int crop_align = 4;
@@ -1799,6 +1969,7 @@ int main(int argc, char *argv[])
         else if (flag == "--iou" && has_value) roi_iou_thres = std::atof(argv[++i]);
         else if (flag == "--debug" && has_value) debug_mode = std::atoi(argv[++i]);
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
+        else if (flag == "--save-native-frame" && has_value) save_native_frame_path = argv[++i];
         else if (flag == "--crop-align" && has_value) crop_align = std::atoi(argv[++i]);
         else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
         else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
@@ -1810,6 +1981,9 @@ int main(int argc, char *argv[])
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
+        else if (flag == "--capture-only") capture_only = true;
+        else if (flag == "--max-exposure-us" && has_value)
+            max_exposure_us = static_cast<CVI_U32>(std::strtoul(argv[++i], nullptr, 10));
         else if (flag == "--decode" && has_value)
         {
             decode = true;
@@ -1861,11 +2035,13 @@ int main(int argc, char *argv[])
     ctx.preview = rtsp;
     ctx.preview_luma = rtsp_luma;
     ctx.preview_item_capacity = static_cast<size_t>(std::max(1, max_proposals));
+    ctx.save_native_frame_path = save_native_frame_path;
     ctx.mirror = mirror;
     ctx.flip = flip;
     ctx.compact_direct_input = direct_compact_input && !detector.uses_aligned_input();
     ctx.validate_compact_input = validate_compact_input && ctx.compact_direct_input;
-    ctx.direct_model_input = detector.uses_aligned_input() || ctx.compact_direct_input;
+    ctx.direct_model_input = !capture_only &&
+                             (detector.uses_aligned_input() || ctx.compact_direct_input);
     if (const char *online = std::getenv("TINYTAG_LIVE_VI_ONLINE"))
         ctx.vi_online = std::atoi(online) != 0;
     if (const char *delay = std::getenv("TINYTAG_LIVE_PREVIEW_DELAY_MS"))
@@ -1874,6 +2050,23 @@ int main(int argc, char *argv[])
     {
         teardown_camera(ctx);
         return 1;
+    }
+    if (!save_native_vpss_frame(ctx))
+    {
+        teardown_camera(ctx);
+        return 1;
+    }
+    if (max_exposure_us != 0 && !isp_set_max_auto_exptime(max_exposure_us))
+    {
+        teardown_camera(ctx);
+        return 1;
+    }
+
+    if (capture_only)
+    {
+        const int result = run_capture_only();
+        teardown_camera(ctx);
+        return result;
     }
 
     // Matches the detector VPSS pool. Avoid even the few vector reallocations
@@ -1956,7 +2149,6 @@ int main(int argc, char *argv[])
                                           : "CPU resize/copy to 640x360"));
 
     bool logged_first_frame = false;
-    constexpr int kSaveFrameIndex = 30;
     int frames_seen = 0;
     size_t stale_prev = 0;
     size_t pair_mismatch_prev = 0;

@@ -43,6 +43,9 @@ ISP_SNS_COMMBUS_U g_aunOv5647_BusInfo[VI_MAX_PIPE_NUM] = {
 
 CVI_U16 g_au16Ov5647_GainMode[VI_MAX_PIPE_NUM] = {0};
 CVI_U16 g_au16Ov5647_UseHwSync[VI_MAX_PIPE_NUM] = {0};
+static CVI_U8 g_au8Ov5647RequestedMode[VI_MAX_PIPE_NUM] = {
+	[0 ... VI_MAX_PIPE_NUM - 1] = OV5647_MODE_1920X1080P30
+};
 
 ISP_SNS_MIRRORFLIP_TYPE_E g_aeOv5647_MirrorFip[VI_MAX_PIPE_NUM] = {0};
 
@@ -66,6 +69,7 @@ static CVI_S32 cmos_get_wdr_size(VI_PIPE ViPipe, ISP_SNS_ISP_INFO_S *pstIspCfg);
 #define OV5647_VTS_ADDR		0x380E
 
 #define OV5647_RES_IS_1080P(w, h)      ((w) == 1920 && (h) == 1080)
+#define OV5647_RES_IS_720P(w, h)       ((w) == 1280 && (h) == 720)
 
 static CVI_S32 cmos_get_ae_default(VI_PIPE ViPipe, AE_SENSOR_DEFAULT_S *pstAeSnsDft)
 {
@@ -80,7 +84,8 @@ static CVI_S32 cmos_get_ae_default(VI_PIPE ViPipe, AE_SENSOR_DEFAULT_S *pstAeSns
 	pstAeSnsDft->u32FullLinesStd = pstSnsState->u32FLStd;
 	pstAeSnsDft->u32FlickerFreq = 50 * 256;
 	pstAeSnsDft->u32FullLinesMax = OV5647_FULL_LINES_MAX;
-	pstAeSnsDft->u32HmaxTimes = (1000000) / (pstSnsState->u32FLStd * 30);
+	pstAeSnsDft->u32HmaxTimes = (1000000) /
+		(pstSnsState->u32FLStd * DIV_0_TO_1_FLOAT(pstMode->f32MaxFps));
 
 	pstAeSnsDft->stIntTimeAccu.enAccuType = AE_ACCURACY_LINEAR;
 	pstAeSnsDft->stIntTimeAccu.f32Accuracy = 1;
@@ -97,7 +102,7 @@ static CVI_S32 cmos_get_ae_default(VI_PIPE ViPipe, AE_SENSOR_DEFAULT_S *pstAeSns
 	pstAeSnsDft->u32MaxISPDgainTarget = 2 << pstAeSnsDft->u32ISPDgainShift;
 
 	if (g_au32LinesPer500ms[ViPipe] == 0)
-		pstAeSnsDft->u32LinesPer500ms = pstSnsState->u32FLStd * 30 / 2;
+		pstAeSnsDft->u32LinesPer500ms = pstSnsState->u32FLStd * pstMode->f32MaxFps / 2;
 	else
 		pstAeSnsDft->u32LinesPer500ms = g_au32LinesPer500ms[ViPipe];
 	pstAeSnsDft->u32SnsStableFrame = 0;
@@ -161,6 +166,7 @@ static CVI_S32 cmos_fps_set(VI_PIPE ViPipe, CVI_FLOAT f32Fps, AE_SENSOR_DEFAULT_
 
 	switch (pstSnsState->u8ImgMode) {
 	case OV5647_MODE_1920X1080P30:
+	case OV5647_MODE_1280X720P60:
 		if ((f32Fps <= f32MaxFps) && (f32Fps >= f32MinFps)) {
 			u32VMAX = u32Vts * f32MaxFps / DIV_0_TO_1_FLOAT(f32Fps);
 		} else {
@@ -466,7 +472,12 @@ static CVI_S32 cmos_set_wdr_mode(VI_PIPE ViPipe, CVI_U8 u8Mode)
 
 	switch (u8Mode) {
 	case WDR_MODE_NONE:
-		pstSnsState->u8ImgMode = OV5647_MODE_1920X1080P30;
+		/* cmos_set_image_mode() selects the requested linear mode first.
+		 * Do not erase an opt-in 720p60 selection while applying the WDR
+		 * mode; the old unconditional assignment made the ISP report 60 fps
+		 * while the sensor still emitted 1080p30 registers. */
+		if (pstSnsState->u8ImgMode != OV5647_MODE_1280X720P60)
+			pstSnsState->u8ImgMode = OV5647_MODE_1920X1080P30;
 		pstSnsState->enWDRMode = WDR_MODE_NONE;
 		pstSnsState->u32FLStd = g_astOv5647_mode[pstSnsState->u8ImgMode].u32VtsDef;
 		syslog(LOG_INFO, "linear mode\n");
@@ -590,9 +601,12 @@ static CVI_S32 cmos_set_image_mode(VI_PIPE ViPipe, ISP_CMOS_SENSOR_IMAGE_MODE_S 
 
 	u8SensorImageMode = pstSnsState->u8ImgMode;
 	pstSnsState->bSyncInit = CVI_FALSE;
-	if (pstSensorImageMode->f32Fps <= 30) {
+	if (pstSensorImageMode->f32Fps <= 60) {
 		if (pstSnsState->enWDRMode == WDR_MODE_NONE) {
-			if (OV5647_RES_IS_1080P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height))
+			if (OV5647_RES_IS_720P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height) &&
+				pstSensorImageMode->f32Fps > 30)
+				u8SensorImageMode = OV5647_MODE_1280X720P60;
+			else if (OV5647_RES_IS_1080P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height))
 				u8SensorImageMode = OV5647_MODE_1920X1080P30;
 			else {
 				CVI_TRACE_SNS(CVI_DBG_ERR, "Not support! Width:%d, Height:%d, Fps:%f, WDRMode:%d\n",
@@ -612,6 +626,9 @@ static CVI_S32 cmos_set_image_mode(VI_PIPE ViPipe, ISP_CMOS_SENSOR_IMAGE_MODE_S 
 		}
 	}
 
+	/* Keep the requested mode even when the framework reports no state change.
+	 * sensor_global_init() may run later and rebuild the state from this latch. */
+	g_au8Ov5647RequestedMode[ViPipe] = u8SensorImageMode;
 	if ((pstSnsState->bInit == CVI_TRUE) && (u8SensorImageMode == pstSnsState->u8ImgMode)) {
 		/* Don't need to switch SensorImageMode */
 		return CVI_FAILURE;
@@ -642,7 +659,7 @@ static CVI_VOID sensor_global_init(VI_PIPE ViPipe)
 
 	pstSnsState->bInit = CVI_FALSE;
 	pstSnsState->bSyncInit = CVI_FALSE;
-	pstSnsState->u8ImgMode = OV5647_MODE_1920X1080P30;
+	pstSnsState->u8ImgMode = g_au8Ov5647RequestedMode[ViPipe];
 	pstSnsState->enWDRMode = WDR_MODE_NONE;
 	pstSnsState->u32FLStd  = g_astOv5647_mode[pstSnsState->u8ImgMode].u32VtsDef;
 	pstSnsState->au32FL[0] = g_astOv5647_mode[pstSnsState->u8ImgMode].u32VtsDef;
@@ -883,5 +900,3 @@ ISP_SNS_OBJ_S stSnsOv5647_Obj = {
 	.pfnExpAeCb		= cmos_init_ae_exp_function,
 	.pfnSnsProbe		= sensor_probe,
 };
-
-

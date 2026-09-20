@@ -825,13 +825,13 @@ path.
 
 ---
 
-## 11. Native 1280x720 @ 60 fps from OV5647  -- NOT STARTED, LOW PRIORITY
+## 11. Native 1280x720 @ 60 fps from OV5647  -- BRING-UP IN PROGRESS, OPT-IN ONLY
 
 **Priority: low.** This needs sensor-driver work against an NDA datasheet.
 Sections 3-9 address correctness and remove more immediate latency/throughput
-bottlenecks without changing the sensor. Complete the final preview accounting
-checkpoint and the section 10 LDC gates before beginning this sensor-mode
-work.
+bottlenecks without changing the sensor. The mode is being brought up
+independently of LDC; LDC remains calibration-gated and is not part of this
+change.
 
 **Why it is still worth doing eventually.** The detector channel is exactly
 1280x720. Capturing natively at that
@@ -839,7 +839,68 @@ size would remove the VPSS downscale from 1920x1080 entirely, and 60 fps halves
 the worst-case frame age in the table above (33 ms -> 16.7 ms). Both feed
 straight into the latency goal.
 
-**What exists today.** The CVI driver supports exactly one mode:
+**Current bring-up state.** The CV181X OV5647 driver now contains an opt-in
+1280x720@60 mode and the live app can request it with:
+
+    TINYTAG_LIVE_OV5647_720P60=1 /app/tinytag_detect/run_live.sh --no-rtsp
+
+The normal profile remains 1920x1080@30. The original incomplete 720p table
+produced a white frame; it was replaced with the complete open K230 OV5647
+720p60 sequence. The corrected mode has valid image content, and its live PLL
+and timing registers match that sequence. No device-tree or boot-clock change
+has been made.
+
+**Important cadence result: AE can deliberately trade frame rate for light.**
+In the remote indoor scene, ordinary auto exposure extended the sensor frame
+length to obtain more light. The 720p60 nominal VTS is `0x0353` (851 lines),
+but the live register was `0x12AF` (4783 lines), giving about 10 fps. The
+1080p30 path did the same. This is below TinyTag, VPSS, and LDC: a
+`--capture-only` VPSS reader measured about 10 fps for both modes. FOV and
+lens distortion are therefore orthogonal to this issue.
+
+### Fixed-cadence exposure choices
+
+1. **Uncapped automatic exposure (current default).** Best brightness and
+   generally less gain noise in low light, but the camera may use slow shutter
+   and reduce real cadence below the advertised mode rate. This is unsuitable
+   for a hard low-latency/fixed-fps requirement.
+2. **Automatic exposure with a shutter ceiling (recommended experiment).**
+   Add `--max-exposure-us 15000` for 720p60:
+
+       TINYTAG_LIVE_OV5647_720P60=1 /app/tinytag_detect/run_live.sh \
+           --no-rtsp --max-exposure-us 15000
+
+   AE remains enabled and can adjust gain, but may not extend exposure beyond
+   15 ms. Remote measurement gave 57.6 fps in `--capture-only` and 57.4-57.8
+   fps for the full strict-decode pipeline in one controlled run. The cost is
+   higher analog/digital gain, visibly more low-light noise, and potentially
+   more decoder threshold/contour work; a later capped-AE image run processed
+   only about 45 fps despite camera delivery at 58 fps. This option must be
+   judged with saved frames and tag recall, not cadence alone.
+3. **Fully manual exposure (diagnostic only for now).** Sending `exptime
+   15000` to the app also restored about 57.5 fps. It is deterministic, but
+   brightness no longer adapts safely to lighting changes, so it requires a
+   deliberate fixed-gain/illumination policy. Do not make it the normal field
+   mode without that policy.
+
+The present app implements `--max-exposure-us N` as an opt-in ceiling; `0`
+(the default) leaves the ISP's exposure range unchanged. It does not modify
+the board persistently.
+
+The live experiment links the OV5647-only binary directly against the rebuilt
+`libsns_ov5647.so`; this is intentional because the normal SDK binary links
+the aggregate `libsns_full.so`, which would otherwise mask sensor-library
+changes. A run can be tested without a screen:
+
+    TINYTAG_LIVE_OV5647_720P60=1 /app/tinytag_detect/run_live.sh --no-rtsp --save-frame /tmp/ov5647-720p60.png
+    scp root@board:/tmp/ov5647-720p60.png .
+
+The acceptance gate is: correct image content at the chosen exposure policy,
+stable near-60 fps camera delivery, acceptable strict-decode throughput and
+tag recall against 1080p30, and zero persistent pairing problems. Do not
+enable 720p60 by default until the low-light image/recall trade-off is accepted.
+
+The CVI driver previously supported exactly one mode:
 
     // cvi_mpi/component/isp/sensor/sg200x/ov_ov5647/ov5647_cmos_ex.h:26
     typedef enum _OV5647_MODE_E {
@@ -862,17 +923,14 @@ supported today and provides no present detector benefit.
 
 **Sketch.**
 
-1. Add `OV5647_MODE_1280X720P60` to the mode enum.
-2. Add `ov5647_linear_720p60_init()` with the register sequence, and select it
-   from `ov5647_init()`.
-3. Add the mode entry in `ov5647_cmos_param.h`: 1280x720 window, HTS/VTS for
-   60 fps, exposure and gain ranges (max exposure is VTS-bound, so it changes
-   with the new VTS).
-4. Register the mode name in `build/sensors/sensor_list.json` and point
-   `device/generic/rootfs_overlay/duos/mnt/data/sensor_cfg.ini` at it.
-5. Have the new mode provide 60 fps through the sensor-derived ISP/VENC rate
-   path established in pre-investigation; do not add another hardcoded value.
-6. Drop the VPSS downscale once capture is already 1280x720.
+1. Compare capped-AE saved frames, gain/noise, decoder work, and tag recall
+   against the 1080p30 baseline under representative illumination.
+2. Tune the CV181x ISP/PQ profile for the 720p binned mode, especially noise
+   reduction and sharpening, before drawing detector conclusions.
+3. Choose and document an illumination-dependent exposure ceiling if fixed
+   cadence is a product requirement; do not silently allow slow shutter.
+4. After image quality passes, measure detector freshness and recall; only
+   then consider making 720p60 the normal low-latency profile.
 
 **Open questions -- resolve before coding.**
 
@@ -881,11 +939,12 @@ supported today and provides no present detector benefit.
   whether it actually carries a 1280x720 mode -- it may only have 640x480,
   1296x972 and 1920x1080. The Raspberry Pi firmware exposes 1280x720 as its
   "mode 6", derived by binning and cropping the full array.
-- **Field of view.** 1280x720 out of a 2592x1944 array is a crop, possibly with
-  2x2 binning. Compared with today's 1080p-downscaled-to-720p view the FOV will
-  change, and probably narrow. That directly changes tag angular size, so
-  re-measure px-per-module afterwards -- the current frames sit at a
-  comfortable 7.8-8.7, so there is margin, but it is not unlimited.
+- **Field of view.** The current K230-derived 720p table reads a much wider
+  2576x1452 sensor window and bins it 2x2, while 1080p uses a central
+  1928x1088 window. The observed 720p FOV is therefore wider, not narrower;
+  tags occupy fewer pixels at the same physical distance. Compare modes on a
+  common active/rectified FOV after lens calibration, not by uncorrected scene
+  appearance.
 - **Binned image quality.** Binning trades resolution for sensitivity and can
   soften edges. The decoder cares about crisp local contrast far more than the
   network does.

@@ -92,27 +92,17 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_platform.c
       ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_sensor.c
       ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_bin.c
-      ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_venc.c)
+      ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_venc.c
+      ${MIDDLEWARE_SDK_ROOT}/component/isp/common/sensor_list.c)
 
   # cvi_mpi/sample/common/sample_common_sensor.c gates each sensor's entry in
   # its SAMPLE_COMM_SNS_GetSnsObj() switch behind #if defined(SENSOR_xxx).
-  # The prebuilt tdl_sdk demo binaries (sample_vi_fd et al.) were compiled
-  # with every sensor this board supports enabled; compiling this file
-  # ourselves without these defines silently compiles out every case, so
-  # GetSnsObj() returns NULL for a sensor that is definitely present and
-  # working (confirmed against real hardware: SAMPLE_COMM_ISP_PatchSnsObj
-  # failed with GetSnsObj returning NULL for OV5647, while the prebuilt
-  # sample_vi_fd worked fine against the same board/ini).
-  #
-  # Only OV5647 and GC2083 here, not the SC035HGS/SC200AI this board's other
-  # sensor_cfg_*.ini files reference: libsns_full.so's prebuilt .so does not
-  # actually export stSnsSC200AI_Obj/stSnsSC035HGS_Obj (confirmed -- defining
-  # those two macros is an undefined-reference link error), so this library
-  # build doesn't support them regardless of what we define here. Add them
-  # back if a build with those objects present is ever available.
+  # This live binary is intentionally OV5647-only: linking the standalone
+  # sensor library makes the opt-in 720p60 experiment use the exact library
+  # rebuilt from the working tree, instead of silently resolving OV5647 from
+  # the prebuilt aggregate libsns_full.so.
   target_compile_definitions(tinytag_detect_live PRIVATE
-      SENSOR_OV_OV5647
-      SENSOR_GCORE_GC2083)
+      SENSOR_OV_OV5647)
 
   target_compile_options(tinytag_detect_live PRIVATE -ffunction-sections -fdata-sections)
   target_link_options(tinytag_detect_live PRIVATE -Wl,--gc-sections)
@@ -126,7 +116,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       ${MIDDLEWARE_SDK_ROOT}/lib/libgdc.so
       ${MIDDLEWARE_SDK_ROOT}/lib/librgn.so
       ${MIDDLEWARE_SDK_ROOT}/lib/3rd/libini.so
-      ${MIDDLEWARE_SDK_ROOT}/lib/libsns_full.so
+      ${MIDDLEWARE_SDK_ROOT}/lib/libsns_ov5647.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libisp.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libisp_algo.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libawb.so
