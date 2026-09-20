@@ -12,7 +12,7 @@
 # arguments are passed straight through to the binary:
 #
 #   TINYTAG_THRES=0.20 run_tinytag.sh frame.jpg
-#   TINYTAG_DECODE=strict run_tinytag.sh frame.jpg    # full two-stage pipeline
+#   TINYTAG_DECODE= run_tinytag.sh frame.jpg          # disable stage two
 #   run_tinytag.sh frame.jpg --repeat 20
 set -eu
 
@@ -32,10 +32,10 @@ TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/app/tinytag_detect/cvimodel/tinytag-v40c.ttgo
 TINYTAG_REPEAT="${TINYTAG_REPEAT:-20}"
 TINYTAG_WARMUP="${TINYTAG_WARMUP:-2}"
 TINYTAG_MAX_MAE="${TINYTAG_MAX_MAE:-0.05}"
-# Empty disables stage two. Set to "strict" or "tolerant" to run the ArUco Nano
-# AprilTag 36h11 decoder over every proposal -- i.e. the full two-stage
-# pipeline, minus camera capture.
-TINYTAG_DECODE="${TINYTAG_DECODE:-}"
+# Strict is the default: run the ArUco Nano AprilTag 36h11 decoder over every
+# proposal, i.e. the full two-stage pipeline, minus camera capture. Set this to
+# empty to recover proposal-only behavior, or to "tolerant" for tolerant IDs.
+TINYTAG_DECODE="${TINYTAG_DECODE:-strict}"
 # With no <image> argument, run against this bundled sample -- the real
 # deployment path (see samples/README.md) -- so `run_tinytag.sh` alone works.
 TINYTAG_IMAGE="${TINYTAG_IMAGE:-/app/tinytag_detect/samples/arena-1280x800.jpg}"
@@ -67,7 +67,7 @@ Environment overrides (current values shown):
   TINYTAG_REPEAT  ${TINYTAG_REPEAT}
   TINYTAG_WARMUP  ${TINYTAG_WARMUP}
   TINYTAG_MAX_MAE ${TINYTAG_MAX_MAE}
-  TINYTAG_DECODE  ${TINYTAG_DECODE:-(off)}
+  TINYTAG_DECODE  ${TINYTAG_DECODE:-(strict)}
 USAGE
 }
 

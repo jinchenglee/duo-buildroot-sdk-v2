@@ -125,12 +125,12 @@ arguments at all it runs against the bundled `arena-1280x800.jpg` sample, so
 every other option already has a working default:
 
 ```sh
-run_tinytag.sh                                                  # bundled sample, all defaults
-run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg   # proposals only
+run_tinytag.sh                                                  # bundled sample, full two-stage pipeline
+run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg   # full two-stage pipeline
 run_tinytag.sh /app/tinytag_detect/samples/frame-640x360.png    # no resize
 
-# full two-stage pipeline: proposals + AprilTag 36h11 ids
-TINYTAG_DECODE=strict run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg
+# proposal-only mode, if needed
+TINYTAG_DECODE= run_tinytag.sh /app/tinytag_detect/samples/arena-1280x800.jpg
 ```
 
 Or any image of your own:
@@ -155,7 +155,7 @@ environment:
 | `TINYTAG_WARMUP` | `2` | untimed runs before measuring |
 | `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/tinytag-v40c.ttgold` | self-test bundle |
 | `TINYTAG_MAX_MAE` | `0.05` | self-test error gate |
-| `TINYTAG_DECODE` | *(off)* | `strict` or `tolerant` — enables stage two |
+| `TINYTAG_DECODE` | `strict` | `strict` or `tolerant`; empty disables stage two |
 
 ```sh
 TINYTAG_THRES=0.20 run_tinytag.sh frame.jpg      # higher recall, ~2x proposals

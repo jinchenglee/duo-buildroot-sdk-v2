@@ -725,7 +725,7 @@ baselines. Exact-luma remains the production preview; do not retire colour
 
 ---
 
-## 10. Hardware lens-distortion correction -- NOT STARTED, MEASURE BEFORE ENABLE
+## 10. Hardware lens-distortion correction -- NOT STARTED, CALIBRATION FIRST
 
 **Goal.** Correct OV5647/lens barrel or pincushion distortion in hardware before
 the proposal/decode split, without adding CPU remap work or breaking geometric
@@ -755,25 +755,53 @@ channel, or applying resolution-inconsistent parameters, silently moves ROIs
 away from their tags. Exact-luma preview follows channel 0 automatically; an
 optional colour channel must use matching correction if it remains enabled.
 
+The preferred geometry is a single corrected image followed by the existing
+scale split:
+
+    sensor/ISP -> one corrected 1280x720 image
+                         |-> channel 0: crop/decode and luma preview
+                         `-> 640x360 model input
+
+That arrangement makes the model image a true downscale of the image used for
+crop decoding. The current implementation does not have that guarantee: it
+configures 1280x720 channel 0 and 640x360 channel 1 as independent VPSS
+outputs. Even if both channels receive the same nominal LDC calibration,
+independent output-size-specific mesh generation, coordinate grids,
+interpolation, center/FOV handling, and edge behavior can make them different
+resamplings of the sensor image. “Same calibration parameters” is therefore
+not the same claim as “channel 1 is channel 0 scaled down.”
+
+Do not implement or enable LDC before lens calibration exists. The first
+follow-up is measurement only. If calibration shows a benefit, use corrected
+channel 0 resized in software as the correctness reference, then compare the
+independently corrected 640x360 VPSS output against it. The direct 640x360
+path may be retained only if the comparison proves that proposals and
+proposal-to-crop geometry remain valid; otherwise use the reference resize or
+move correction upstream/shared. The current VI_OFFLINE_VPSS_ONLINE topology
+does not make VI-channel LDC an assumed upstream solution, so changing the
+topology is a separate design decision, not part of the first LDC patch.
+
 **Plan.**
 
-1. Capture a calibration grid/checkerboard across the full field and quantify
+1. **Calibration and baseline only; no code change.** Capture a calibration
+   grid/checkerboard across the full field and quantify
    baseline reprojection/line-curvature error. Preserve the raw frame and
    lens/module identity; LDC parameters are lens-specific.
 2. Use Milk-V's PQ Tools/`isp_tool_daemon` workflow and the SOPHGO LDC guide to
    derive distortion ratio, optical-center offsets, and FOV ratios. Do not tune
    by visual preference alone.
-3. Add an opt-in `TINYTAG_LIVE_LDC=1` path that calls
+3. Only after calibration, add an opt-in `TINYTAG_LIVE_LDC=1` path that calls
    `CVI_VPSS_SetChnLDCAttr()` after `CVI_VPSS_SetChnAttr()` and before enabling
    each affected channel. Log read-back attributes and fail closed if either
    detector channel rejects them. Default remains off until all gates pass.
-4. Configure channel 0 and channel 1 as a matched pair. Validate corrected
-   channel-1 inference against CPU resize/copy from corrected channel 0 on the
-   same `u32TimeRef`. Independent LDC resampling at 640x360 and 1280x720 may not
-   be bit-exact, so compare tensor outputs, proposal peaks/order/ROIs, decoded
-   IDs, and a tag-position sweep across center, edges, and corners. If geometry
-   cannot be matched, reject per-channel LDC or move correction upstream; never
-   decode corrected proposals against uncorrected pixels.
+4. Treat corrected channel 0 plus a CPU resize/copy as the reference path.
+   Compare independently corrected channel 1 on the same `u32TimeRef`. Exact
+   pixels are not required, but compare tensor outputs, proposal peaks/order/
+   ROIs, decoded IDs, and a tag-position sweep across center, edges, and
+   corners. Never decode corrected proposals against uncorrected pixels.
+   If the geometry cannot be matched, reject independent per-channel LDC and
+   either retain the reference resize or investigate a shared/upstream
+   correction path.
 5. Measure corrected grid error, retained FOV, px-per-tag-module, edge/corner
    recall, false positives, and crop area. LDC may straighten edges while
    shrinking/cropping the usable image or softening resampled tag borders.

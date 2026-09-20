@@ -256,6 +256,16 @@ The aligned-input compiler option and aligned-only runtime API remain for VPSS
 layouts whose stride differs from compact width. The deployed fixed 640x360
 layout does not require a separately converted aligned model.
 
+The next LDC step is calibration and baseline measurement only; no LDC
+implementation is currently planned before a lens/module calibration exists.
+The preferred geometry is one corrected 1280x720 image followed by the 640x360
+model downscale. The current two-channel VPSS path renders 1280x720 and 640x360
+independently, so equal nominal LDC settings do not prove that the smaller
+image is a downscale of the crop/decode image. If LDC is pursued, corrected
+channel 0 plus a CPU resize is the correctness reference; the direct corrected
+channel 1 path must demonstrate equivalent proposal-to-crop geometry before it
+can be retained. Otherwise keep the resize path or move correction upstream.
+
 Generated overlay binaries, launchers, samples, and DMA tools are ignored;
 their sources live under `apps/tinytag_detect/`. The hardware-validated
 cvimodel is the intentional tracked overlay exception.
