@@ -825,9 +825,9 @@ path.
 
 ---
 
-## 11. Native 1280x720 @ 60 fps from OV5647  -- BRING-UP IN PROGRESS, OPT-IN ONLY
+## 11. Native 1280x720 @ 60 fps from OV5647  -- OPT-IN SENSOR MODE, TIMING VERIFIED
 
-**Priority: low.** This needs sensor-driver work against an NDA datasheet.
+**Priority: low.** This needs continued sensor-driver validation against an NDA datasheet.
 Sections 3-9 address correctness and remove more immediate latency/throughput
 bottlenecks without changing the sensor. The mode is being brought up
 independently of LDC; LDC remains calibration-gated and is not part of this
@@ -848,7 +848,9 @@ The normal profile remains 1920x1080@30. The original incomplete 720p table
 produced a white frame; it was replaced with the complete open K230 OV5647
 720p60 sequence. The corrected mode has valid image content, and its live PLL
 and timing registers match that sequence. No device-tree or boot-clock change
-has been made.
+has been made. The corrected 24 MHz PLL is now the default inside the opt-in
+720p60 mode; the mode itself remains opt-in until longer image-quality and
+MIPI validation is complete.
 
 **Important cadence result: AE can deliberately trade frame rate for light.**
 In the remote indoor scene, ordinary auto exposure extended the sensor frame
@@ -857,6 +859,33 @@ but the live register was `0x12AF` (4783 lines), giving about 10 fps. The
 1080p30 path did the same. This is below TinyTag, VPSS, and LDC: a
 `--capture-only` VPSS reader measured about 10 fps for both modes. FOV and
 lens distortion are therefore orthogonal to this issue.
+
+**Confirmed 57.6-fps timing cause.** With capped exposure, direct OV5647 I²C
+reads showed the intended 720p timing registers (`HTS=0x0704`,
+`VTS=0x0353`) and contiguous MPI frame sequence numbers, so the application is
+not dropping frames and AE is not stretching VTS. The Duo-S clock tree reports
+`clk_cam0 = 24,000,000 Hz`. The K230-derived PLL table produces the observed
+ratio almost exactly: `24/25 * 60 = 57.6 fps`. The table therefore appears to
+assume a 25 MHz sensor input clock. The next timing experiment is to select a
+valid OV5647 PLL combination for the actual 24 MHz clock; do not change the
+window or VTS blindly, and recheck MIPI stability, image quality, and cadence.
+
+The 24 MHz compensation now uses sensor PLL multiplier `0x73` instead of the
+old K230-derived `0x6e` fallback. It is selected by default; the fallback can
+be tested explicitly with `TINYTAG_LIVE_OV5647_720P60_PLL24=0`:
+
+    TINYTAG_LIVE_OV5647_720P60=1 \
+    /app/tinytag_detect/run_live.sh --no-rtsp --capture-only \
+        --max-exposure-us 10000
+
+On hardware this produced 60.1-60.3 fps with contiguous sequences. The full
+detector path also produced roughly 59.2-60.8 fps, a valid 1280x720 frame, and
+decoded tag ID 0. Setting `TINYTAG_LIVE_OV5647_720P60_PLL24=0` retains the
+stable fallback at roughly 57.6 fps.
+
+The live launcher also defaults its decode ROI expansion to `1.3`; the larger
+`1.5` setting increases crop work enough to reduce throughput. Override it
+with `TINYTAG_LIVE_EXPAND=1.5` when explicitly testing that trade-off.
 
 ### Fixed-cadence exposure choices
 

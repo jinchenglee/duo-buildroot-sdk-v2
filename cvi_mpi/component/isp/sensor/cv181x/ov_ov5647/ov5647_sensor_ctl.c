@@ -4,6 +4,7 @@
 #include <sys/ioctl.h>
 #include <syslog.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
@@ -14,6 +15,14 @@
 
 static void ov5647_linear_1080p30_init(VI_PIPE ViPipe);
 static void ov5647_linear_720p60_init(VI_PIPE ViPipe);
+
+static int ov5647_720p60_24m_pll_requested(void)
+{
+	const char *value = getenv("TINYTAG_LIVE_OV5647_720P60_PLL24");
+	/* The Duo-S camera clock is 24 MHz. Keep the old K230 25 MHz-derived
+	 * multiplier available with =0, but make the corrected timing default. */
+	return value == NULL || (value[0] == '1' && value[1] == '\0');
+}
 
 CVI_U8 ov5647_i2c_addr = 0x36;        /* I2C Address of OV5647 */
 const CVI_U32 ov5647_addr_byte = 2;
@@ -351,7 +360,11 @@ static void ov5647_linear_720p60_init(VI_PIPE ViPipe)
 	ov5647_write_register(ViPipe, 0x0103, 0x01);
 	ov5647_write_register(ViPipe, 0x3034, 0x1a);
 	ov5647_write_register(ViPipe, 0x3035, 0x21);
-	ov5647_write_register(ViPipe, 0x3036, 0x6e);
+	/* The fallback K230 table uses 0x6e and runs at 57.6 fps with Duo-S's
+	 * 24 MHz cam0 clock. 0x73 compensates 24 MHz -> 25 MHz nominal input;
+	 * TINYTAG_LIVE_OV5647_720P60_PLL24=0 selects the fallback. */
+	ov5647_write_register(ViPipe, 0x3036,
+			ov5647_720p60_24m_pll_requested() ? 0x73 : 0x6e);
 	ov5647_write_register(ViPipe, 0x303c, 0x11);
 	ov5647_write_register(ViPipe, 0x3106, 0xf5);
 	ov5647_write_register(ViPipe, 0x3820, 0x01);
@@ -445,5 +458,3 @@ static void ov5647_linear_720p60_init(VI_PIPE ViPipe)
 	delay_ms(100);
 	printf("ViPipe:%d,===OV5647 720P 60fps 10bit LINE Init OK!\n", ViPipe);
 }
-
-

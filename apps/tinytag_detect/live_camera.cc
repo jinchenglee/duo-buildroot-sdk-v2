@@ -52,6 +52,7 @@ extern "C" {
 
 #include <pthread.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -74,6 +75,7 @@ extern "C" {
 namespace {
 
 volatile sig_atomic_t g_stop = 0;
+int g_result_fd = STDOUT_FILENO;
 void handle_signal(int) { g_stop = 1; }
 
 int preview_nice_value()
@@ -365,7 +367,7 @@ void usage(const char *argv0)
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
             "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png]\n"
             "       [--save-native-frame frame.png] [--rtsp|--no-rtsp]\n"
-            "       [--capture-only] [--max-exposure-us N]\n"
+            "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
             "\n"
@@ -389,6 +391,8 @@ void usage(const char *argv0)
             "              capture queue, or image processing. Prints one rate per second.\n"
             "  --max-exposure-us N  retain auto exposure but cap its shutter time. This\n"
             "              prevents AE slow-shutter from reducing capture cadence.\n"
+            "  --quiet  suppress application diagnostics on stderr; detected tag IDs\n"
+            "              remain on stdout.\n"
 
             "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n",
             argv0);
@@ -1954,6 +1958,7 @@ int main(int argc, char *argv[])
     bool mirror = false, flip = false;
     bool tag_output = true;
     bool capture_only = false;
+    bool quiet = false;
     CVI_U32 max_exposure_us = 0;
     bool direct_compact_input = false;
     bool validate_compact_input = false;
@@ -1984,6 +1989,7 @@ int main(int argc, char *argv[])
         else if (flag == "--capture-only") capture_only = true;
         else if (flag == "--max-exposure-us" && has_value)
             max_exposure_us = static_cast<CVI_U32>(std::strtoul(argv[++i], nullptr, 10));
+        else if (flag == "--quiet") quiet = true;
         else if (flag == "--decode" && has_value)
         {
             decode = true;
@@ -2004,8 +2010,25 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Quiet mode is the minimal result stream: retain detected IDs even
+    // though run_live.sh normally disables per-tag stdout by default.
+    if (quiet)
+        tag_output = true;
+
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    if (quiet)
+    {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDERR_FILENO);
+            g_result_fd = dup(STDOUT_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+    }
 
     // Validate and construct the model before acquiring camera resources. An
     // aligned model selects the optional independent 640x360 VPSS input path.
@@ -2096,8 +2119,10 @@ int main(int argc, char *argv[])
 
     std::vector<Proposal> proposals;
     std::vector<TinyTagResult> results;
+    std::vector<TinyTagResult> window_tags;
     proposals.reserve(static_cast<size_t>(std::max(1, max_proposals)));
     results.reserve(static_cast<size_t>(std::max(1, max_proposals)));
+    window_tags.reserve(static_cast<size_t>(std::max(1, max_proposals)));
 
     // Per-stage times summed over a one-second window and printed as
     // per-frame averages, so the line shows where latency actually goes
@@ -2434,10 +2459,16 @@ int main(int argc, char *argv[])
         if (tag_output)
         {
             for (const auto &r : results)
-                fprintf(stdout, "[tag] id=%d confidence=%.2f roi=(%.0f,%.0f,%.0fx%.0f)\n", r.id,
-                        r.proposal_confidence, r.roi.x, r.roi.y, r.roi.width, r.roi.height);
-            if (!results.empty())
-                fflush(stdout);
+            {
+                auto existing = std::find_if(window_tags.begin(), window_tags.end(),
+                                             [&r](const TinyTagResult &saved) {
+                                                 return saved.id == r.id;
+                                             });
+                if (existing == window_tags.end())
+                    window_tags.push_back(r);
+                else
+                    *existing = r;
+            }
         }
 
         const double t_output_done = now_ms();
@@ -2495,22 +2526,39 @@ int main(int argc, char *argv[])
             const double loop = busy + win.output / n;
             const double process_cpu_now = process_cpu_ms();
             const double process_cpu_per_frame = (process_cpu_now - process_cpu_window_start) / n;
-            fprintf(stderr,
-                    "[camera] %.1f fps | per frame ms: wait %.2f pair %.2f map %.2f pre %.2f infer %.2f "
-                    "decode %.2f crop %.2f release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f proc-cpu %.2f | "
-                    "%.1f proposals | %zu stale"
-                    " | seq mean %.2f max %u sum %u | age mean %.2f max %.2f ms | "
-                    "map-cache hit %zu miss %zu blocks %zu\n",
-                    n * 1000.0 / (t_now - fps_window_start), win.wait / n, win.pair / n,
-                    win.map / n, win.pre / n,
-                    win.infer / n, win.decode / n, win.crop / n, win.release / n, win.output / n,
-                    busy, loop, win.service_cpu / n, process_cpu_per_frame,
-                    win.proposals / n, stale_now - stale_prev,
-                    win.seq_samples ? static_cast<double>(win.seq_sum) / win.seq_samples : 0.0,
-                    win.seq_max, win.seq_sum,
-                    win.age_samples ? win.age_sum / win.age_samples : 0.0, win.age_max,
-                    ctx.luma_mapping_hits,
-                    ctx.luma_mapping_misses, ctx.luma_mappings.size());
+            const double window_fps = n * 1000.0 / (t_now - fps_window_start);
+            if (quiet)
+            {
+                dprintf(g_result_fd, "[stats] %.1f fps | total %.2f ms | %.1f proposals\n",
+                        window_fps, loop, win.proposals / n);
+            }
+            else
+            {
+                fprintf(stderr,
+                        "[camera] %.1f fps | per frame ms: wait %.2f pair %.2f map %.2f pre %.2f infer %.2f "
+                        "decode %.2f crop %.2f release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f proc-cpu %.2f | "
+                        "%.1f proposals | %zu stale"
+                        " | seq mean %.2f max %u sum %u | age mean %.2f max %.2f ms | "
+                        "map-cache hit %zu miss %zu blocks %zu\n",
+                        window_fps, win.wait / n, win.pair / n,
+                        win.map / n, win.pre / n,
+                        win.infer / n, win.decode / n, win.crop / n, win.release / n, win.output / n,
+                        busy, loop, win.service_cpu / n, process_cpu_per_frame,
+                        win.proposals / n, stale_now - stale_prev,
+                        win.seq_samples ? static_cast<double>(win.seq_sum) / win.seq_samples : 0.0,
+                        win.seq_max, win.seq_sum,
+                        win.age_samples ? win.age_sum / win.age_samples : 0.0, win.age_max,
+                        ctx.luma_mapping_hits,
+                        ctx.luma_mapping_misses, ctx.luma_mappings.size());
+            }
+            if (tag_output)
+            {
+                for (const auto &r : window_tags)
+                    dprintf(g_result_fd,
+                            "[tag] id=%d confidence=%.2f roi=(%.0f,%.0f,%.0fx%.0f)\n", r.id,
+                            r.proposal_confidence, r.roi.x, r.roi.y, r.roi.width, r.roi.height);
+                window_tags.clear();
+            }
             if (decode)
             {
                 const double profiled = (win.crop_threshold + win.crop_contour + win.crop_quad +
@@ -2601,5 +2649,7 @@ int main(int argc, char *argv[])
     if (isp_control.joinable())
         isp_control.join();
     teardown_camera(ctx);
+    if (g_result_fd != STDOUT_FILENO)
+        close(g_result_fd);
     return 0;
 }

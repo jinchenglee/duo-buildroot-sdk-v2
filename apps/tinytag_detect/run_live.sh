@@ -8,7 +8,7 @@ MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvim
 BIN="${TINYTAG_LIVE_BIN:-/app/tinytag_detect/tinytag_detect_live}"
 THRES="${TINYTAG_LIVE_THRES:-0.20}"
 MAX="${TINYTAG_LIVE_MAX:-8}"
-EXPAND="${TINYTAG_LIVE_EXPAND:-1.5}"
+EXPAND="${TINYTAG_LIVE_EXPAND:-1.3}"
 IOU="${TINYTAG_LIVE_IOU:-0.5}"
 DECODE="${TINYTAG_LIVE_DECODE:-strict}"
 DEBUG="${TINYTAG_LIVE_DEBUG:-1}"
@@ -71,5 +71,5 @@ exec "${BIN}" "${MODEL}" \
     --tag-output "${TAG_OUTPUT}" \
     --direct-compact-input "${DIRECT_COMPACT_INPUT}" \
     --validate-compact-input "${VALIDATE_COMPACT_INPUT}" \
-    --rtsp \
+    --no-rtsp \
     "$@"

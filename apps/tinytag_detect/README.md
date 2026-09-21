@@ -118,6 +118,45 @@ start latency; `resultAge` is the software approximation `acqAge + loop`.
 not be optimized in isolation. `crop` is full-resolution AprilTag crop-decode
 time, which varies with scene content.
 
+## Live camera usage
+
+`run_live.sh` defaults to detector-only operation with no RTSP preview. Pass
+`--rtsp` or `--rtsp-luma` to enable a preview; later command-line arguments
+override the launcher defaults.
+
+The low-latency 720p60 profile is:
+
+```sh
+TINYTAG_LIVE_OV5647_720P60=1 \
+  /app/tinytag_detect/run_live.sh \
+  --max-exposure-us 10000 \
+  --quiet
+```
+
+The 24 MHz-compensated OV5647 PLL is the default for 720p60 and reaches about
+60 fps on the Duo-S. The older ~57.6 fps timing table remains available with
+`TINYTAG_LIVE_OV5647_720P60_PLL24=0`. The 10 ms exposure ceiling keeps AE
+enabled while preventing low-light slow shutter; the trade-off is more gain
+and noise. Omit it to allow normal AE to choose longer exposures.
+
+The launcher defaults to ROI expansion `1.3`, strict decoding, direct compact
+model input, and per-tag text output disabled. `--quiet` emits one `[stats]`
+line per second plus batched `[tag]` lines, while suppressing diagnostics.
+Use `TINYTAG_LIVE_EXPAND=1.5` to compare the larger decode ROI.
+
+```sh
+# Default 1080p30 detector path
+/app/tinytag_detect/run_live.sh --quiet
+
+# 720p60 with luma RTSP preview
+TINYTAG_LIVE_OV5647_720P60=1 \
+  /app/tinytag_detect/run_live.sh --rtsp-luma --max-exposure-us 10000
+
+# Camera delivery only, without inference or decoding
+TINYTAG_LIVE_OV5647_720P60=1 \
+  /app/tinytag_detect/run_live.sh --capture-only --max-exposure-us 10000
+```
+
 ## Usage on the board
 
 Sample frames ship with the app, so there is nothing to copy over. With no

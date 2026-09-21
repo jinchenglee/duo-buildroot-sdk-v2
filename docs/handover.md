@@ -4,11 +4,11 @@ Orientation for picking this work up cold. The detailed experiment log and
 remaining roadmap are in `docs/live-camera-workplan.md`; sections 1-9 are
 complete as a hardware-verified checkpoint. Section 10, hardware lens
 distortion correction, remains calibration-gated. Section 11, native OV5647
-1280x720@60, is an opt-in experiment with a valid K230-derived sensor table.
+1280x720@60, is selected with `TINYTAG_LIVE_OV5647_720P60=1` and now uses a
+24 MHz-compensated PLL by default. Hardware validation reaches about 60 fps.
 In low light, uncapped auto exposure extends frame length and reduces either
-mode to about 10 fps. `--max-exposure-us 15000` retains AE while restoring
-about 58 fps camera delivery, at the cost of higher-gain noise; image/PQ and
-tag-recall validation remain before accepting it as a default.
+mode to about 10 fps. Use `--max-exposure-us 10000` to retain AE while
+preventing slow shutter; the cost is higher-gain noise.
 
 ## Preview scheduling checkpoint
 
