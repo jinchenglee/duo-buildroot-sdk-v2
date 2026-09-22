@@ -215,7 +215,7 @@ the top-N slots. See `docs/duo-s-performance-findings.md` for the table.
 Or call the binary directly:
 
 ```
-tinytag_detect <cvimodel> <image> [--thres f] [--max n] [--expand f] [--iou f]
+tinytag_detect <cvimodel> <image_file> [--thres f] [--max n] [--expand f] [--iou f]
                                   [--decode [strict|tolerant]]
                                   [--out path] [--repeat n] [--warmup n] [--debug 0|1|2]
 tinytag_detect <cvimodel> --selftest <bundle> [--repeat n] [--warmup n] [--max-mae f]

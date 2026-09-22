@@ -45,6 +45,23 @@ Note a failed build still runs `clean_all` first, so it wipes
 against. After a failed build, run a full successful one before rebuilding the
 app.
 
+## Clean rebuild (keeping downloads)
+
+`clean_all` does not touch `buildroot/output`, so it is not a from-scratch
+build. To wipe every build output while keeping `buildroot/dl` (the download
+cache) and `host-tools` (the toolchains):
+
+```sh
+scripts/clean_keep_dl.sh      # dry run: list what would be removed
+scripts/clean_keep_dl.sh -f   # remove it
+```
+
+It deletes exactly the git-ignored files, so tracked sources and uncommitted
+edits are safe. That includes `out/`, so copy any image you want to keep
+first. The build outputs are root-owned, so the script runs inside the
+`duodocker` container (`DUO_CONTAINER` overrides the name). Then rebuild with
+the full sequence below, starting from step 1.
+
 ## TinyTag detector (this fork)
 
 This fork adds a TinyTag AprilTag detector that runs on the Duo S NPU. It is
@@ -56,11 +73,12 @@ D="docker exec -it duodocker /bin/bash -c"
 B=milkv-duos-glibc-arm64-sd
 
 $D "cd /home/work && export FORCE_UNSAFE_CONFIGURE=1 && ./build.sh $B"   # 1. full build (produces the TPU SDK)
-$D "cd /home/work && ./apps/tinytag_detect/build.sh $B"                  # 2. build the app, stage it
-$D "cd /home/work && export FORCE_UNSAFE_CONFIGURE=1 && ./build.sh $B"   # 3. rebuild so the image picks it up
+$D "cd /home/work && ./apps/tinytag_detect/build.sh $B"                  # 2. build TinyTag, stage it
+$D "cd /home/work && ./apps/aruco_nano/build.sh $B"                       # 3. build ArUco Nano, stage it
+$D "cd /home/work && export FORCE_UNSAFE_CONFIGURE=1 && ./build.sh $B"   # 4. rebuild so the image picks both up
 ```
 
-Step 2 cannot be folded into step 1: it cross-compiles against the cvitek TPU
+The two app-build commands cannot be folded into step 1: they cross-compile against the cvitek TPU
 SDK that step 1 itself produces, so on a first-ever build there is nothing to
 link against yet.
 
