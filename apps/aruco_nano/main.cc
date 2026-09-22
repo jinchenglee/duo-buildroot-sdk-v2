@@ -1,0 +1,1826 @@
+// Pure ArUco Nano live detector for the Milk-V Duo S.
+//
+// Reads the exact same camera feed as apps/tinytag_detect/live_camera.cc --
+// the same OV5647 VI -> VPSS group, channel 0 as 1280x720 YUV400, the same
+// latest-value capture slot, the same CVI_SYS_MmapCache zero-copy mapping, the
+// same VI mirror correction and AE control -- so the stock detector can be
+// compared against the tinytag two-stage path under identical acquisition
+// conditions.
+//
+// Two live options mirror the tinytag binary exactly:
+//   --rtsp-luma   exact-luma preview: the detector's channel-0 Y plane is
+//                 borrowed (zero copy) into an NV21 frame with a neutral chroma
+//                 plane, drawn with the overlay, H.264-encoded and RTSP-served.
+//   --rtsp        colour preview: a second VPSS channel (channel 1) delivers
+//                 NV21 which is drawn and streamed.
+// Both are served by a VENC + cvi_rtsp server (rtsp://<board>:554/h264).
+//
+// There is no cviruntime / cvimodel dependency. Everything is traditional CV
+// plus the MPI stack.
+//
+// Verified camera assumptions (from live_camera.cc and docs/handover.md):
+//   - VI_OFFLINE_VPSS_ONLINE (default), VI/VPSS device 1, group 0, channel 0.
+//   - sensor 1920x1080@30 (or opt-in 1280x720@60) -> VPSS 1280x720 YUV400.
+//   - mirror correction must default ON or AprilTag markers (chiral) decode
+//     to zero; the network would still "see" them but nothing matches.
+
+#include "tag_crop_decoder.h"
+
+extern "C" {
+#include <core/utils/vpss_helper.h>
+#include <cvi_ae.h>
+#include <cvi_awb.h>
+#include <cvi_comm.h>
+#include <cvi_isp.h>
+#include <cvi_vi.h>
+#include <rtsp.h>
+#include <sample_comm.h>
+}
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include <pthread.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <csignal>
+#include <mutex>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+volatile sig_atomic_t g_stop = 0;
+int g_result_fd = STDOUT_FILENO;
+void handle_signal(int) { g_stop = 1; }
+
+constexpr VPSS_GRP kVpssGrp = 0;
+constexpr VPSS_CHN kVpssChn = 0;
+constexpr VPSS_CHN kPreviewChn = 1;
+constexpr CVI_U32 kDetWidth = 1280;
+constexpr CVI_U32 kDetHeight = 720;
+constexpr VB_POOL kDetPool = 1;
+constexpr VB_POOL kPreviewPool = 2;
+constexpr VENC_CHN kVencChn = 0;
+constexpr int kPreviewBitrateKbps = 3000;
+constexpr int kVencTimeoutMs = 2000;
+constexpr int kSaveFrameIndex = 30;
+
+// A preview surface owns an NV21 chroma plane reached by the worker. For the
+// exact-luma path the Y plane is borrowed from the detector's VPSS frame; for
+// the colour path the whole NV21 frame comes from channel 1.
+constexpr size_t kPreviewSurfaceCount = 2;
+struct PreviewSurface
+{
+    CVI_U64 c_phy = 0;
+    CVI_VOID *c_vir = nullptr;
+    CVI_U32 c_len = 0;
+    CVI_U32 c_stride = 0;
+    std::vector<cv::Rect> dirty;
+    bool free = true;
+    size_t index = 0;
+};
+
+enum RtspSendFailure : unsigned
+{
+    RTSP_SEND_OK = 0,
+    RTSP_SEND_SUBMIT = 1u << 0,
+    RTSP_SEND_NO_PACKS = 1u << 1,
+    RTSP_SEND_PACK_OVERFLOW = 1u << 2,
+    RTSP_SEND_GET = 1u << 3,
+    RTSP_SEND_WRITE = 1u << 4,
+    RTSP_SEND_RELEASE = 1u << 5,
+};
+
+struct RtspSendResult
+{
+    unsigned failures = RTSP_SEND_OK;
+    size_t get_timeouts = 0;
+    double venc_ms = 0.0;
+    double rtsp_ms = 0.0;
+};
+
+struct CaptureSlot
+{
+    std::mutex mutex;
+    std::condition_variable not_empty;
+    VIDEO_FRAME_INFO_S frame{};
+    double ready_ms = 0.0;
+    bool full = false;
+    bool stopping = false;
+    size_t dropped = 0;
+};
+
+struct CachedLumaMapping
+{
+    CVI_U64 phy = 0;
+    uint8_t *vir = nullptr;
+    CVI_U32 len = 0;
+};
+
+// One latest-value item handed to the exact-luma preview worker.
+struct LumaRtspItem
+{
+    VIDEO_FRAME_INFO_S source{};
+    uint8_t *source_y_vir = nullptr;
+    CVI_U32 source_map_len = 0;
+    VIDEO_FRAME_INFO_S encoded{};
+    PreviewSurface *surface = nullptr;
+    std::vector<TagDetection> tags;
+    double fps = 0.0;
+    double busy_ms = 0.0;
+    CVI_U32 sequence = 0;
+    double queued_ms = 0.0;
+};
+
+struct LumaRtspQueue
+{
+    std::mutex mutex;
+    std::condition_variable not_empty;
+    LumaRtspItem pending{};
+    bool full = false;
+    bool stopping = false;
+
+    size_t published = 0;
+    size_t superseded = 0;
+    size_t no_surface = 0;
+    size_t dequeued = 0;
+    size_t encoded = 0;
+    size_t encode_failed = 0;
+    size_t submit_failed = 0;
+    size_t no_packs = 0;
+    size_t pack_overflow = 0;
+    size_t get_failed = 0;
+    size_t get_timeouts = 0;
+    size_t rtsp_failed = 0;
+    size_t release_failed = 0;
+    size_t sequence_skipped = 0;
+    size_t ownership_errors = 0;
+    size_t borrowed_frames = 0;
+    size_t borrowed_frames_max = 0;
+    CVI_U32 sequence_gap_max = 0;
+    CVI_U32 previous_sequence = 0;
+    bool have_previous_sequence = false;
+    double queue_age_sum_ms = 0.0;
+    double queue_age_max_ms = 0.0;
+    double venc_sum_ms = 0.0;
+    double venc_max_ms = 0.0;
+    double rtsp_sum_ms = 0.0;
+    double rtsp_max_ms = 0.0;
+};
+
+struct LumaRtspStats
+{
+    size_t published = 0, superseded = 0, no_surface = 0;
+    size_t dequeued = 0, encoded = 0, encode_failed = 0;
+    size_t submit_failed = 0, no_packs = 0, pack_overflow = 0;
+    size_t get_failed = 0, get_timeouts = 0, rtsp_failed = 0, release_failed = 0;
+    size_t sequence_skipped = 0, ownership_errors = 0;
+    size_t borrowed_frames = 0, borrowed_frames_max = 0;
+    CVI_U32 sequence_gap_max = 0;
+    double queue_age_sum_ms = 0.0, queue_age_max_ms = 0.0;
+    double venc_sum_ms = 0.0, venc_max_ms = 0.0;
+    double rtsp_sum_ms = 0.0, rtsp_max_ms = 0.0;
+    bool pending = false;
+};
+
+struct BorrowedYResources
+{
+    VIDEO_FRAME_INFO_S frame{};
+    uint8_t *mapped_y = nullptr;
+    CVI_U32 map_len = 0;
+    bool valid = false;
+};
+
+// Latest detections published by the detector loop and read by the colour
+// preview thread. The preview draws whatever is newest.
+struct Overlay
+{
+    std::mutex mutex;
+    std::vector<TagDetection> tags;
+    double fps = 0.0;
+    double busy_ms = 0.0;
+} g_overlay;
+
+struct CameraContext
+{
+    SAMPLE_VI_CONFIG_S vi_config{};
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool preview = false;
+    bool preview_luma = false;
+    bool vi_online = false;
+    bool sys_initialized = false;
+    bool vi_initialized = false;
+    bool vpss_created = false;
+    bool vi_vpss_bound = false;
+    bool venc_started = false;
+    bool rtsp_started = false;
+    VPSS_CHN preview_chn = kPreviewChn;
+    VB_POOL preview_pool = kPreviewPool;
+    size_t preview_item_capacity = 8;
+    unsigned preview_delay_ms = 0;
+    bool mirror = false;
+    bool flip = false;
+    CaptureSlot capture;
+    std::thread capture_worker;
+    std::vector<CachedLumaMapping> luma_mappings;
+    size_t luma_mapping_hits = 0;
+    size_t luma_mapping_misses = 0;
+    PreviewSurface preview_surfaces[kPreviewSurfaceCount];
+    std::vector<VENC_PACK_S> venc_packs;
+    LumaRtspQueue luma_rtsp_queue;
+    std::thread luma_rtsp_worker;
+    CVI_RTSP_CTX *rtsp = nullptr;
+    CVI_RTSP_SESSION *session = nullptr;
+};
+
+bool ov5647_720p60_requested()
+{
+    const char *value = std::getenv("ARUCO_NANO_LIVE_OV5647_720P60");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+double now_ms()
+{
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+double thread_cpu_ms()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
+double process_cpu_ms()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
+struct TailSummary
+{
+    double p50 = 0, p95 = 0, p99 = 0, max = 0;
+};
+
+TailSummary summarize_tail(std::vector<double> samples)
+{
+    TailSummary out;
+    if (samples.empty())
+        return out;
+    std::sort(samples.begin(), samples.end());
+    auto percentile = [&samples](double p) {
+        const size_t rank = static_cast<size_t>(std::ceil(p * samples.size()));
+        return samples[std::min(samples.size() - 1, std::max<size_t>(1, rank) - 1)];
+    };
+    out.p50 = percentile(0.50);
+    out.p95 = percentile(0.95);
+    out.p99 = percentile(0.99);
+    out.max = samples.back();
+    return out;
+}
+
+void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "Usage: %s [--mode strict|tolerant] [--debug n] [--mirror 0|1]\n"
+            "       [--flip 0|1] [--max-exposure-us N] [--save-frame frame.png]\n"
+            "       [--tag-output 0|1] [--rtsp|--rtsp-luma|--no-rtsp] [--quiet]\n"
+            "\n"
+            "  --mode strict|tolerant  ArUco Nano decode acceptance. strict (default)\n"
+            "              matches the K230/tinytag production setting: errorCorrectionRate\n"
+            "              and maxErroneousBitsInBorderRate both 0.0. tolerant raises both\n"
+            "              to 1.0 (more marginal tags, more false positives, slower).\n"
+            "  --mirror 0|1    correct a horizontally mirrored sensor (default 1). Mirrored\n"
+            "              frames decode ZERO AprilTag markers (markers are chiral). Applied\n"
+            "              in VI hardware so there is no per-frame cost.\n"
+            "  --flip 0|1      same, vertically (default 0).\n"
+            "  --max-exposure-us N  retain auto exposure but cap shutter time, so AE\n"
+            "              slow-shutter cannot reduce capture cadence (default 0 = uncapped).\n"
+            "  --save-frame frame.png  save one annotated frame ~1s in.\n"
+            "  --tag-output 0|1  print a per-second batch of detected tags on stdout\n"
+            "              (default 0). Synchronous per-tag output can stall capture behind\n"
+            "              a slow consumer; batching avoids that. Implied by --quiet.\n"
+            "  --rtsp         colour preview on a second VPSS channel (rtsp://<ip>:554/h264).\n"
+            "  --rtsp-luma    exact-luma preview: the detector's Y plane is borrowed zero\n"
+            "              copy (rtsp://<ip>:554/h264). Preferred for a debug view.\n"
+            "  --no-rtsp      no preview (default).\n"
+            "  --quiet         suppress diagnostics on stderr; detection goes to stdout.\n",
+            argv0);
+}
+
+// --- RTSP / VENC -----------------------------------------------------------
+int preview_nice_value()
+{
+    constexpr int kDefaultPreviewNice = 10;
+    const char *value = std::getenv("ARUCO_NANO_LIVE_PREVIEW_NICE");
+    if (value == nullptr || *value == '\0')
+        return kDefaultPreviewNice;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 19)
+        return kDefaultPreviewNice;
+    return static_cast<int>(parsed);
+}
+
+void configure_preview_priority(const char *worker)
+{
+    if (setpriority(PRIO_PROCESS, 0, preview_nice_value()) != 0)
+        fprintf(stderr, "[preview] %s worker could not set nice\n", worker);
+}
+
+void on_rtsp_connect(const char *ip, void *) { fprintf(stderr, "[rtsp] client connected from %s\n", ip); }
+void on_rtsp_disconnect(const char *ip, void *) { fprintf(stderr, "[rtsp] client disconnected from %s\n", ip); }
+
+bool start_preview_stream(CameraContext &ctx)
+{
+    chnInputCfg ic{};
+    strcpy(ic.codec, "h264");
+    ic.initialDelay = CVI_INITIAL_DELAY_DEFAULT;
+    ic.width = kDetWidth;
+    ic.height = kDetHeight;
+    ic.vpssGrp = kVpssGrp;
+    ic.vpssChn = ctx.preview_luma ? kVpssChn : ctx.preview_chn;
+    ic.num_frames = -1;
+    ic.bsMode = 0;
+    ic.rcMode = SAMPLE_RC_CBR;
+    ic.iqp = DEF_IQP;
+    ic.pqp = DEF_PQP;
+    ic.gop = DEF_264_GOP;
+    ic.maxIprop = CVI_H26X_MAX_I_PROP_DEFAULT;
+    ic.minIprop = CVI_H26X_MIN_I_PROP_DEFAULT;
+    ic.bitrate = kPreviewBitrateKbps;
+    ic.firstFrmstartQp = 30;
+    ic.minIqp = DEF_264_MINIQP;
+    ic.maxIqp = DEF_264_MAXIQP;
+    ic.minQp = DEF_264_MINQP;
+    ic.maxQp = DEF_264_MAXQP;
+    ic.srcFramerate = 30;
+    ic.framerate = 30;
+    ic.bVariFpsEn = 0;
+    ic.maxbitrate = -1;
+    ic.statTime = -1;
+    ic.chgNum = -1;
+    ic.quality = -1;
+    ic.pixel_format = 0;
+    ic.bitstreamBufSize = 0;
+    ic.single_LumaBuf = 0;
+    ic.single_core = 0;
+    ic.forceIdr = -1;
+    ic.tempLayer = 0;
+    ic.testRoi = 0;
+    ic.bgInterval = 0;
+
+    VENC_GOP_ATTR_S gop{};
+    if (SAMPLE_COMM_VENC_GetGopAttr(VENC_GOPMODE_NORMALP, &gop) != CVI_SUCCESS ||
+        SAMPLE_COMM_VENC_Start(&ic, kVencChn, PT_H264, PIC_720P, SAMPLE_RC_CBR, 0, CVI_FALSE, &gop) !=
+            CVI_SUCCESS)
+    {
+        fprintf(stderr, "[rtsp] VENC start failed\n");
+        return false;
+    }
+    ctx.venc_started = true;
+
+    CVI_RTSP_CONFIG rtsp_config{};
+    rtsp_config.port = 554;
+    if (CVI_RTSP_Create(&ctx.rtsp, &rtsp_config) < 0)
+    {
+        fprintf(stderr, "[rtsp] cannot create RTSP server\n");
+        return false;
+    }
+    CVI_RTSP_SESSION_ATTR attr{};
+    attr.video.codec = RTSP_VIDEO_H264;
+    snprintf(attr.name, sizeof(attr.name), "h264");
+    if (CVI_RTSP_CreateSession(ctx.rtsp, &attr, &ctx.session) < 0)
+    {
+        fprintf(stderr, "[rtsp] cannot create RTSP session\n");
+        return false;
+    }
+
+    CVI_RTSP_STATE_LISTENER listener{};
+    listener.onConnect = on_rtsp_connect;
+    listener.onDisconnect = on_rtsp_disconnect;
+    CVI_RTSP_SetListener(ctx.rtsp, &listener);
+
+    if (CVI_RTSP_Start(ctx.rtsp) < 0)
+    {
+        fprintf(stderr, "[rtsp] cannot start RTSP server\n");
+        return false;
+    }
+    ctx.rtsp_started = true;
+    ctx.venc_packs.resize(64);
+    return true;
+}
+
+RtspSendResult send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
+{
+    RtspSendResult result;
+    const double venc_start = now_ms();
+    if (CVI_VENC_SendFrame(kVencChn, &frame, kVencTimeoutMs) != CVI_SUCCESS)
+    {
+        result.failures |= RTSP_SEND_SUBMIT;
+        result.venc_ms = now_ms() - venc_start;
+        return result;
+    }
+    VENC_STREAM_S stream{};
+    stream.pstPack = ctx.venc_packs.data();
+    CVI_S32 get_rc;
+    do
+    {
+        get_rc = CVI_VENC_GetStream(kVencChn, &stream, kVencTimeoutMs);
+        if (get_rc == CVI_ERR_VENC_BUSY)
+            ++result.get_timeouts;
+    } while (get_rc == CVI_ERR_VENC_BUSY);
+    result.venc_ms = now_ms() - venc_start;
+    if (get_rc != CVI_SUCCESS)
+    {
+        result.failures |= RTSP_SEND_GET;
+        return result;
+    }
+
+    if (stream.u32PackCount == 0)
+        result.failures |= RTSP_SEND_NO_PACKS;
+    if (stream.u32PackCount > ctx.venc_packs.size())
+    {
+        fprintf(stderr, "[rtsp] too many VENC packs: %u\n", stream.u32PackCount);
+        result.failures |= RTSP_SEND_PACK_OVERFLOW;
+    }
+
+    if ((result.failures & (RTSP_SEND_NO_PACKS | RTSP_SEND_PACK_OVERFLOW)) == 0)
+    {
+        CVI_RTSP_DATA data{};
+        data.blockCnt = stream.u32PackCount;
+        for (CVI_U32 i = 0; i < stream.u32PackCount; ++i)
+        {
+            data.dataPtr[i] = stream.pstPack[i].pu8Addr + stream.pstPack[i].u32Offset;
+            data.dataLen[i] = stream.pstPack[i].u32Len - stream.pstPack[i].u32Offset;
+        }
+        const double rtsp_start = now_ms();
+        if (CVI_RTSP_WriteFrame(ctx.rtsp, ctx.session->video, &data) != 0)
+            result.failures |= RTSP_SEND_WRITE;
+        result.rtsp_ms = now_ms() - rtsp_start;
+    }
+    if (CVI_VENC_ReleaseStream(kVencChn, &stream) != CVI_SUCCESS)
+        result.failures |= RTSP_SEND_RELEASE;
+    return result;
+}
+
+void reserve_luma_item(LumaRtspItem &item, size_t capacity)
+{
+    item.tags.reserve(capacity);
+}
+
+void clear_luma_item(LumaRtspItem &item)
+{
+    item.source = VIDEO_FRAME_INFO_S{};
+    item.source_y_vir = nullptr;
+    item.source_map_len = 0;
+    item.encoded = VIDEO_FRAME_INFO_S{};
+    item.surface = nullptr;
+    item.tags.clear();
+    item.fps = 0.0;
+    item.busy_ms = 0.0;
+    item.sequence = 0;
+    item.queued_ms = 0.0;
+}
+
+BorrowedYResources detach_borrowed_y(LumaRtspItem &item)
+{
+    BorrowedYResources resources;
+    if (item.source_y_vir != nullptr)
+    {
+        resources.frame = item.source;
+        resources.mapped_y = item.source_y_vir;
+        resources.map_len = item.source_map_len;
+        resources.valid = true;
+        item.source = VIDEO_FRAME_INFO_S{};
+        item.source_y_vir = nullptr;
+        item.source_map_len = 0;
+    }
+    return resources;
+}
+
+void release_borrowed_y(BorrowedYResources &resources)
+{
+    if (!resources.valid)
+        return;
+    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &resources.frame);
+    resources.valid = false;
+}
+
+PreviewSurface *acquire_luma_surface(CameraContext &ctx)
+{
+    LumaRtspQueue &queue = ctx.luma_rtsp_queue;
+    BorrowedYResources superseded;
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    if (queue.stopping)
+        return nullptr;
+
+    for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+    {
+        PreviewSurface &sfc = ctx.preview_surfaces[i];
+        if (sfc.free)
+        {
+            sfc.free = false;
+            return &sfc;
+        }
+    }
+
+    if (queue.full && queue.pending.surface != nullptr)
+    {
+        PreviewSurface *sfc = queue.pending.surface;
+        superseded = detach_borrowed_y(queue.pending);
+        if (superseded.valid)
+            --queue.borrowed_frames;
+        clear_luma_item(queue.pending);
+        queue.full = false;
+        ++queue.superseded;
+        sfc->free = false;
+        lock.unlock();
+        release_borrowed_y(superseded);
+        return sfc;
+    }
+
+    ++queue.no_surface;
+    return nullptr;
+}
+
+bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
+                       PreviewSurface *surface, const std::vector<TagDetection> &tags,
+                       double fps, double busy_ms,
+                       const VIDEO_FRAME_INFO_S &source, uint8_t *source_y_vir,
+                       CVI_U32 source_map_len)
+{
+    LumaRtspQueue &queue = ctx.luma_rtsp_queue;
+    BorrowedYResources superseded;
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    if (surface == nullptr)
+    {
+        ++queue.ownership_errors;
+        return false;
+    }
+    if (source_y_vir == nullptr || source_map_len == 0)
+    {
+        ++queue.ownership_errors;
+        surface->free = true;
+        return false;
+    }
+    if (queue.stopping)
+    {
+        surface->free = true;
+        return false;
+    }
+
+    if (queue.full)
+    {
+        PreviewSurface *old = queue.pending.surface;
+        if (old != nullptr)
+            old->free = true;
+        superseded = detach_borrowed_y(queue.pending);
+        if (superseded.valid)
+            --queue.borrowed_frames;
+        clear_luma_item(queue.pending);
+        ++queue.superseded;
+    }
+
+    LumaRtspItem &item = queue.pending;
+    item.encoded = encoded;
+    item.surface = surface;
+    item.source = source;
+    item.source_y_vir = source_y_vir;
+    item.source_map_len = source_map_len;
+    ++queue.borrowed_frames;
+    queue.borrowed_frames_max = std::max(queue.borrowed_frames_max, queue.borrowed_frames);
+    item.tags = tags;
+    item.fps = fps;
+    item.busy_ms = busy_ms;
+    item.sequence = encoded.stVFrame.u32TimeRef;
+    item.queued_ms = now_ms();
+    queue.full = true;
+    ++queue.published;
+    lock.unlock();
+    release_borrowed_y(superseded);
+    queue.not_empty.notify_one();
+    return true;
+}
+
+void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<TagDetection> &tags,
+                       double fps, double busy_ms, std::vector<cv::Rect> *dirty);
+
+// Latest-value exact-luma preview worker. Draws the overlay into the borrowed Y
+// plane + a neutral chroma plane, then encodes and serves.
+void luma_rtsp_loop(CameraContext *ctx)
+{
+    configure_preview_priority("luma");
+    LumaRtspQueue &queue = ctx->luma_rtsp_queue;
+    LumaRtspItem item;
+    reserve_luma_item(item, ctx->preview_item_capacity);
+    for (;;)
+    {
+        {
+            std::unique_lock<std::mutex> lock(queue.mutex);
+            queue.not_empty.wait(lock, [&queue] { return queue.full || queue.stopping; });
+            if (!queue.full && queue.stopping)
+                return;
+
+            std::swap(item, queue.pending);
+            queue.full = false;
+            if (item.surface == nullptr)
+            {
+                BorrowedYResources rejected = detach_borrowed_y(item);
+                if (rejected.valid)
+                    --queue.borrowed_frames;
+                clear_luma_item(item);
+                release_borrowed_y(rejected);
+                continue;
+            }
+            ++queue.dequeued;
+            if (queue.have_previous_sequence)
+            {
+                const CVI_U32 gap = item.sequence - queue.previous_sequence;
+                queue.sequence_gap_max = std::max(queue.sequence_gap_max, gap);
+                if (gap > 1)
+                    queue.sequence_skipped += gap - 1;
+            }
+            queue.previous_sequence = item.sequence;
+            queue.have_previous_sequence = true;
+            const double age_ms = now_ms() - item.queued_ms;
+            queue.queue_age_sum_ms += age_ms;
+            queue.queue_age_max_ms = std::max(queue.queue_age_max_ms, age_ms);
+        }
+
+        if (item.surface != nullptr)
+        {
+            PreviewSurface &sfc = *item.surface;
+            const VIDEO_FRAME_S &vf = item.encoded.stVFrame;
+            uint8_t *y_vir = item.source_y_vir;
+            cv::Mat y(vf.u32Height, vf.u32Width, CV_8UC1, y_vir, vf.u32Stride[0]);
+            cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
+                       static_cast<uint8_t *>(sfc.c_vir), sfc.c_stride);
+
+            for (const auto &r : sfc.dirty)
+                vu(r & cv::Rect(0, 0, vu.cols, vu.rows)).setTo(cv::Scalar(128, 128));
+            sfc.dirty.clear();
+
+            draw_overlay_nv21(y, vu, item.tags, item.fps, item.busy_ms, &sfc.dirty);
+
+            CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], y_vir, item.source_map_len);
+            CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+        }
+
+        if (ctx->preview_delay_ms != 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(ctx->preview_delay_ms));
+
+        const RtspSendResult send = send_to_rtsp(*ctx, item.encoded);
+        BorrowedYResources completed = detach_borrowed_y(item);
+        const bool completed_borrowed = completed.valid;
+        release_borrowed_y(completed);
+
+        {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            if (item.surface != nullptr)
+                item.surface->free = true;
+            queue.venc_sum_ms += send.venc_ms;
+            queue.venc_max_ms = std::max(queue.venc_max_ms, send.venc_ms);
+            queue.rtsp_sum_ms += send.rtsp_ms;
+            queue.rtsp_max_ms = std::max(queue.rtsp_max_ms, send.rtsp_ms);
+            queue.get_timeouts += send.get_timeouts;
+            if (send.failures == RTSP_SEND_OK)
+                ++queue.encoded;
+            else
+            {
+                ++queue.encode_failed;
+                if (send.failures & RTSP_SEND_SUBMIT) ++queue.submit_failed;
+                if (send.failures & RTSP_SEND_NO_PACKS) ++queue.no_packs;
+                if (send.failures & RTSP_SEND_PACK_OVERFLOW) ++queue.pack_overflow;
+                if (send.failures & RTSP_SEND_GET) ++queue.get_failed;
+                if (send.failures & RTSP_SEND_WRITE) ++queue.rtsp_failed;
+                if (send.failures & RTSP_SEND_RELEASE) ++queue.release_failed;
+            }
+            if (completed_borrowed)
+                --queue.borrowed_frames;
+        }
+        clear_luma_item(item);
+    }
+}
+
+LumaRtspStats luma_rtsp_stats(CameraContext &ctx)
+{
+    LumaRtspQueue &queue = ctx.luma_rtsp_queue;
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    LumaRtspStats stats;
+    stats.published = queue.published;
+    stats.superseded = queue.superseded;
+    stats.no_surface = queue.no_surface;
+    stats.dequeued = queue.dequeued;
+    stats.encoded = queue.encoded;
+    stats.encode_failed = queue.encode_failed;
+    stats.submit_failed = queue.submit_failed;
+    stats.no_packs = queue.no_packs;
+    stats.pack_overflow = queue.pack_overflow;
+    stats.get_failed = queue.get_failed;
+    stats.get_timeouts = queue.get_timeouts;
+    stats.rtsp_failed = queue.rtsp_failed;
+    stats.release_failed = queue.release_failed;
+    stats.sequence_skipped = queue.sequence_skipped;
+    stats.ownership_errors = queue.ownership_errors;
+    stats.borrowed_frames = queue.borrowed_frames;
+    stats.borrowed_frames_max = queue.borrowed_frames_max;
+    stats.sequence_gap_max = queue.sequence_gap_max;
+    stats.queue_age_sum_ms = queue.queue_age_sum_ms;
+    stats.queue_age_max_ms = queue.queue_age_max_ms;
+    stats.venc_sum_ms = queue.venc_sum_ms;
+    stats.venc_max_ms = queue.venc_max_ms;
+    stats.rtsp_sum_ms = queue.rtsp_sum_ms;
+    stats.rtsp_max_ms = queue.rtsp_max_ms;
+    stats.pending = queue.full;
+    queue.sequence_gap_max = 0;
+    queue.queue_age_max_ms = 0.0;
+    queue.venc_max_ms = 0.0;
+    queue.rtsp_max_ms = 0.0;
+    return stats;
+}
+
+void stop_luma_rtsp(CameraContext &ctx)
+{
+    if (!ctx.luma_rtsp_worker.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(ctx.luma_rtsp_queue.mutex);
+        ctx.luma_rtsp_queue.stopping = true;
+    }
+    ctx.luma_rtsp_queue.not_empty.notify_one();
+    ctx.luma_rtsp_worker.join();
+}
+
+// --- NV21 drawing ----------------------------------------------------------
+struct Nv21Color
+{
+    uint8_t y, u, v;
+};
+constexpr Nv21Color kTagColor{145, 54, 34};  // green
+
+void draw_tag_quad_nv21(cv::Mat &y, cv::Mat &vu, const TagDetection &tag, Nv21Color c,
+                        int thickness, std::vector<cv::Rect> *dirty)
+{
+    float min_x = tag.corners[0].x, max_x = tag.corners[0].x;
+    float min_y = tag.corners[0].y, max_y = tag.corners[0].y;
+    for (int corner = 0; corner < 4; ++corner)
+    {
+        const cv::Point p(cvRound(tag.corners[corner].x), cvRound(tag.corners[corner].y));
+        const cv::Point next(cvRound(tag.corners[(corner + 1) % 4].x),
+                             cvRound(tag.corners[(corner + 1) % 4].y));
+        cv::line(y, p, next, cv::Scalar(c.y), thickness);
+        cv::line(vu, cv::Point(p.x / 2, p.y / 2), cv::Point(next.x / 2, next.y / 2),
+                 cv::Scalar(c.v, c.u), std::max(1, thickness / 2));
+        min_x = std::min(min_x, tag.corners[corner].x);
+        max_x = std::max(max_x, tag.corners[corner].x);
+        min_y = std::min(min_y, tag.corners[corner].y);
+        max_y = std::max(max_y, tag.corners[corner].y);
+    }
+    if (dirty != nullptr)
+    {
+        const int pad = std::max(1, thickness / 2) + 1;
+        const int left = static_cast<int>(std::floor(min_x / 2.0f)) - pad;
+        const int top = static_cast<int>(std::floor(min_y / 2.0f)) - pad;
+        const int right = static_cast<int>(std::ceil(max_x / 2.0f)) + pad;
+        const int bottom = static_cast<int>(std::ceil(max_y / 2.0f)) + pad;
+        dirty->push_back(cv::Rect(left, top, std::max(1, right - left + 1),
+                                  std::max(1, bottom - top + 1)));
+    }
+}
+
+void draw_label(cv::Mat &y, const std::string &text, cv::Point org, double scale)
+{
+    cv::putText(y, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0), 4);
+    cv::putText(y, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255), 2);
+}
+
+void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<TagDetection> &tags,
+                       double fps, double busy_ms, std::vector<cv::Rect> *dirty)
+{
+    for (const auto &tag : tags)
+        draw_tag_quad_nv21(y, vu, tag, kTagColor, 4, dirty);
+    char status[96];
+    snprintf(status, sizeof(status), "aruco_nano %.1f fps  %.1f ms  %zu tags", fps, busy_ms,
+             tags.size());
+    draw_label(y, status, cv::Point(16, 40), 0.9);
+}
+
+// Colour preview worker: reads channel 1 NV21, draws the latest detections.
+void preview_loop(CameraContext *ctx)
+{
+    configure_preview_priority("colour");
+    std::vector<TagDetection> tags;
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        if (CVI_VPSS_GetChnFrame(kVpssGrp, ctx->preview_chn, &frame, 1000) != CVI_SUCCESS)
+            continue;
+        const VIDEO_FRAME_S &vf = frame.stVFrame;
+        const CVI_U64 base = vf.u64PhyAddr[0];
+        const CVI_U32 span = static_cast<CVI_U32>(vf.u64PhyAddr[1] + vf.u32Length[1] - base);
+        uint8_t *mem = static_cast<uint8_t *>(CVI_SYS_MmapCache(base, span));
+        if (mem == nullptr)
+        {
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+            continue;
+        }
+        cv::Mat y(vf.u32Height, vf.u32Width, CV_8UC1, mem, vf.u32Stride[0]);
+        cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
+                   mem + (vf.u64PhyAddr[1] - base), vf.u32Stride[1]);
+
+        double fps, busy_ms;
+        {
+            std::lock_guard<std::mutex> lock(g_overlay.mutex);
+            tags = g_overlay.tags;
+            fps = g_overlay.fps;
+            busy_ms = g_overlay.busy_ms;
+        }
+        draw_overlay_nv21(y, vu, tags, fps, busy_ms, nullptr);
+
+        CVI_SYS_IonFlushCache(base, mem, span);
+        CVI_SYS_Munmap(mem, span);
+        (void)send_to_rtsp(*ctx, frame);
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+    }
+}
+
+// --- ISP control -----------------------------------------------------------
+void print_isp_help()
+{
+    fprintf(stderr,
+            "[isp] commands (stdin):\n"
+            "  gain <value>       manual analog gain (0x400=1x)\n"
+            "  exptime <us>       manual exposure time, microseconds\n"
+            "  ae auto            revert exposure+gain to automatic\n"
+            "  awb <r> <g> <b>    manual white balance gains (0x1-0x3FFF each)\n"
+            "  awb auto           revert white balance to automatic\n"
+            "  help               show this message\n");
+}
+
+void isp_set_manual_gain(CVI_U32 gain)
+{
+    ISP_EXPOSURE_ATTR_S attr;
+    if (CVI_ISP_GetExposureAttr(0, &attr) != CVI_SUCCESS)
+        return;
+    attr.enOpType = OP_TYPE_MANUAL;
+    attr.stManual.enAGainOpType = OP_TYPE_MANUAL;
+    attr.stManual.u32AGain = gain;
+    if (CVI_ISP_SetExposureAttr(0, &attr) != CVI_SUCCESS)
+        fprintf(stderr, "[isp] SetExposureAttr failed\n");
+    else
+        fprintf(stderr, "[isp] gain set to %u\n", gain);
+}
+
+void isp_set_manual_exptime(CVI_U32 us)
+{
+    ISP_EXPOSURE_ATTR_S attr;
+    if (CVI_ISP_GetExposureAttr(0, &attr) != CVI_SUCCESS)
+        return;
+    attr.enOpType = OP_TYPE_MANUAL;
+    attr.stManual.enExpTimeOpType = OP_TYPE_MANUAL;
+    attr.stManual.u32ExpTime = us;
+    if (CVI_ISP_SetExposureAttr(0, &attr) != CVI_SUCCESS)
+        fprintf(stderr, "[isp] SetExposureAttr failed\n");
+    else
+        fprintf(stderr, "[isp] exposure time set to %u us\n", us);
+}
+
+bool isp_set_max_auto_exptime(CVI_U32 us)
+{
+    ISP_EXPOSURE_ATTR_S attr;
+    if (CVI_ISP_GetExposureAttr(0, &attr) != CVI_SUCCESS)
+        return false;
+    attr.enOpType = OP_TYPE_AUTO;
+    attr.stManual.enAGainOpType = OP_TYPE_AUTO;
+    attr.stManual.enExpTimeOpType = OP_TYPE_AUTO;
+    attr.stAuto.stExpTimeRange.u32Max = us;
+    if (attr.stAuto.stExpTimeRange.u32Min > us)
+        attr.stAuto.stExpTimeRange.u32Min = us;
+    if (CVI_ISP_SetExposureAttr(0, &attr) != CVI_SUCCESS)
+        return false;
+    fprintf(stderr, "[isp] auto exposure capped at %u us\n", us);
+    return true;
+}
+
+void isp_set_ae_auto()
+{
+    ISP_EXPOSURE_ATTR_S attr;
+    if (CVI_ISP_GetExposureAttr(0, &attr) != CVI_SUCCESS)
+        return;
+    attr.enOpType = OP_TYPE_AUTO;
+    attr.stManual.enAGainOpType = OP_TYPE_AUTO;
+    attr.stManual.enExpTimeOpType = OP_TYPE_AUTO;
+    if (CVI_ISP_SetExposureAttr(0, &attr) != CVI_SUCCESS)
+        fprintf(stderr, "[isp] SetExposureAttr failed\n");
+    else
+        fprintf(stderr, "[isp] exposure/gain back to auto\n");
+}
+
+void isp_set_manual_wb(CVI_U16 r, CVI_U16 g, CVI_U16 b)
+{
+    ISP_WB_ATTR_S attr;
+    if (CVI_ISP_GetWBAttr(0, &attr) != CVI_SUCCESS)
+        return;
+    attr.enOpType = OP_TYPE_MANUAL;
+    attr.stManual.u16Rgain = r;
+    attr.stManual.u16Grgain = g;
+    attr.stManual.u16Gbgain = g;
+    attr.stManual.u16Bgain = b;
+    if (CVI_ISP_SetWBAttr(0, &attr) != CVI_SUCCESS)
+        fprintf(stderr, "[isp] SetWBAttr failed\n");
+    else
+        fprintf(stderr, "[isp] white balance set to r=%u g=%u b=%u\n", r, g, b);
+}
+
+void isp_set_awb_auto()
+{
+    ISP_WB_ATTR_S attr;
+    if (CVI_ISP_GetWBAttr(0, &attr) != CVI_SUCCESS)
+        return;
+    attr.enOpType = OP_TYPE_AUTO;
+    if (CVI_ISP_SetWBAttr(0, &attr) != CVI_SUCCESS)
+        fprintf(stderr, "[isp] SetWBAttr failed\n");
+    else
+        fprintf(stderr, "[isp] white balance back to auto\n");
+}
+
+void isp_control_loop()
+{
+    print_isp_help();
+    char line[256];
+    while (!g_stop)
+    {
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const int ready = poll(&input, 1, 200);
+        if (ready <= 0)
+            continue;
+        if (!(input.revents & POLLIN) || fgets(line, sizeof(line), stdin) == nullptr)
+            break;
+        char cmd[32] = {0};
+        if (sscanf(line, "%31s", cmd) != 1)
+            continue;
+        if (strcmp(cmd, "gain") == 0)
+        {
+            unsigned long v;
+            if (sscanf(line, "%*s %lu", &v) == 1) isp_set_manual_gain((CVI_U32)v);
+            else fprintf(stderr, "[isp] usage: gain <value>\n");
+        }
+        else if (strcmp(cmd, "exptime") == 0)
+        {
+            unsigned long v;
+            if (sscanf(line, "%*s %lu", &v) == 1) isp_set_manual_exptime((CVI_U32)v);
+            else fprintf(stderr, "[isp] usage: exptime <microseconds>\n");
+        }
+        else if (strcmp(cmd, "ae") == 0)
+        {
+            char mode[16];
+            if (sscanf(line, "%*s %15s", mode) == 1 && strcmp(mode, "auto") == 0) isp_set_ae_auto();
+            else fprintf(stderr, "[isp] usage: ae auto\n");
+        }
+        else if (strcmp(cmd, "awb") == 0)
+        {
+            char mode[16];
+            unsigned long r, g, b;
+            if (sscanf(line, "%*s %15s", mode) == 1 && strcmp(mode, "auto") == 0)
+                isp_set_awb_auto();
+            else if (sscanf(line, "%*s %lu %lu %lu", &r, &g, &b) == 3)
+                isp_set_manual_wb((CVI_U16)r, (CVI_U16)g, (CVI_U16)b);
+            else fprintf(stderr, "[isp] usage: awb <r> <g> <b> | awb auto\n");
+        }
+        else if (strcmp(cmd, "help") == 0)
+            print_isp_help();
+        else
+            fprintf(stderr, "[isp] unknown command: %s (type 'help')\n", cmd);
+    }
+}
+
+// --- camera setup ----------------------------------------------------------
+bool get_vi_config(SAMPLE_VI_CONFIG_S &vi_config)
+{
+    SAMPLE_INI_CFG_S ini_cfg = {};
+    ini_cfg.enSource = VI_PIPE_FRAME_SOURCE_DEV;
+    ini_cfg.devNum = 1;
+    ini_cfg.enSnsType[0] = SONY_IMX327_MIPI_2M_30FPS_12BIT;
+    ini_cfg.enWDRMode[0] = WDR_MODE_NONE;
+    ini_cfg.s32BusId[0] = 3;
+    ini_cfg.s32SnsI2cAddr[0] = -1;
+    ini_cfg.MipiDev[0] = 0xFF;
+    ini_cfg.u8UseMultiSns = 0;
+    if (SAMPLE_COMM_VI_ParseIni(&ini_cfg))
+        fprintf(stderr, "[camera] sensor info loaded from /mnt/data/sensor_cfg.ini\n");
+    if (SAMPLE_COMM_VI_IniToViCfg(&ini_cfg, &vi_config) != CVI_SUCCESS)
+        return false;
+    return vi_config.s32WorkingViNum > 0;
+}
+
+bool setup_camera(CameraContext &ctx)
+{
+    if (!get_vi_config(ctx.vi_config))
+        return false;
+
+    CVI_VI_SetDevNum(ctx.vi_config.s32WorkingViNum);
+
+    PIC_SIZE_E pic_size;
+    if (SAMPLE_COMM_VI_GetSizeBySensor(ctx.vi_config.astViInfo[0].stSnsInfo.enSnsType, &pic_size) !=
+        CVI_SUCCESS)
+        return false;
+    SIZE_S sensor_size;
+    if (SAMPLE_COMM_SYS_GetPicSize(pic_size, &sensor_size) != CVI_SUCCESS)
+        return false;
+    ctx.width = sensor_size.u32Width;
+    ctx.height = sensor_size.u32Height;
+    if (ov5647_720p60_requested())
+    {
+        ctx.width = 1280;
+        ctx.height = 720;
+    }
+    fprintf(stderr, "[camera] sensor %ux%u\n", ctx.width, ctx.height);
+
+    // Pool 0 for VI native NV21 capture, pool 1 for the 1280x720 detector
+    // (YUV400) channel, optional pool 2 for the colour preview channel.
+    ctx.preview_chn = kPreviewChn;
+    ctx.preview_pool = kPreviewPool;
+    VB_CONFIG_S vb_config{};
+    vb_config.u32MaxPoolCnt = 2 + ((ctx.preview && !ctx.preview_luma) ? 1 : 0);
+    vb_config.astCommPool[0].u32BlkSize = COMMON_GetPicBufferSize(
+        ctx.width, ctx.height, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+    vb_config.astCommPool[0].u32BlkCnt = 5;
+    vb_config.astCommPool[kDetPool].u32BlkSize = COMMON_GetPicBufferSize(
+        kDetWidth, kDetHeight, PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+    vb_config.astCommPool[kDetPool].u32BlkCnt = 5;
+    if (ctx.preview && !ctx.preview_luma)
+    {
+        vb_config.astCommPool[ctx.preview_pool].u32BlkSize = COMMON_GetPicBufferSize(
+            kDetWidth, kDetHeight, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+        vb_config.astCommPool[ctx.preview_pool].u32BlkCnt = 5;
+    }
+    if (SAMPLE_COMM_SYS_Init(&vb_config) != CVI_SUCCESS)
+        return false;
+    ctx.sys_initialized = true;
+
+    // A prior aborted run may have left VPSS group 0 alive in the kernel
+    // (SAMPLE_COMM_VPSS_Stop bails out before DestroyGrp when a channel
+    // disable/stop fails mid-setup). Clear it defensively so a fresh
+    // CreateGrp below never returns CVI_ERR_VPSS_EXIST on a rerun.
+    CVI_VPSS_DestroyGrp(kVpssGrp);
+
+    // Exact-luma preview borrows the detector's Y plane; only neutral NV21
+    // chroma surfaces are allocated here, once at init.
+    if (ctx.preview_luma)
+    {
+        VB_CAL_CONFIG_S chroma_cfg{};
+        COMMON_GetPicBufferConfig(kDetWidth, kDetHeight, VI_PIXEL_FORMAT,
+                                  DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN,
+                                  &chroma_cfg);
+        for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+        {
+            PreviewSurface &sfc = ctx.preview_surfaces[i];
+            sfc.index = i;
+            sfc.c_len = chroma_cfg.u32MainCSize;
+            sfc.c_stride = chroma_cfg.u32CStride;
+            char name[32];
+            snprintf(name, sizeof(name), "aruco_preview_c%zu", i);
+            if (CVI_SYS_IonAlloc(&sfc.c_phy, &sfc.c_vir, name, sfc.c_len) != CVI_SUCCESS)
+                return false;
+            std::memset(sfc.c_vir, 128, sfc.c_len);
+            CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+            sfc.dirty.reserve(64);
+        }
+        fprintf(stderr, "[camera] preview transport: borrowed VPSS Y (zero copy)\n");
+    }
+
+    VI_VPSS_MODE_S vi_vpss_mode{};
+    vi_vpss_mode.aenMode[0] = ctx.vi_online ? VI_ONLINE_VPSS_ONLINE : VI_OFFLINE_VPSS_ONLINE;
+    if (CVI_SYS_SetVIVPSSMode(&vi_vpss_mode) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] CVI_SYS_SetVIVPSSMode failed\n");
+        return false;
+    }
+    fprintf(stderr, "[camera] VI/VPSS mode: VI %s, VPSS online\n",
+            ctx.vi_online ? "online" : "offline");
+
+    if (SAMPLE_PLAT_VI_INIT(&ctx.vi_config) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] VI init failed\n");
+        return false;
+    }
+    ctx.vi_initialized = true;
+
+    ISP_PUB_ATTR_S pub_attr{};
+    CVI_ISP_GetPubAttr(0, &pub_attr);
+    pub_attr.f32FrameRate = ov5647_720p60_requested() ? 60 : 30;
+    CVI_ISP_SetPubAttr(0, &pub_attr);
+
+    if (ctx.mirror || ctx.flip)
+    {
+        const CVI_S32 rc = CVI_VI_SetChnFlipMirror(
+            0, 0, ctx.flip ? CVI_TRUE : CVI_FALSE, ctx.mirror ? CVI_TRUE : CVI_FALSE);
+        if (rc != CVI_SUCCESS)
+            fprintf(stderr, "[camera] CVI_VI_SetChnFlipMirror failed: %#x\n", rc);
+        else
+            fprintf(stderr, "[camera] orientation: flip=%d mirror=%d\n", ctx.flip, ctx.mirror);
+    }
+
+    VPSS_MODE_S vpss_mode{};
+    vpss_mode.enMode = VPSS_MODE_DUAL;
+    vpss_mode.aenInput[0] = VPSS_INPUT_MEM;
+    vpss_mode.aenInput[1] = VPSS_INPUT_ISP;
+    vpss_mode.ViPipe[1] = 0;
+    CVI_SYS_SetVPSSModeEx(&vpss_mode);
+
+    VPSS_GRP_ATTR_S vpss_grp_attr{};
+    VPSS_GRP_DEFAULT_HELPER2(&vpss_grp_attr, ctx.width, ctx.height, VI_PIXEL_FORMAT, /*dev=*/1);
+    VPSS_CHN_ATTR_S vpss_chn_attr{};
+    VPSS_CHN_DEFAULT_HELPER(&vpss_chn_attr, kDetWidth, kDetHeight, PIXEL_FORMAT_YUV_400, CVI_FALSE);
+
+    CVI_S32 vpss_ret = CVI_VPSS_CreateGrp(kVpssGrp, &vpss_grp_attr);
+    if (vpss_ret == CVI_SUCCESS)
+        ctx.vpss_created = true;
+    if (vpss_ret == CVI_SUCCESS)
+        vpss_ret = CVI_VPSS_ResetGrp(kVpssGrp);
+    if (vpss_ret == CVI_SUCCESS)
+        vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kVpssChn, &vpss_chn_attr);
+    if (vpss_ret == CVI_SUCCESS)
+        vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kVpssChn);
+    if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
+    {
+        VPSS_CHN_ATTR_S preview_attr{};
+        VPSS_CHN_DEFAULT_HELPER(&preview_attr, kDetWidth, kDetHeight, VI_PIXEL_FORMAT, CVI_FALSE);
+        vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, ctx.preview_chn, &preview_attr);
+        if (vpss_ret == CVI_SUCCESS)
+            vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, ctx.preview_chn);
+    }
+    if (vpss_ret == CVI_SUCCESS)
+        vpss_ret = CVI_VPSS_StartGrp(kVpssGrp);
+    if (vpss_ret != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] VPSS init failed: %#x\n", vpss_ret);
+        return false;
+    }
+
+    if (SAMPLE_COMM_VI_Bind_VPSS(0, 0, kVpssGrp) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] VI->VPSS bind failed\n");
+        return false;
+    }
+    ctx.vi_vpss_bound = true;
+
+    vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kVpssChn, kDetPool);
+    if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
+        vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, ctx.preview_chn, ctx.preview_pool);
+    if (vpss_ret != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] VPSS attach VB pool failed: %#x\n", vpss_ret);
+        return false;
+    }
+
+    if (ctx.preview && !start_preview_stream(ctx))
+        return false;
+
+    return true;
+}
+
+void capture_loop(VPSS_CHN channel, CaptureSlot *slot)
+{
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        if (CVI_VPSS_GetChnFrame(kVpssGrp, channel, &frame, 1000) != CVI_SUCCESS)
+            continue;
+        VIDEO_FRAME_INFO_S superseded{};
+        bool release_superseded = false;
+        bool stopping = false;
+        {
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            stopping = slot->stopping;
+            if (!stopping)
+            {
+                if (slot->full)
+                {
+                    superseded = slot->frame;
+                    release_superseded = true;
+                    ++slot->dropped;
+                }
+                slot->frame = frame;
+                slot->ready_ms = now_ms();
+                slot->full = true;
+            }
+        }
+        if (stopping)
+        {
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, channel, &frame);
+            return;
+        }
+        if (release_superseded)
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, channel, &superseded);
+        slot->not_empty.notify_one();
+    }
+}
+
+bool take_latest_frame(CaptureSlot &slot, VIDEO_FRAME_INFO_S &out, double *ready_ms = nullptr)
+{
+    std::unique_lock<std::mutex> lock(slot.mutex);
+    slot.not_empty.wait(lock, [&slot] { return slot.full || slot.stopping || g_stop; });
+    if (!slot.full)
+        return false;
+    out = slot.frame;
+    if (ready_ms != nullptr)
+        *ready_ms = slot.ready_ms;
+    slot.full = false;
+    return true;
+}
+
+void stop_capture_slot(CaptureSlot &slot, std::thread &worker, VPSS_CHN channel)
+{
+    {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        slot.stopping = true;
+    }
+    slot.not_empty.notify_all();
+    if (worker.joinable())
+        worker.join();
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    if (slot.full)
+    {
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, channel, &slot.frame);
+        slot.full = false;
+    }
+}
+
+uint8_t *map_luma_for_cpu(CameraContext &ctx, CVI_U64 phy, CVI_U32 len)
+{
+    for (auto &mapping : ctx.luma_mappings)
+    {
+        if (mapping.phy != phy)
+            continue;
+        if (len > mapping.len)
+            return nullptr;
+        if (CVI_SYS_IonInvalidateCache(phy, mapping.vir, len) != CVI_SUCCESS)
+            return nullptr;
+        ++ctx.luma_mapping_hits;
+        return mapping.vir;
+    }
+    uint8_t *vir = static_cast<uint8_t *>(CVI_SYS_MmapCache(phy, len));
+    if (vir == nullptr)
+        return nullptr;
+    CachedLumaMapping mapping;
+    mapping.phy = phy;
+    mapping.vir = vir;
+    mapping.len = len;
+    ctx.luma_mappings.push_back(mapping);
+    ++ctx.luma_mapping_misses;
+    return vir;
+}
+
+void unmap_cached_luma(CameraContext &ctx)
+{
+    for (auto &mapping : ctx.luma_mappings)
+    {
+        if (mapping.vir != nullptr)
+            CVI_SYS_Munmap(mapping.vir, mapping.len);
+    }
+    ctx.luma_mappings.clear();
+}
+
+void teardown_camera(CameraContext &ctx)
+{
+    if (ctx.rtsp)
+    {
+        if (ctx.rtsp_started)
+            CVI_RTSP_Stop(ctx.rtsp);
+        ctx.rtsp_started = false;
+        if (ctx.session)
+            CVI_RTSP_DestroySession(ctx.rtsp, ctx.session);
+        ctx.session = nullptr;
+        CVI_RTSP_Destroy(&ctx.rtsp);
+    }
+    if (ctx.venc_started)
+    {
+        SAMPLE_COMM_VENC_Stop(kVencChn);
+        ctx.venc_started = false;
+    }
+
+    unmap_cached_luma(ctx);
+
+    if (ctx.vi_vpss_bound)
+    {
+        SAMPLE_COMM_VI_UnBind_VPSS(0, 0, kVpssGrp);
+        ctx.vi_vpss_bound = false;
+    }
+    if (ctx.vpss_created)
+    {
+        CVI_BOOL chn_enable[VPSS_MAX_PHY_CHN_NUM + 1] = {0};
+        chn_enable[kVpssChn] = CVI_TRUE;
+        if (ctx.preview && !ctx.preview_luma)
+            chn_enable[ctx.preview_chn] = CVI_TRUE;
+        SAMPLE_COMM_VPSS_Stop(kVpssGrp, chn_enable);
+        ctx.vpss_created = false;
+    }
+    if (ctx.vi_initialized)
+    {
+        SAMPLE_COMM_VI_DestroyIsp(&ctx.vi_config);
+        SAMPLE_COMM_VI_DestroyVi(&ctx.vi_config);
+        ctx.vi_initialized = false;
+    }
+
+    for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+    {
+        PreviewSurface &sfc = ctx.preview_surfaces[i];
+        if (sfc.c_vir)
+        {
+            CVI_SYS_IonFree(sfc.c_phy, sfc.c_vir);
+            sfc.c_phy = 0;
+            sfc.c_vir = nullptr;
+        }
+    }
+
+    if (ctx.sys_initialized)
+    {
+        CVI_SYS_Exit();
+        CVI_VB_Exit();
+        ctx.sys_initialized = false;
+    }
+}
+
+} // namespace
+
+int main(int argc, char *argv[])
+{
+    bool tolerant = false;
+    bool mirror = true;  // OV5647 module on this board is horizontally mirrored.
+    bool flip = false;
+    bool tag_output = false;
+    bool quiet = false;
+    bool rtsp = false, rtsp_luma = false;
+    int debug_mode = 1;
+    CVI_U32 max_exposure_us = 0;
+    std::string save_frame_path;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string flag = argv[i];
+        bool has_value = i + 1 < argc;
+        if (flag == "--mode" && has_value)
+        {
+            std::string mode = argv[++i];
+            if (mode == "strict") tolerant = false;
+            else if (mode == "tolerant") tolerant = true;
+            else { fprintf(stderr, "--mode must be 'strict' or 'tolerant'\n"); return 1; }
+        }
+        else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
+        else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
+        else if (flag == "--max-exposure-us" && has_value)
+            max_exposure_us = static_cast<CVI_U32>(std::strtoul(argv[++i], nullptr, 10));
+        else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
+        else if (flag == "--tag-output" && has_value) tag_output = std::atoi(argv[++i]) != 0;
+        else if (flag == "--debug" && has_value) debug_mode = std::atoi(argv[++i]);
+        else if (flag == "--rtsp") rtsp = true, rtsp_luma = false;
+        else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
+        else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
+        else if (flag == "--quiet") quiet = true;
+        else
+        {
+            fprintf(stderr, "Unknown or incomplete option: %s\n\n", flag.c_str());
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (quiet)
+        tag_output = true;
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    if (quiet)
+    {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDERR_FILENO);
+            g_result_fd = dup(STDOUT_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+    }
+
+    std::shared_ptr<TagCropDecoder> decoder;
+    try
+    {
+        decoder = make_aruco_nano_decoder(tolerant);
+    }
+    catch (const std::exception &e)
+    {
+        fprintf(stderr, "[camera] decoder initialization failed: %s\n", e.what());
+        return 1;
+    }
+    fprintf(stderr, "[detector] ArUco Nano, AprilTag 36h11, %s\n", tolerant ? "tolerant" : "strict");
+
+    CameraContext ctx;
+    ctx.preview = rtsp;
+    ctx.preview_luma = rtsp_luma;
+    ctx.mirror = mirror;
+    ctx.flip = flip;
+    if (const char *online = std::getenv("ARUCO_NANO_LIVE_VI_ONLINE"))
+        ctx.vi_online = std::atoi(online) != 0;
+    if (const char *delay = std::getenv("ARUCO_NANO_LIVE_PREVIEW_DELAY_MS"))
+        ctx.preview_delay_ms = static_cast<unsigned>(std::max(0, std::atoi(delay)));
+    if (!setup_camera(ctx))
+    {
+        teardown_camera(ctx);
+        return 1;
+    }
+    if (max_exposure_us != 0 && !isp_set_max_auto_exptime(max_exposure_us))
+    {
+        teardown_camera(ctx);
+        return 1;
+    }
+
+    ctx.luma_mappings.reserve(5);
+    if (rtsp_luma)
+    {
+        reserve_luma_item(ctx.luma_rtsp_queue.pending, ctx.preview_item_capacity);
+        for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+            ctx.preview_surfaces[i].dirty.reserve(ctx.preview_item_capacity * 2);
+    }
+    ctx.capture_worker = std::thread(capture_loop, kVpssChn, &ctx.capture);
+    std::thread isp_control(isp_control_loop);
+
+    std::thread preview;
+    if (rtsp && !rtsp_luma)
+        preview = std::thread(preview_loop, &ctx);
+    if (rtsp_luma)
+        ctx.luma_rtsp_worker = std::thread(luma_rtsp_loop, &ctx);
+
+    fprintf(stderr, "[camera] capture started: sensor %ux%u -> VPSS %ux%u %s -> aruco_nano\n",
+            ctx.width, ctx.height, kDetWidth, kDetHeight,
+            rtsp_luma ? "YUV400 + borrowed RTSP Y" : "YUV400");
+
+    struct StageTotals
+    {
+        long frames = 0;
+        double wait = 0, map = 0, decode = 0, release = 0;
+        double output = 0;
+        double service_cpu = 0;
+        size_t tags = 0;
+        double threshold = 0, contour = 0, quad = 0;
+        double marker_decode = 0, refine = 0;
+        size_t pixels = 0, contours = 0, candidates = 0;
+        size_t attempts = 0, markers = 0;
+        double age_sum = 0, age_max = 0;
+        long age_samples = 0;
+        unsigned seq_sum = 0, seq_max = 0;
+        long seq_samples = 0;
+    } win;
+
+    CVI_U32 prev_seq = 0;
+    bool have_prev_seq = false;
+    double fps_window_start = now_ms();
+    double tail_window_start = fps_window_start;
+    double process_cpu_window_start = process_cpu_ms();
+    std::vector<double> tail_service, tail_cpu, tail_decode, tail_age, tail_result;
+    for (auto *samples : {&tail_service, &tail_cpu, &tail_decode, &tail_age, &tail_result})
+        samples->reserve(512);
+
+    std::vector<TagDetection> window_tags;
+    size_t stale_prev = 0;
+    long frames_seen = 0;
+    bool logged_first_frame = false;
+    double last_fps = 0.0, last_busy_ms = 0.0;
+
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        double ready_ms = 0.0;
+        const double t_wait = now_ms();
+        if (!take_latest_frame(ctx.capture, frame, &ready_ms))
+            break;
+        const double t_got = now_ms();
+        const double cpu_got = thread_cpu_ms();
+
+        const VIDEO_FRAME_S &vf = frame.stVFrame;
+        const CVI_U32 map_len = vf.u32Length[0] ? vf.u32Length[0] : vf.u32Stride[0] * vf.u32Height;
+
+        const CVI_U32 seq = vf.u32TimeRef;
+        if (have_prev_seq)
+        {
+            const unsigned gap = static_cast<unsigned>(seq - prev_seq);
+            win.seq_sum += gap;
+            if (gap > win.seq_max)
+                win.seq_max = gap;
+            ++win.seq_samples;
+        }
+        prev_seq = seq;
+        have_prev_seq = true;
+
+        double acquisition_age_ms = -1.0;
+        if (vf.u64PTS != 0)
+        {
+            const double age_ms = t_got - static_cast<double>(vf.u64PTS) / 1000.0;
+            if (age_ms >= 0.0 && age_ms < 10000.0)
+            {
+                acquisition_age_ms = age_ms;
+                win.age_sum += age_ms;
+                win.age_max = std::max(win.age_max, age_ms);
+                ++win.age_samples;
+            }
+        }
+
+        if (!logged_first_frame)
+        {
+            fprintf(stderr, "[camera] first frame: timeRef=%u pts=%llu\n", vf.u32TimeRef,
+                    (unsigned long long)vf.u64PTS);
+            fprintf(stderr, "[camera] first frame: %ux%u stride=%u len=%u fmt=%d\n", vf.u32Width,
+                    vf.u32Height, vf.u32Stride[0], map_len, vf.enPixelFormat);
+            logged_first_frame = true;
+        }
+        ++frames_seen;
+
+        const double t_map_started = now_ms();
+        uint8_t *luma = map_luma_for_cpu(ctx, vf.u64PhyAddr[0], map_len);
+        if (luma == nullptr)
+        {
+            fprintf(stderr, "[camera] CVI_SYS_Mmap failed for %#llx (%u bytes)\n",
+                    (unsigned long long)vf.u64PhyAddr[0], map_len);
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            continue;
+        }
+        const double t_mapped = now_ms();
+
+        const cv::Mat gray(vf.u32Height, vf.u32Width, CV_8UC1, luma, vf.u32Stride[0]);
+
+        std::vector<TagDetection> tags;
+        try
+        {
+            tags = decoder->detect(gray);
+        }
+        catch (const std::exception &e)
+        {
+            fprintf(stderr, "[camera] detector runtime failed: %s\n", e.what());
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            g_stop = 1;
+            break;
+        }
+        const TagDecoderProfile &profile = decoder->last_profile();
+        const double t_detected = now_ms();
+
+        if (!save_frame_path.empty() && frames_seen == kSaveFrameIndex)
+        {
+            cv::Mat annotated;
+            cv::cvtColor(gray, annotated, cv::COLOR_GRAY2BGR);
+            for (const auto &tag : tags)
+            {
+                for (int corner = 0; corner < 4; ++corner)
+                    cv::line(annotated, tag.corners[corner], tag.corners[(corner + 1) % 4],
+                             cv::Scalar(0, 0, 255), 2);
+                char label[32];
+                std::snprintf(label, sizeof(label), "id %d", tag.id);
+                cv::putText(annotated, label, tag.center + cv::Point2f(-14.f, -6.f),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 255), 1);
+            }
+            if (cv::imwrite(save_frame_path, annotated))
+                fprintf(stderr, "[camera] saved annotated frame %d to %s\n",
+                        kSaveFrameIndex, save_frame_path.c_str());
+            else
+                fprintf(stderr, "[camera] could not write %s\n", save_frame_path.c_str());
+        }
+
+        // Publish detections for the preview workers. The exact-luma worker
+        // borrows the Y plane, so its release is deferred until encode finishes.
+        const double busy_ms = (t_detected - t_wait);
+        if (rtsp_luma)
+        {
+            PreviewSurface *surface = acquire_luma_surface(ctx);
+            if (surface != nullptr)
+            {
+                VIDEO_FRAME_INFO_S rtsp_frame = frame;
+                VIDEO_FRAME_S &rf = rtsp_frame.stVFrame;
+                rf.enPixelFormat = PIXEL_FORMAT_NV21;
+                rf.pu8VirAddr[0] = luma;
+                rf.u32Stride[1] = surface->c_stride;
+                rf.u32Length[1] = surface->c_len;
+                rf.u64PhyAddr[1] = surface->c_phy;
+                rf.pu8VirAddr[1] = static_cast<CVI_U8 *>(surface->c_vir);
+                rf.u32Stride[2] = 0;
+                rf.u32Length[2] = 0;
+                rf.u64PhyAddr[2] = 0;
+                rf.pu8VirAddr[2] = nullptr;
+                const bool queued = enqueue_luma_rtsp(
+                    ctx, rtsp_frame, surface, tags, last_fps, last_busy_ms,
+                    frame, luma, map_len);
+                if (!queued)
+                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            }
+            else
+            {
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            }
+        }
+        else
+        {
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+        }
+        const double t_released = now_ms();
+
+        if (rtsp && !rtsp_luma)
+        {
+            std::lock_guard<std::mutex> lock(g_overlay.mutex);
+            g_overlay.tags = tags;
+            g_overlay.fps = last_fps;
+            g_overlay.busy_ms = last_busy_ms;
+        }
+
+        ++win.frames;
+        win.wait += t_got - t_wait;
+        win.map += t_mapped - t_map_started;
+        win.decode += t_detected - t_mapped;
+        win.release += t_released - t_detected;
+        win.tags += tags.size();
+        win.threshold += profile.threshold_ms;
+        win.contour += profile.contour_ms;
+        win.quad += profile.quad_ms;
+        win.marker_decode += profile.decode_ms;
+        win.refine += profile.refine_ms;
+        win.pixels += profile.pixels;
+        win.contours += profile.contours;
+        win.candidates += profile.candidates;
+        win.attempts += profile.attempts;
+        win.markers += profile.markers;
+
+        if (tag_output)
+        {
+            for (const auto &tag : tags)
+            {
+                auto existing = std::find_if(window_tags.begin(), window_tags.end(),
+                                             [&tag](const TagDetection &saved) {
+                                                 return saved.id == tag.id;
+                                             });
+                if (existing == window_tags.end())
+                    window_tags.push_back(tag);
+                else
+                    *existing = tag;
+            }
+        }
+
+        const double t_output_done = now_ms();
+        const double cpu_output_done = thread_cpu_ms();
+        win.output += t_output_done - t_released;
+        win.service_cpu += cpu_output_done - cpu_got;
+
+        const double service_ms = t_output_done - t_got;
+        tail_service.push_back(service_ms);
+        tail_cpu.push_back(cpu_output_done - cpu_got);
+        tail_decode.push_back(t_detected - t_mapped);
+        if (acquisition_age_ms >= 0.0)
+        {
+            tail_age.push_back(acquisition_age_ms);
+            tail_result.push_back(acquisition_age_ms + service_ms);
+        }
+
+        const double t_now = now_ms();
+        if (t_now - tail_window_start >= 10000.0)
+        {
+            const TailSummary service = summarize_tail(tail_service);
+            const TailSummary cpu = summarize_tail(tail_cpu);
+            const TailSummary decode = summarize_tail(tail_decode);
+            const TailSummary acquisition = summarize_tail(tail_age);
+            const TailSummary result = summarize_tail(tail_result);
+            fprintf(stderr,
+                    "[tails] %.1fs n=%zu | service p50 %.2f p95 %.2f p99 %.2f max %.2f | "
+                    "cpu %.2f/%.2f/%.2f/%.2f | decode %.2f/%.2f/%.2f/%.2f | "
+                    "acq-age %.2f/%.2f/%.2f/%.2f | result-age %.2f/%.2f/%.2f/%.2f ms\n",
+                    (t_now - tail_window_start) / 1000.0, tail_service.size(),
+                    service.p50, service.p95, service.p99, service.max,
+                    cpu.p50, cpu.p95, cpu.p99, cpu.max,
+                    decode.p50, decode.p95, decode.p99, decode.max,
+                    acquisition.p50, acquisition.p95, acquisition.p99, acquisition.max,
+                    result.p50, result.p95, result.p99, result.max);
+            tail_service.clear();
+            tail_cpu.clear();
+            tail_decode.clear();
+            tail_age.clear();
+            tail_result.clear();
+            tail_window_start = t_now;
+        }
+        if (t_now - fps_window_start >= 1000.0)
+        {
+            size_t stale_now;
+            {
+                std::lock_guard<std::mutex> lock(ctx.capture.mutex);
+                stale_now = ctx.capture.dropped;
+            }
+            const double n = static_cast<double>(win.frames);
+            const double busy = (win.wait + win.map + win.decode + win.release) / n;
+            const double loop = busy + win.output / n;
+            const double process_cpu_now = process_cpu_ms();
+            const double process_cpu_per_frame = (process_cpu_now - process_cpu_window_start) / n;
+            const double window_fps = n * 1000.0 / (t_now - fps_window_start);
+            const double profiled = (win.threshold + win.contour + win.quad +
+                                     win.marker_decode + win.refine) / n;
+            last_fps = window_fps;
+            last_busy_ms = busy;
+            if (quiet)
+            {
+                dprintf(g_result_fd, "[stats] %.1f fps | total %.2f ms | %.1f tags\n",
+                        window_fps, loop, static_cast<double>(win.tags) / n);
+                if (tag_output)
+                {
+                    for (const auto &tag : window_tags)
+                        dprintf(g_result_fd, "[tag] id=%d center=(%.0f,%.0f)\n", tag.id,
+                                tag.center.x, tag.center.y);
+                    window_tags.clear();
+                }
+            }
+            else
+            {
+                fprintf(stderr,
+                        "[detector] %.1f fps | per frame ms: wait %.2f map %.2f detect %.2f "
+                        "release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f proc-cpu %.2f | "
+                        "%.1f tags | %zu stale | "
+                        "seq mean %.2f max %u sum %u | age mean %.2f max %.2f ms\n",
+                        window_fps, win.wait / n, win.map / n, win.decode / n,
+                        win.release / n, win.output / n, busy, loop,
+                        win.service_cpu / n, process_cpu_per_frame,
+                        static_cast<double>(win.tags) / n, stale_now - stale_prev,
+                        win.seq_samples ? static_cast<double>(win.seq_sum) / win.seq_samples : 0.0,
+                        win.seq_max, win.seq_sum,
+                        win.age_samples ? win.age_sum / win.age_samples : 0.0, win.age_max);
+                fprintf(stderr,
+                        "[aruco-profile] per frame ms: threshold %.2f contour %.2f quad %.2f "
+                        "marker %.2f refine %.2f = %.2f detect %.2f | "
+                        "pixels %.0f contours %.1f candidates %.1f attempts %.1f markers %.2f\n",
+                        win.threshold / n, win.contour / n, win.quad / n,
+                        win.marker_decode / n, win.refine / n, profiled, win.decode / n,
+                        static_cast<double>(win.pixels) / n,
+                        static_cast<double>(win.contours) / n,
+                        static_cast<double>(win.candidates) / n,
+                        static_cast<double>(win.attempts) / n,
+                        static_cast<double>(win.markers) / n);
+                if (tag_output)
+                {
+                    for (const auto &tag : window_tags)
+                        dprintf(g_result_fd, "[tag] id=%d center=(%.0f,%.0f)\n", tag.id,
+                                tag.center.x, tag.center.y);
+                    window_tags.clear();
+                }
+            }
+            if (rtsp_luma)
+            {
+                const LumaRtspStats current = luma_rtsp_stats(ctx);
+                fprintf(stderr,
+                        "[preview] published %zu dequeued %zu encoded %zu fail %zu | "
+                        "replaced %zu no-surface %zu | "
+                        "seq skipped %zu max-gap %u | queue age mean %.2f max %.2f ms | "
+                        "venc mean %.2f max %.2f rtsp mean %.2f max %.2f ms\n",
+                        current.published, current.dequeued, current.encoded,
+                        current.encode_failed, current.superseded, current.no_surface,
+                        current.sequence_skipped, current.sequence_gap_max,
+                        current.dequeued ? current.queue_age_sum_ms / current.dequeued : 0.0,
+                        current.queue_age_max_ms,
+                        current.dequeued ? current.venc_sum_ms / current.dequeued : 0.0,
+                        current.venc_max_ms,
+                        current.dequeued ? current.rtsp_sum_ms / current.dequeued : 0.0,
+                        current.rtsp_max_ms);
+            }
+            if (debug_mode >= 2)
+                fprintf(stderr, "[detector] map-cache hit %zu miss %zu blocks %zu\n",
+                        ctx.luma_mapping_hits, ctx.luma_mapping_misses, ctx.luma_mappings.size());
+            win = StageTotals{};
+            stale_prev = stale_now;
+            fps_window_start = t_now;
+            process_cpu_window_start = process_cpu_now;
+        }
+    }
+
+    fprintf(stderr, "[camera] stopping\n");
+    stop_capture_slot(ctx.capture, ctx.capture_worker, kVpssChn);
+    if (preview.joinable())
+        preview.join();
+    stop_luma_rtsp(ctx);
+    if (isp_control.joinable())
+        isp_control.join();
+    teardown_camera(ctx);
+    return 0;
+}

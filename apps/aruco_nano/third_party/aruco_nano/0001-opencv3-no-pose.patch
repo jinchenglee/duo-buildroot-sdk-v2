@@ -1,0 +1,30 @@
+--- third_party/aruco_nano/aruco_nano.h.orig	2026-09-15 17:01:22.855705266 -0700
++++ third_party/aruco_nano/aruco_nano.h	2026-09-15 17:01:22.857161604 -0700
+@@ -147,9 +147,11 @@
+ #pragma once
+ #define ArucoNanoVersion 10
+ #include <opencv2/imgproc.hpp>
++#ifndef ARUCONANO_NO_POSE
+ #include <opencv2/calib3d.hpp>
++#endif
+ #include <opencv2/core/hal/intrin.hpp>
+-#include <opencv2/objdetect/aruco_detector.hpp> // We extract the dictionary from here
++#include <opencv2/objdetect/aruco_dictionary.hpp> // only the dictionary is needed
+ #include <vector>
+ 
+ namespace aruco_nano  {
+@@ -534,12 +536,14 @@
+     if (o < 0.0)  std::swap(res_marker[1], res_marker[3]);
+     return res_marker;
+ }
++#ifndef ARUCONANO_NO_POSE
+ std::pair<cv::Mat,cv::Mat> Marker::estimatePose(cv::Mat cameraMatrix,cv::Mat distCoeffs,double markerSize) const{
+     std::vector<cv::Point3d> markerCorners={ {-markerSize/2.f,markerSize/2.f,0.f},{markerSize/2.f,markerSize/2.f,0.f},{markerSize/2.f,-markerSize/2.f,0.f},{-markerSize/2.f,-markerSize/2.f,0.f}};
+     cv::Mat Rvec,Tvec;
+     cv::solvePnP(markerCorners,*this,cameraMatrix,distCoeffs,Rvec,Tvec,false,cv::SOLVEPNP_SQPNP);
+     return {Rvec,Tvec};
+ }
++#endif
+ void Marker::draw(cv::Mat &in, const cv::Scalar color) const{
+     auto _to_string=[](int i){ std::stringstream str;str<<i;return str.str();};
+     float flineWidth=  std::max(1.f, std::min(5.f, float(in.cols) / 500.f));

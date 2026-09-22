@@ -13,6 +13,11 @@ app/tinytag_detect/samples/
 usr/local/bin/run_tinytag.sh
 root/.ssh/
 
+# apps/aruco_nano/build.sh stages these from sources kept in apps/aruco_nano/.
+app/aruco_nano/aruco_nano
+app/aruco_nano/run_aruco_nano.sh
+usr/local/bin/run_aruco_nano.sh
+
 # The cvimodel IS tracked. Per tools/tinytag_cvimodel/README.md only a
 # hardware-validated model belongs in the repo, and this one qualifies: it ran
 # on a Duo S and reproduced tpu-mlir's simulator bit-exactly (worst element
