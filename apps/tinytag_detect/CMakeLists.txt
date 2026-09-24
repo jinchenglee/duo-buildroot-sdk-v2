@@ -125,6 +125,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       ${MIDDLEWARE_SDK_ROOT}/lib/libcvi_bin_isp.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libcvi_bin.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libvenc.so
+      ${MIDDLEWARE_SDK_ROOT}/lib/libvdec.so
       ${CVI_RTSP_ROOT}/install/lib/libcvi_rtsp.so
       dl stdc++ pthread z m)
 

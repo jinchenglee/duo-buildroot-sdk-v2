@@ -122,7 +122,8 @@ time, which varies with scene content.
 
 `run_live.sh` defaults to detector-only operation with no RTSP preview. Pass
 `--rtsp` or `--rtsp-luma` to enable a preview; later command-line arguments
-override the launcher defaults.
+override the launcher defaults. To record the scene or run the detector on a
+recording instead of the camera, see "Recording and replay" below.
 
 The low-latency 720p60 profile is:
 
@@ -156,6 +157,82 @@ TINYTAG_LIVE_OV5647_720P60=1 \
 TINYTAG_LIVE_OV5647_720P60=1 \
   /app/tinytag_detect/run_live.sh --capture-only --max-exposure-us 10000
 ```
+
+## Recording and replay
+
+The live binary can record the camera image while you watch the annotated
+preview, then run the detector on that recording through the same hardware
+pipeline. Together they let you find tags that the live detector missed, and
+re-check them after a change.
+
+### Recording (`--record`)
+
+```sh
+# Colour recording, overlay-free; live view in colour with overlay
+/app/tinytag_detect/run_live.sh --rtsp --record          # writes rec.mp4
+
+# Monochrome recording of the detector's own input; live view in luma
+/app/tinytag_detect/run_live.sh --rtsp-luma --record     # writes rec_mono.mp4
+
+# Explicit path
+/app/tinytag_detect/run_live.sh --rtsp-luma --record /root/scene1.mp4
+```
+
+On the host, watch with `ffplay rtsp://192.168.42.1/h264`.
+
+- The file is 1280x720 H.264 at 4 Mbps (about 30 MB per minute), encoded by
+  a second VENC channel independent of the RTSP encoder. No overlay is ever
+  drawn into it.
+- `--rtsp-luma` records exactly the Y plane the detector saw, with neutral
+  chroma. `--rtsp`, or `--record` with no preview, records colour.
+- VPSS device 1 has only three output channels, so the recording shares the
+  preview's. The preview worker encodes each frame for the file *before*
+  drawing the overlay on it, adding about 7 ms per frame to that worker.
+- Stop with Ctrl-C or SIGTERM. The MP4 index is written on a clean stop; a
+  `kill -9`, crash or power cut leaves an unplayable file.
+- Default file names are relative to the directory you run from.
+
+### Replay (`--input`)
+
+```sh
+# Recorded timing: behaves like the camera, skipping frames it can't keep up with
+/app/tinytag_detect/run_live.sh --input /root/rec_mono.mp4
+
+# Every frame, as fast as the detector takes them -- use this for analysis
+/app/tinytag_detect/run_live.sh --input /root/rec_mono.mp4 --input-speed 0
+
+# Replay with the annotated live view
+/app/tinytag_detect/run_live.sh --input /root/rec_mono.mp4 --rtsp-luma
+```
+
+The hardware H.264 decoder (VDEC) is bound to the same VPSS group, device
+and channels that VI feeds live, so scaling, the model-input channel, the
+detector, crop-decode and the previews are all unchanged. Only the source
+differs: VI, the sensor and the ISP are not started.
+
+- `--input-speed f` scales the recorded timing (default 1). `0` is lockstep:
+  the next frame is fed only after the detector has taken the previous one,
+  so no frame is skipped. A 67 s recording replays in about 29 s this way.
+- The run exits at end of file and prints
+  `[input] detector processed N of M frames`.
+- `--mirror`/`--flip` are ignored (recordings are already oriented), as are
+  `--max-exposure-us` and the interactive ISP commands.
+- Other files work if they are 8-bit 4:2:0 H.264 (Baseline, Main or High).
+  10-bit, 4:2:2, 4:4:4 and H.265 are rejected at open; re-encode with
+  `ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p -bf 0 out.mp4`. A
+  non-16:9 source is stretched to 1280x720, with a warning.
+
+Known limitations:
+
+- With B-frames, the decoder driver does not flush its reorder queue at end
+  of stream, so the last few frames (3 in testing) are never processed, and
+  lockstep can skip about one frame. `--record` output has no B-frames and
+  loses nothing; use `-bf 0` when re-encoding.
+- VPSS numbers replayed frames in steps of 2, so the per-second `seq mean
+  2.00` and the preview's `seq skipped` counts read like dropped frames.
+  Trust the `[input]` summary line instead.
+- Decoded tags are reported per second, as in live mode. There is no
+  per-frame output mapping a detection to a frame index yet.
 
 ## Usage on the board
 

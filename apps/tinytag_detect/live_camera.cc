@@ -32,6 +32,7 @@
 // Verified on a Duo S with an OV5647 on J2: 30 fps (sensor-limited), ~11 ms
 // busy per frame with crop-decode on, ~6 ms neural-only.
 
+#include "mp4_reader.h"
 #include "mp4_writer.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
@@ -42,6 +43,7 @@ extern "C" {
 #include <cvi_awb.h>
 #include <cvi_comm.h>
 #include <cvi_isp.h>
+#include <cvi_vdec.h>
 #include <cvi_vi.h>
 #include <rtsp.h>
 #include <sample_comm.h>
@@ -141,6 +143,12 @@ constexpr VB_POOL kDetPool = 1;
 constexpr VB_POOL kModelPool = 2;
 constexpr VENC_CHN kVencChn = 0;
 constexpr VENC_CHN kRecVencChn = 1;
+// --input: the hardware H.264 decoder replaces VI as the VPSS group's source.
+// Five frame buffers let VDEC reorder B-frames (the driver enables reordering
+// above four); the extra display frames cover what VPSS holds while scaling.
+constexpr VDEC_CHN kVdecChn = 0;
+constexpr CVI_U32 kVdecFrameBufCnt = 5;
+constexpr CVI_U32 kVdecDisplayFrameNum = 2;
 constexpr int kRecordBitrateKbps = 4000;
 constexpr int kPreviewBitrateKbps = 3000;
 constexpr int kVencTimeoutMs = 2000;
@@ -402,7 +410,15 @@ void usage(const char *argv0)
             "              while --rtsp/--rtsp-luma still shows the annotated view.\n"
             "              --rtsp: colour, default rec.mp4. --rtsp-luma: monochrome (the\n"
             "              detector's input), default rec_mono.mp4. Only playable after a\n"
-            "              clean stop (Ctrl-C / SIGTERM).\n",
+            "              clean stop (Ctrl-C / SIGTERM).\n"
+            "       [--input file.mp4 [--input-speed f]]  replay an H.264 MP4 instead of\n"
+            "              the camera: the hardware decoder (VDEC) feeds the same VPSS group\n"
+            "              and channels VI does, so everything after VPSS is unchanged. VI,\n"
+            "              ISP, --mirror/--flip and exposure options are not used. Frames are\n"
+            "              fed at their recorded timing times --input-speed (default 1), and\n"
+            "              like the camera, frames the detector cannot keep up with are\n"
+            "              skipped. --input-speed 0 processes every frame, as fast as the\n"
+            "              detector takes them. Exits at end of file.\n",
             argv0);
 }
 
@@ -627,6 +643,20 @@ struct CameraContext
     // before drawing, so that recording is monochrome.
     bool record_own_chn = false;
     size_t record_failures = 0;
+    // --input playback. VI, the sensor and the ISP are never touched; VDEC is
+    // bound to the same VPSS group, device and channels the camera uses.
+    std::unique_ptr<Mp4Reader> input;
+    double input_speed = 1.0;
+    VB_POOL vdec_pool = VB_INVALID_POOLID;
+    bool vdec_created = false;
+    bool vdec_pool_attached = false;
+    bool vdec_started = false;
+    bool vdec_vpss_bound = false;
+    // --input-speed 0: frames the detector has taken, so the feeder can send
+    // the next one only then and no frame is superseded in a capture slot.
+    size_t input_taken = 0;
+    std::mutex input_mutex;
+    std::condition_variable input_taken_cv;
     std::unique_ptr<Mp4Writer> mp4;
     bool rec_venc_started = false;
     std::vector<VENC_PACK_S> rec_packs;
@@ -847,11 +877,9 @@ bool get_vi_config(SAMPLE_VI_CONFIG_S &vi_config)
     return vi_config.s32WorkingViNum > 0;
 }
 
-bool setup_camera(CameraContext &ctx)
+// Sensor dimensions from the VI config (live camera only).
+bool setup_sensor_size(CameraContext &ctx)
 {
-    if (!get_vi_config(ctx.vi_config))
-        return false;
-
     CVI_VI_SetDevNum(ctx.vi_config.s32WorkingViNum);
 
     PIC_SIZE_E pic_size;
@@ -875,10 +903,168 @@ bool setup_camera(CameraContext &ctx)
         ctx.height = 720;
     }
     fprintf(stderr, "[camera] sensor %ux%u\n", ctx.width, ctx.height);
+    return true;
+}
+
+// VI + ISP bring-up and sensor orientation (live camera only).
+bool start_vi(CameraContext &ctx)
+{
+    VI_VPSS_MODE_S vi_vpss_mode{};
+    vi_vpss_mode.aenMode[0] = ctx.vi_online ? VI_ONLINE_VPSS_ONLINE
+                                            : VI_OFFLINE_VPSS_ONLINE;
+    if (CVI_SYS_SetVIVPSSMode(&vi_vpss_mode) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] CVI_SYS_SetVIVPSSMode failed\n");
+        return false;
+    }
+    fprintf(stderr, "[camera] VI/VPSS mode: VI %s, VPSS online\n",
+            ctx.vi_online ? "online" : "offline");
+
+    if (SAMPLE_PLAT_VI_INIT(&ctx.vi_config) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[camera] VI init failed\n");
+        return false;
+    }
+    ctx.vi_initialized = true;
+
+    ISP_PUB_ATTR_S pub_attr{};
+    CVI_ISP_GetPubAttr(0, &pub_attr);
+    pub_attr.f32FrameRate = ov5647_720p60_requested() ? 60 : 30;
+    CVI_ISP_SetPubAttr(0, &pub_attr);
+
+    // Orientation is fixed in the VI channel rather than per frame. Mirroring
+    // matters beyond cosmetics here: AprilTag/ArUco markers are chiral, so a
+    // mirrored frame decodes to nothing at all -- the network still proposes
+    // ROIs on tag-like texture, but no quad ever matches the dictionary.
+    // Runtime-selectable because which setting is correct depends on the
+    // camera module, and getting it wrong is silent apart from zero decodes.
+    if (ctx.mirror || ctx.flip)
+    {
+        const CVI_S32 rc = CVI_VI_SetChnFlipMirror(
+            0, 0, ctx.flip ? CVI_TRUE : CVI_FALSE, ctx.mirror ? CVI_TRUE : CVI_FALSE);
+        if (rc != CVI_SUCCESS)
+            fprintf(stderr, "[camera] CVI_VI_SetChnFlipMirror(flip=%d mirror=%d) failed: %#x\n",
+                    ctx.flip, ctx.mirror, rc);
+        else
+            fprintf(stderr, "[camera] orientation: flip=%d mirror=%d\n", ctx.flip, ctx.mirror);
+    }
+    return true;
+}
+
+// Picture buffers for VDEC, in a pool of its own so the decoder can never
+// take blocks from a VPSS channel's pool.
+bool create_input_pool(CameraContext &ctx)
+{
+    VB_POOL_CONFIG_S pool{};
+    pool.u32BlkSize = VDEC_GetPicBufferSize(PT_H264, ctx.width, ctx.height, VI_PIXEL_FORMAT,
+                                            DATA_BITWIDTH_8, COMPRESS_MODE_NONE);
+    pool.u32BlkCnt = kVdecFrameBufCnt + kVdecDisplayFrameNum + 1;
+    pool.enRemapMode = VB_REMAP_MODE_NONE;
+    ctx.vdec_pool = CVI_VB_CreatePool(&pool);
+    if (ctx.vdec_pool == VB_INVALID_POOLID)
+    {
+        fprintf(stderr, "[input] cannot create VDEC pool (%u x %u bytes)\n", pool.u32BlkCnt,
+                pool.u32BlkSize);
+        return false;
+    }
+    return true;
+}
+
+// H.264 decoder channel producing NV21 -- the same format VI hands VPSS.
+bool start_input_decoder(CameraContext &ctx)
+{
+    VDEC_MOD_PARAM_S mod{};
+    CVI_VDEC_GetModParam(&mod);
+    mod.enVdecVBSource = VB_SOURCE_USER;
+    CVI_VDEC_SetModParam(&mod);
+
+    VDEC_CHN_ATTR_S attr{};
+    attr.enType = PT_H264;
+    attr.enMode = VIDEO_MODE_FRAME;
+    attr.u32PicWidth = ctx.width;
+    attr.u32PicHeight = ctx.height;
+    attr.u32StreamBufSize = ctx.width * ctx.height;
+    attr.u32FrameBufCnt = kVdecFrameBufCnt;
+    CVI_S32 rc = CVI_VDEC_CreateChn(kVdecChn, &attr);
+    if (rc != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[input] CVI_VDEC_CreateChn failed: %#x\n", rc);
+        return false;
+    }
+    ctx.vdec_created = true;
+
+    VDEC_CHN_POOL_S pools{};
+    pools.hPicVbPool = ctx.vdec_pool;
+    pools.hTmvVbPool = VB_INVALID_POOLID;
+    rc = CVI_VDEC_AttachVbPool(kVdecChn, &pools);
+    if (rc != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[input] CVI_VDEC_AttachVbPool failed: %#x\n", rc);
+        return false;
+    }
+    ctx.vdec_pool_attached = true;
+
+    VDEC_CHN_PARAM_S param{};
+    rc = CVI_VDEC_GetChnParam(kVdecChn, &param);
+    if (rc == CVI_SUCCESS)
+    {
+        param.enPixelFormat = VI_PIXEL_FORMAT;
+        param.u32DisplayFrameNum = kVdecDisplayFrameNum;
+        rc = CVI_VDEC_SetChnParam(kVdecChn, &param);
+    }
+    if (rc == CVI_SUCCESS)
+        rc = CVI_VDEC_StartRecvStream(kVdecChn);
+    if (rc != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[input] VDEC channel setup failed: %#x\n", rc);
+        return false;
+    }
+    ctx.vdec_started = true;
+    return true;
+}
+
+void stop_input_decoder(CameraContext &ctx)
+{
+    if (ctx.vdec_vpss_bound)
+    {
+        SAMPLE_COMM_VDEC_UnBind_VPSS(kVdecChn, kVpssGrp);
+        ctx.vdec_vpss_bound = false;
+    }
+    if (ctx.vdec_started)
+    {
+        CVI_VDEC_StopRecvStream(kVdecChn);
+        ctx.vdec_started = false;
+    }
+    if (ctx.vdec_created)
+    {
+        CVI_VDEC_ResetChn(kVdecChn);
+        if (ctx.vdec_pool_attached)
+            CVI_VDEC_DetachVbPool(kVdecChn);
+        ctx.vdec_pool_attached = false;
+        CVI_VDEC_DestroyChn(kVdecChn);
+        ctx.vdec_created = false;
+    }
+}
+
+bool setup_camera(CameraContext &ctx)
+{
+    if (ctx.input)
+    {
+        ctx.width = ctx.input->width();
+        ctx.height = ctx.input->height();
+        if (ctx.width * kDetHeight != ctx.height * kDetWidth)
+            fprintf(stderr, "[input] warning: %ux%u is not 16:9; VPSS stretches it to %ux%u\n",
+                    ctx.width, ctx.height, kDetWidth, kDetHeight);
+    }
+    else if (!get_vi_config(ctx.vi_config))
+        return false;
+    else if (!setup_sensor_size(ctx))
+        return false;
 
     // VB pools: pool 0 for VI's native NV21 capture, pool 1 for the 1280x720
     // detector/decode channel, optional pool 2 for direct 640x360 TPU input,
-    // and the next pool for the ordinary color preview channel.
+    // and the next pool for the ordinary color preview channel. With --input,
+    // pool 0 is sized from the file instead and VDEC gets its own pool below.
     ctx.preview_chn = ctx.direct_model_input ? 2 : 1;
     ctx.preview_pool = ctx.direct_model_input ? 3 : 2;
     if (!ctx.save_native_frame_path.empty() && ctx.direct_model_input &&
@@ -957,45 +1143,15 @@ bool setup_camera(CameraContext &ctx)
         fprintf(stderr, "[camera] preview transport: borrowed VPSS Y (zero copy)\n");
     }
 
-    VI_VPSS_MODE_S vi_vpss_mode{};
-    vi_vpss_mode.aenMode[0] = ctx.vi_online ? VI_ONLINE_VPSS_ONLINE
-                                            : VI_OFFLINE_VPSS_ONLINE;
-    if (CVI_SYS_SetVIVPSSMode(&vi_vpss_mode) != CVI_SUCCESS)
+    if (ctx.input)
     {
-        fprintf(stderr, "[camera] CVI_SYS_SetVIVPSSMode failed\n");
+        if (!create_input_pool(ctx))
+            return false;
+        if (ctx.mirror || ctx.flip)
+            fprintf(stderr, "[input] --mirror/--flip ignored: file frames are used as recorded\n");
+    }
+    else if (!start_vi(ctx))
         return false;
-    }
-    fprintf(stderr, "[camera] VI/VPSS mode: VI %s, VPSS online\n",
-            ctx.vi_online ? "online" : "offline");
-
-    if (SAMPLE_PLAT_VI_INIT(&ctx.vi_config) != CVI_SUCCESS)
-    {
-        fprintf(stderr, "[camera] VI init failed\n");
-        return false;
-    }
-    ctx.vi_initialized = true;
-
-    ISP_PUB_ATTR_S pub_attr{};
-    CVI_ISP_GetPubAttr(0, &pub_attr);
-    pub_attr.f32FrameRate = ov5647_720p60_requested() ? 60 : 30;
-    CVI_ISP_SetPubAttr(0, &pub_attr);
-
-    // Orientation is fixed in the VI channel rather than per frame. Mirroring
-    // matters beyond cosmetics here: AprilTag/ArUco markers are chiral, so a
-    // mirrored frame decodes to nothing at all -- the network still proposes
-    // ROIs on tag-like texture, but no quad ever matches the dictionary.
-    // Runtime-selectable because which setting is correct depends on the
-    // camera module, and getting it wrong is silent apart from zero decodes.
-    if (ctx.mirror || ctx.flip)
-    {
-        const CVI_S32 rc = CVI_VI_SetChnFlipMirror(
-            0, 0, ctx.flip ? CVI_TRUE : CVI_FALSE, ctx.mirror ? CVI_TRUE : CVI_FALSE);
-        if (rc != CVI_SUCCESS)
-            fprintf(stderr, "[camera] CVI_VI_SetChnFlipMirror(flip=%d mirror=%d) failed: %#x\n",
-                    ctx.flip, ctx.mirror, rc);
-        else
-            fprintf(stderr, "[camera] orientation: flip=%d mirror=%d\n", ctx.flip, ctx.mirror);
-    }
 
     // VPSS device/mode setup. u8VpssDev is only meaningful in VPSS_MODE_DUAL
     // (see cvi_comm_vpss.h), and this board's VI runs offline-into-VPSS, so a
@@ -1009,7 +1165,8 @@ bool setup_camera(CameraContext &ctx)
     VPSS_MODE_S vpss_mode{};
     vpss_mode.enMode = VPSS_MODE_DUAL;
     vpss_mode.aenInput[0] = VPSS_INPUT_MEM;
-    vpss_mode.aenInput[1] = VPSS_INPUT_ISP;
+    // --input keeps the same device and group, fed from memory by VDEC.
+    vpss_mode.aenInput[1] = ctx.input ? VPSS_INPUT_MEM : VPSS_INPUT_ISP;
     vpss_mode.ViPipe[1] = 0;
     CVI_SYS_SetVPSSModeEx(&vpss_mode);
 
@@ -1072,12 +1229,26 @@ bool setup_camera(CameraContext &ctx)
         return false;
     }
 
-    if (SAMPLE_COMM_VI_Bind_VPSS(0, 0, kVpssGrp) != CVI_SUCCESS)
+    if (ctx.input)
     {
-        fprintf(stderr, "[camera] VI->VPSS bind failed\n");
-        return false;
+        if (!start_input_decoder(ctx))
+            return false;
+        if (SAMPLE_COMM_VDEC_Bind_VPSS(kVdecChn, kVpssGrp) != CVI_SUCCESS)
+        {
+            fprintf(stderr, "[input] VDEC->VPSS bind failed\n");
+            return false;
+        }
+        ctx.vdec_vpss_bound = true;
     }
-    ctx.vi_vpss_bound = true;
+    else
+    {
+        if (SAMPLE_COMM_VI_Bind_VPSS(0, 0, kVpssGrp) != CVI_SUCCESS)
+        {
+            fprintf(stderr, "[camera] VI->VPSS bind failed\n");
+            return false;
+        }
+        ctx.vi_vpss_bound = true;
+    }
 
     // After the bind, matching SAMPLE_TDL_Init_WM's order (VPSS start ->
     // bind VI -> attach VB pools).
@@ -1994,6 +2165,108 @@ void record_loop(CameraContext *ctx)
         fprintf(stderr, "[record] %zu encode failures\n", failures);
 }
 
+// Wake the detector loop, which otherwise waits for a frame that a finished
+// file will never produce.
+void wake_capture_waiters(CameraContext &ctx)
+{
+    for (CaptureSlot *slot : {&ctx.capture, &ctx.model_capture})
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        slot->not_empty.notify_all();
+    }
+}
+
+// --input: feed the file's access units to VDEC at their recorded timing
+// (scaled by --input-speed), so VPSS and the detector see a camera-like
+// cadence. At end of file, let the decoder and detector drain, then stop.
+void input_feed_loop(CameraContext *ctx)
+{
+    Mp4Reader &in = *ctx->input;
+    std::vector<uint8_t> au;
+    au.reserve(1 << 20);
+    const double start = now_ms();
+    size_t sent = 0;
+    // Lockstep window: how many frames may be ahead of the detector. Grows when
+    // B-frame reordering holds decoded pictures back until more input arrives.
+    size_t lag = 0;
+    for (size_t i = 0; i < in.frame_count() && !g_stop; ++i)
+    {
+        uint64_t dts_us = 0;
+        bool key = false;
+        if (!in.read_frame(i, au, dts_us, key))
+        {
+            fprintf(stderr, "[input] cannot read frame %zu\n", i);
+            break;
+        }
+        if (ctx->input_speed <= 0.0 && i > lag)
+        {
+            // Lockstep: send frame i once the detector has taken frame i-1-lag.
+            // With B-frames a timeout means the decoder is holding that picture
+            // for reordering, so widen the window instead of waiting every
+            // frame. Without them the window stays zero, so no frame can be
+            // superseded; the timeout only guards against a frame lost to a
+            // pairing mismatch.
+            const bool reorders = in.reorders();
+            std::unique_lock<std::mutex> lock(ctx->input_mutex);
+            if (!ctx->input_taken_cv.wait_for(lock, std::chrono::milliseconds(reorders ? 200 : 1000),
+                                              [ctx, i, lag] {
+                                                  return ctx->input_taken >= i - lag || g_stop;
+                                              }) &&
+                reorders && lag < kVdecFrameBufCnt)
+                ++lag;
+        }
+        else if (ctx->input_speed > 0.0)
+        {
+            const double due = start + dts_us / 1000.0 / ctx->input_speed;
+            for (double wait = due - now_ms(); wait > 0.0 && !g_stop; wait = due - now_ms())
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(static_cast<long>(std::min(wait, 100.0) * 1000.0)));
+        }
+        VDEC_STREAM_S stream{};
+        stream.pu8Addr = au.data();
+        stream.u32Len = static_cast<CVI_U32>(au.size());
+        stream.u64PTS = dts_us;
+        stream.bEndOfFrame = CVI_TRUE;
+        stream.bDisplay = CVI_TRUE;
+        // A full stream buffer times out; retry until accepted or stopped.
+        while (!g_stop && CVI_VDEC_SendStream(kVdecChn, &stream, 100) != CVI_SUCCESS)
+        {
+        }
+        if (!g_stop)
+            ++sent;
+    }
+
+    // End of stream. On files with B-frames this driver does not flush its
+    // reorder queue, so their last few frames are never output (verified on
+    // hardware; flagging the last access unit as end-of-stream instead makes
+    // the driver re-emit pictures indefinitely). Streams without B-frames,
+    // such as --record output, lose nothing.
+    VDEC_STREAM_S eos{};
+    eos.bEndOfStream = CVI_TRUE;
+    for (int i = 0; i < 50 && !g_stop && CVI_VDEC_SendStream(kVdecChn, &eos, 100) != CVI_SUCCESS; ++i)
+    {
+    }
+
+    VDEC_CHN_STATUS_S status{};
+    for (int i = 0; i < 500 && !g_stop; ++i)
+    {
+        if (CVI_VDEC_QueryStatus(kVdecChn, &status) == CVI_SUCCESS &&
+            status.u32LeftStreamFrames <= 0 && status.u32LeftPics <= 0)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // The last decoded picture still has to pass VPSS and the detector.
+    for (int i = 0; i < 10 && !g_stop; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!g_stop)
+        fprintf(stderr, "[input] end of file: %zu/%zu frames sent\n", sent, in.frame_count());
+    else
+        fprintf(stderr, "[input] stopped after %zu/%zu frames\n", sent, in.frame_count());
+    g_stop = 1;
+    wake_capture_waiters(*ctx);
+}
+
 void teardown_camera(CameraContext &ctx)
 {
     if (ctx.rtsp)
@@ -2026,6 +2299,7 @@ void teardown_camera(CameraContext &ctx)
         SAMPLE_COMM_VI_UnBind_VPSS(0, 0, kVpssGrp);
         ctx.vi_vpss_bound = false;
     }
+    stop_input_decoder(ctx);
     if (ctx.vpss_created)
     {
         CVI_BOOL chn_enable[VPSS_MAX_PHY_CHN_NUM + 1] = {0};
@@ -2057,6 +2331,12 @@ void teardown_camera(CameraContext &ctx)
         }
     }
 
+    if (ctx.vdec_pool != VB_INVALID_POOLID)
+    {
+        CVI_VB_DestroyPool(ctx.vdec_pool);
+        ctx.vdec_pool = VB_INVALID_POOLID;
+    }
+
     if (ctx.sys_initialized)
     {
         CVI_SYS_Exit();
@@ -2084,6 +2364,8 @@ int main(int argc, char *argv[])
     bool rtsp = false, rtsp_luma = false;
     std::string record_path;
     bool record = false;
+    std::string input_path;
+    double input_speed = 1.0;
     bool mirror = false, flip = false;
     bool tag_output = true;
     bool capture_only = false;
@@ -2115,6 +2397,8 @@ int main(int argc, char *argv[])
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
+        else if (flag == "--input" && has_value) input_path = argv[++i];
+        else if (flag == "--input-speed" && has_value) input_speed = std::atof(argv[++i]);
         else if (flag == "--record")
         {
             record = true;
@@ -2207,6 +2491,20 @@ int main(int argc, char *argv[])
         ctx.vi_online = std::atoi(online) != 0;
     if (const char *delay = std::getenv("TINYTAG_LIVE_PREVIEW_DELAY_MS"))
         ctx.preview_delay_ms = static_cast<unsigned>(std::max(0, std::atoi(delay)));
+    if (!input_path.empty())
+    {
+        ctx.input.reset(new Mp4Reader);
+        std::string error;
+        if (!ctx.input->open(input_path, error))
+        {
+            fprintf(stderr, "[input] %s: %s\n", input_path.c_str(), error.c_str());
+            return 1;
+        }
+        ctx.input_speed = std::max(0.0, input_speed);
+        fprintf(stderr, "[input] %s: %ux%u H.264, %zu frames, %.2f fps, speed %.2fx\n",
+                input_path.c_str(), ctx.input->width(), ctx.input->height(),
+                ctx.input->frame_count(), ctx.input->fps(), ctx.input_speed);
+    }
     if (!ctx.record_path.empty())
     {
         ctx.mp4.reset(new Mp4Writer);
@@ -2227,15 +2525,22 @@ int main(int argc, char *argv[])
         teardown_camera(ctx);
         return 1;
     }
-    if (max_exposure_us != 0 && !isp_set_max_auto_exptime(max_exposure_us))
+    if (max_exposure_us != 0 && !ctx.input && !isp_set_max_auto_exptime(max_exposure_us))
     {
         teardown_camera(ctx);
         return 1;
     }
 
+    std::thread input_feeder;
+    if (ctx.input)
+        input_feeder = std::thread(input_feed_loop, &ctx);
+
     if (capture_only)
     {
         const int result = run_capture_only();
+        g_stop = 1;
+        if (input_feeder.joinable())
+            input_feeder.join();
         teardown_camera(ctx);
         return result;
     }
@@ -2257,7 +2562,10 @@ int main(int argc, char *argv[])
     if (ctx.direct_model_input)
         ctx.model_capture_worker = std::thread(capture_loop, kModelChn, &ctx.model_capture);
 
-    std::thread isp_control(isp_control_loop);
+    // Interactive ISP control only makes sense for the live sensor.
+    std::thread isp_control;
+    if (!ctx.input)
+        isp_control = std::thread(isp_control_loop);
 
     std::thread recorder;
     if (ctx.record_own_chn)
@@ -2326,6 +2634,7 @@ int main(int argc, char *argv[])
 
     bool logged_first_frame = false;
     int frames_seen = 0;
+    size_t total_frames = 0;
     size_t stale_prev = 0;
     size_t pair_mismatch_prev = 0;
     bool compact_needs_validation = ctx.validate_compact_input;
@@ -2460,6 +2769,15 @@ int main(int argc, char *argv[])
             ++win.ready_delta_samples;
         }
 
+        if (ctx.input)
+        {
+            {
+                std::lock_guard<std::mutex> lock(ctx.input_mutex);
+                ++ctx.input_taken;
+            }
+            ctx.input_taken_cv.notify_one();
+        }
+
         // GetChnFrame returns *physical* addresses only -- pu8VirAddr is left
         // NULL. CVI_SYS_MmapCache maps the plane and internally invalidates
         // the mapped range, so the CPU sees what VPSS just wrote via DMA. Do
@@ -2574,6 +2892,7 @@ int main(int argc, char *argv[])
         }
         const double t_released = now_ms();
         ++win.frames;
+        ++total_frames;
         win.wait += t_got - t_wait;
         win.pair += pair_wait_ms;
         win.map += t_mapped - t_map_started;
@@ -2793,6 +3112,11 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "[camera] stopping\n");
     g_stop = 1;
+    if (input_feeder.joinable())
+        input_feeder.join();
+    if (ctx.input)
+        fprintf(stderr, "[input] detector processed %zu of %zu frames\n", total_frames,
+                ctx.input->frame_count());
     if (preview.joinable())
         preview.join();
     if (recorder.joinable())
