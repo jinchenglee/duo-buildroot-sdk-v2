@@ -1,4 +1,4 @@
-#include "cvi_comm_video.h"
+#include <linux/cvi_comm_video.h>
 #include "sensor_list.h"
 
 

@@ -85,9 +85,6 @@ WARNING_LEVEL :=  -Wall -Wextra -Werror
 
 #Generate object files by CC
 CFLAGS    := $(OPT_LEVEL) -std=gnu11 -g $(WARNING_LEVEL) -fPIC -ffunction-sections -fdata-sections
-# Some middleware sources include common video headers without the `linux/`
-# prefix, while the SDK stores those headers under include/linux/.
-CFLAGS    += -I$(MW_INC)/linux
 #Generate object files by CXX
 CXXFLAGS  := $(OPT_LEVEL) -std=gnu++11 -g $(WARNING_LEVEL) -fPIC -ffunction-sections -fdata-sections
 #Generate dependencies files by CC and CXX
