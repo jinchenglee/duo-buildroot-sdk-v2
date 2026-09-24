@@ -32,6 +32,7 @@
 // Verified on a Duo S with an OV5647 on J2: 30 fps (sensor-limited), ~11 ms
 // busy per frame with crop-decode on, ~6 ms neural-only.
 
+#include "mp4_writer.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
 
@@ -139,6 +140,8 @@ bool ov5647_720p60_requested()
 constexpr VB_POOL kDetPool = 1;
 constexpr VB_POOL kModelPool = 2;
 constexpr VENC_CHN kVencChn = 0;
+constexpr VENC_CHN kRecVencChn = 1;
+constexpr int kRecordBitrateKbps = 4000;
 constexpr int kPreviewBitrateKbps = 3000;
 constexpr int kVencTimeoutMs = 2000;
 
@@ -394,7 +397,12 @@ void usage(const char *argv0)
             "  --quiet  suppress application diagnostics on stderr; detected tag IDs\n"
             "              remain on stdout.\n"
 
-            "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n",
+            "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n"
+            "       [--record [out.mp4]]  record the camera image without overlays as H.264 MP4\n"
+            "              while --rtsp/--rtsp-luma still shows the annotated view.\n"
+            "              --rtsp: colour, default rec.mp4. --rtsp-luma: monochrome (the\n"
+            "              detector's input), default rec_mono.mp4. Only playable after a\n"
+            "              clean stop (Ctrl-C / SIGTERM).\n",
             argv0);
 }
 
@@ -609,6 +617,19 @@ struct CameraContext
     bool native_capture_enabled = false;
     bool venc_started = false;
     bool rtsp_started = false;
+    std::string record_path;
+    // The device-1 VPSS group has only three output channels, so --record has
+    // no channel of its own next to the detector, model and colour preview.
+    // With no preview it takes the preview channel/pool slot (clean colour).
+    // With --rtsp the colour preview channel is shared: the preview worker
+    // encodes each frame for the file before drawing on it. With --rtsp-luma
+    // the worker encodes the detector's own grayscale frame (neutral chroma)
+    // before drawing, so that recording is monochrome.
+    bool record_own_chn = false;
+    size_t record_failures = 0;
+    std::unique_ptr<Mp4Writer> mp4;
+    bool rec_venc_started = false;
+    std::vector<VENC_PACK_S> rec_packs;
     VPSS_CHN preview_chn = 1;
     VB_POOL preview_pool = 2;
     size_t preview_item_capacity = 0;
@@ -692,15 +713,15 @@ void on_rtsp_disconnect(const char *ip, void *) { fprintf(stderr, "[rtsp] client
 // the VENC/RTSP half of SAMPLE_TDL_Init_WM), with a lower bitrate: 720p
 // over the USB/Ethernet link doesn't need the 8 Mbps that sample uses, and
 // sending less costs less of this board's single CPU core.
-bool start_preview_stream(CameraContext &ctx)
+void fill_h264_input_config(chnInputCfg &ic, VPSS_CHN vpss_chn, int bitrate_kbps)
 {
-    chnInputCfg ic{};
+    ic = chnInputCfg{};
     strcpy(ic.codec, "h264");
     ic.initialDelay = CVI_INITIAL_DELAY_DEFAULT;
     ic.width = kDetWidth;
     ic.height = kDetHeight;
     ic.vpssGrp = kVpssGrp;
-    ic.vpssChn = ctx.preview_luma ? kVpssChn : ctx.preview_chn;
+    ic.vpssChn = vpss_chn;
     ic.num_frames = -1;
     ic.bsMode = 0;
     ic.rcMode = SAMPLE_RC_CBR;
@@ -709,7 +730,7 @@ bool start_preview_stream(CameraContext &ctx)
     ic.gop = DEF_264_GOP;
     ic.maxIprop = CVI_H26X_MAX_I_PROP_DEFAULT;
     ic.minIprop = CVI_H26X_MIN_I_PROP_DEFAULT;
-    ic.bitrate = kPreviewBitrateKbps;
+    ic.bitrate = bitrate_kbps;
     ic.firstFrmstartQp = 30;
     ic.minIqp = DEF_264_MINIQP;
     ic.maxIqp = DEF_264_MAXIQP;
@@ -730,6 +751,30 @@ bool start_preview_stream(CameraContext &ctx)
     ic.tempLayer = 0;
     ic.testRoi = 0;
     ic.bgInterval = 0;
+}
+
+// Second, independent H.264 encoder for --record, fed by clean frames.
+bool start_record_encoder(CameraContext &ctx)
+{
+    chnInputCfg ic{};
+    fill_h264_input_config(ic, ctx.preview_chn, kRecordBitrateKbps);
+    VENC_GOP_ATTR_S gop{};
+    if (SAMPLE_COMM_VENC_GetGopAttr(VENC_GOPMODE_NORMALP, &gop) != CVI_SUCCESS ||
+        SAMPLE_COMM_VENC_Start(&ic, kRecVencChn, PT_H264, PIC_720P, SAMPLE_RC_CBR, 0, CVI_FALSE, &gop) !=
+            CVI_SUCCESS)
+    {
+        fprintf(stderr, "[record] VENC start failed\n");
+        return false;
+    }
+    ctx.rec_venc_started = true;
+    ctx.rec_packs.resize(64);
+    return true;
+}
+
+bool start_preview_stream(CameraContext &ctx)
+{
+    chnInputCfg ic{};
+    fill_h264_input_config(ic, ctx.preview_luma ? kVpssChn : ctx.preview_chn, kPreviewBitrateKbps);
 
     VENC_GOP_ATTR_S gop{};
     if (SAMPLE_COMM_VENC_GetGopAttr(VENC_GOPMODE_NORMALP, &gop) != CVI_SUCCESS ||
@@ -843,8 +888,14 @@ bool setup_camera(CameraContext &ctx)
         return false;
     }
     VB_CONFIG_S vb_config{};
+    ctx.record_own_chn = !ctx.record_path.empty() && !ctx.preview;
+    if (ctx.record_own_chn && !ctx.save_native_frame_path.empty() && ctx.direct_model_input)
+    {
+        fprintf(stderr, "[camera] --save-native-frame conflicts with --record and direct compact input\n");
+        return false;
+    }
     vb_config.u32MaxPoolCnt = 2 + (ctx.direct_model_input ? 1 : 0) +
-                              ((ctx.preview && !ctx.preview_luma) ? 1 : 0);
+                              ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn ? 1 : 0);
     vb_config.astCommPool[0].u32BlkSize = COMMON_GetPicBufferSize(
         ctx.width, ctx.height, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
     vb_config.astCommPool[0].u32BlkCnt = 5;
@@ -860,7 +911,7 @@ bool setup_camera(CameraContext &ctx)
         vb_config.astCommPool[kModelPool].u32BlkCnt = 5;
     }
 
-    if (ctx.preview && !ctx.preview_luma)
+    if ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn)
     {
         vb_config.astCommPool[ctx.preview_pool].u32BlkSize = COMMON_GetPicBufferSize(
             kDetWidth, kDetHeight, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
@@ -1005,7 +1056,7 @@ bool setup_camera(CameraContext &ctx)
         if (vpss_ret == CVI_SUCCESS)
             ctx.native_capture_enabled = true;
     }
-    if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
+    if (vpss_ret == CVI_SUCCESS && ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn))
     {
         VPSS_CHN_ATTR_S preview_attr{};
         VPSS_CHN_DEFAULT_HELPER(&preview_attr, kDetWidth, kDetHeight, VI_PIXEL_FORMAT, CVI_FALSE);
@@ -1033,10 +1084,11 @@ bool setup_camera(CameraContext &ctx)
     vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kVpssChn, kDetPool);
     if (vpss_ret == CVI_SUCCESS && ctx.direct_model_input)
         vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kModelChn, kModelPool);
-    if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
+    if (vpss_ret == CVI_SUCCESS && ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn))
         vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, ctx.preview_chn, ctx.preview_pool);
     if (vpss_ret == CVI_SUCCESS && ctx.native_capture_enabled)
         vpss_ret = CVI_VPSS_AttachVbPool(kVpssGrp, kNativeCaptureChn, 0);
+
     if (vpss_ret != CVI_SUCCESS)
     {
         fprintf(stderr, "[camera] VPSS attach VB pool failed: %#x\n", vpss_ret);
@@ -1044,6 +1096,8 @@ bool setup_camera(CameraContext &ctx)
     }
 
     if (ctx.preview && !start_preview_stream(ctx))
+        return false;
+    if (!ctx.record_path.empty() && !start_record_encoder(ctx))
         return false;
 
     return true;
@@ -1571,6 +1625,8 @@ bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
     return true;
 }
 
+bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame);
+
 void luma_rtsp_loop(CameraContext *ctx)
 {
     configure_preview_priority("luma");
@@ -1638,6 +1694,15 @@ void luma_rtsp_loop(CameraContext *ctx)
             for (const auto &r : sfc.dirty)
                 vu(r & cv::Rect(0, 0, vu.cols, vu.rows)).setTo(cv::Scalar(128, 128));
             sfc.dirty.clear();
+
+            // Monochrome recording: the detector's Y plane with neutral chroma,
+            // encoded before any overlay is drawn. Flush the chroma we just reset.
+            if (ctx->mp4)
+            {
+                CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+                if (!record_frame(*ctx, item.encoded))
+                    ++ctx->record_failures;
+            }
 
             draw_overlay_nv21(y, vu, item.proposals, item.tags, item.crops, item.fps,
                               item.busy_ms, &sfc.dirty);
@@ -1823,6 +1888,8 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
     draw_label(y, status, cv::Point(16, 40), 0.9);
 }
 
+bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame);
+
 // Runs beside the detector loop, which only has to publish into g_overlay.
 void preview_loop(CameraContext *ctx)
 {
@@ -1851,6 +1918,10 @@ void preview_loop(CameraContext *ctx)
         cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
                    mem + (vf.u64PhyAddr[1] - base), vf.u32Stride[1]);
 
+        // Recording takes the frame before any overlay is drawn on it.
+        if (ctx->mp4 && !record_frame(*ctx, frame))
+            ++ctx->record_failures;
+
         double fps, busy_ms;
         {
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
@@ -1872,6 +1943,57 @@ void preview_loop(CameraContext *ctx)
     }
 }
 
+// Encode one clean NV21 frame on the recording VENC channel and mux it.
+// Independent of the RTSP encoder, so the file holds exactly what the camera
+// saw, without overlays.
+bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
+{
+    if (CVI_VENC_SendFrame(kRecVencChn, &frame, kVencTimeoutMs) != CVI_SUCCESS)
+        return false;
+    VENC_STREAM_S stream{};
+    stream.pstPack = ctx.rec_packs.data();
+    CVI_S32 rc;
+    do
+        rc = CVI_VENC_GetStream(kRecVencChn, &stream, kVencTimeoutMs);
+    while (rc == CVI_ERR_VENC_BUSY);
+    if (rc != CVI_SUCCESS)
+        return false;
+
+    static thread_local std::vector<uint8_t> au;
+    au.clear();
+    const CVI_U32 packs = std::min<CVI_U32>(stream.u32PackCount, ctx.rec_packs.size());
+    for (CVI_U32 i = 0; i < packs; ++i)
+    {
+        const uint8_t *src = stream.pstPack[i].pu8Addr + stream.pstPack[i].u32Offset;
+        au.insert(au.end(), src, src + (stream.pstPack[i].u32Len - stream.pstPack[i].u32Offset));
+    }
+    if (packs != 0)
+    {
+        const uint64_t pts = stream.pstPack[0].u64PTS ? stream.pstPack[0].u64PTS
+                                                      : static_cast<uint64_t>(now_ms() * 1000.0);
+        ctx.mp4->add_frame(au.data(), au.size(), pts);
+    }
+    return CVI_VENC_ReleaseStream(kRecVencChn, &stream) == CVI_SUCCESS;
+}
+
+// Recording worker for the case where the recording has its own VPSS channel.
+void record_loop(CameraContext *ctx)
+{
+    configure_preview_priority("record");
+    size_t failures = 0;
+    while (!g_stop)
+    {
+        VIDEO_FRAME_INFO_S frame{};
+        if (CVI_VPSS_GetChnFrame(kVpssGrp, ctx->preview_chn, &frame, 1000) != CVI_SUCCESS)
+            continue;
+        if (!record_frame(*ctx, frame))
+            ++failures;
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+    }
+    if (failures)
+        fprintf(stderr, "[record] %zu encode failures\n", failures);
+}
+
 void teardown_camera(CameraContext &ctx)
 {
     if (ctx.rtsp)
@@ -1888,6 +2010,11 @@ void teardown_camera(CameraContext &ctx)
     {
         SAMPLE_COMM_VENC_Stop(kVencChn);
         ctx.venc_started = false;
+    }
+    if (ctx.rec_venc_started)
+    {
+        SAMPLE_COMM_VENC_Stop(kRecVencChn);
+        ctx.rec_venc_started = false;
     }
 
     // All detector and preview workers have released their frames before
@@ -1907,7 +2034,7 @@ void teardown_camera(CameraContext &ctx)
             chn_enable[kModelChn] = CVI_TRUE;
         if (ctx.native_capture_enabled)
             chn_enable[kNativeCaptureChn] = CVI_TRUE;
-        if (ctx.preview && !ctx.preview_luma)
+        if ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn)
             chn_enable[ctx.preview_chn] = CVI_TRUE;
         SAMPLE_COMM_VPSS_Stop(kVpssGrp, chn_enable);
         ctx.vpss_created = false;
@@ -1955,6 +2082,8 @@ int main(int argc, char *argv[])
     std::string save_frame_path;
     std::string save_native_frame_path;
     bool rtsp = false, rtsp_luma = false;
+    std::string record_path;
+    bool record = false;
     bool mirror = false, flip = false;
     bool tag_output = true;
     bool capture_only = false;
@@ -1986,6 +2115,12 @@ int main(int argc, char *argv[])
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
+        else if (flag == "--record")
+        {
+            record = true;
+            if (has_value && argv[i + 1][0] != '-')
+                record_path = argv[++i];
+        }
         else if (flag == "--capture-only") capture_only = true;
         else if (flag == "--max-exposure-us" && has_value)
             max_exposure_us = static_cast<CVI_U32>(std::strtoul(argv[++i], nullptr, 10));
@@ -2057,6 +2192,9 @@ int main(int argc, char *argv[])
     CameraContext ctx;
     ctx.preview = rtsp;
     ctx.preview_luma = rtsp_luma;
+    if (record && record_path.empty())
+        record_path = rtsp_luma ? "rec_mono.mp4" : "rec.mp4";
+    ctx.record_path = record_path;
     ctx.preview_item_capacity = static_cast<size_t>(std::max(1, max_proposals));
     ctx.save_native_frame_path = save_native_frame_path;
     ctx.mirror = mirror;
@@ -2069,6 +2207,16 @@ int main(int argc, char *argv[])
         ctx.vi_online = std::atoi(online) != 0;
     if (const char *delay = std::getenv("TINYTAG_LIVE_PREVIEW_DELAY_MS"))
         ctx.preview_delay_ms = static_cast<unsigned>(std::max(0, std::atoi(delay)));
+    if (!ctx.record_path.empty())
+    {
+        ctx.mp4.reset(new Mp4Writer);
+        if (!ctx.mp4->open(ctx.record_path, kDetWidth, kDetHeight))
+        {
+            fprintf(stderr, "[record] cannot open %s\n", ctx.record_path.c_str());
+            return 1;
+        }
+        fprintf(stderr, "[record] writing %s\n", ctx.record_path.c_str());
+    }
     if (!setup_camera(ctx))
     {
         teardown_camera(ctx);
@@ -2111,6 +2259,9 @@ int main(int argc, char *argv[])
 
     std::thread isp_control(isp_control_loop);
 
+    std::thread recorder;
+    if (ctx.record_own_chn)
+        recorder = std::thread(record_loop, &ctx);
     std::thread preview;
     if (ctx.preview && !ctx.preview_luma)
         preview = std::thread(preview_loop, &ctx);
@@ -2644,8 +2795,19 @@ int main(int argc, char *argv[])
     g_stop = 1;
     if (preview.joinable())
         preview.join();
+    if (recorder.joinable())
+        recorder.join();
     stop_capture(ctx);
     stop_luma_rtsp(ctx);
+    // Every thread that can feed the muxer (colour preview, recorder, luma
+    // worker) has been joined, so it is safe to finalize the file now.
+    if (ctx.mp4)
+    {
+        const size_t frames = ctx.mp4->frames();
+        ctx.mp4->close();
+        fprintf(stderr, "[record] closed %s: %zu frames, %zu encode failures\n",
+                ctx.record_path.c_str(), frames, ctx.record_failures);
+    }
     if (isp_control.joinable())
         isp_control.join();
     teardown_camera(ctx);

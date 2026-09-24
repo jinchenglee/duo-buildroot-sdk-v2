@@ -17,6 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <iomanip>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,6 +36,7 @@ void usage(const char *argv0)
     printf("  --expand <f>      ROI expansion factor     (default 1.5)\n");
     printf("  --iou <f>         ROI IoU suppression      (default 0.5, <=0 disables)\n");
     printf("  --out <path>      write annotated image    (default tinytag_det.jpg)\n");
+    printf("  --bench-json <path> write decoded IDs, centers, scores, and exact corners as JSONL\n");
     printf("  --repeat <n>      inference runs, for timing (default 1)\n");
     printf("  --warmup <n>      untimed runs first       (default 2)\n");
     printf("  --max-mae <f>     self-test error gate     (default 0.05)\n");
@@ -241,6 +245,7 @@ int main(int argc, char **argv)
     float roi_expand = 1.5f;
     float roi_iou_thres = 0.5f;
     std::string output_path = "tinytag_det.jpg";
+    std::string bench_json_path;
     bool decode = false;
     bool decode_tolerant = false;
     int repeat = 1;
@@ -257,6 +262,7 @@ int main(int argc, char **argv)
         else if (flag == "--expand" && has_value) roi_expand = std::atof(argv[++i]);
         else if (flag == "--iou" && has_value)    roi_iou_thres = std::atof(argv[++i]);
         else if (flag == "--out" && has_value)    output_path = argv[++i];
+        else if (flag == "--bench-json" && has_value) bench_json_path = argv[++i];
         else if (flag == "--repeat" && has_value) repeat = std::atoi(argv[++i]);
         else if (flag == "--warmup" && has_value) warmup = std::atoi(argv[++i]);
         else if (flag == "--max-mae" && has_value) max_mae = std::atof(argv[++i]);
@@ -355,10 +361,35 @@ int main(int argc, char **argv)
         {
             printf("\n%zu tag(s) decoded from %zu crop(s)\n",
                    results.size(), detector.last_crop_count());
+            std::ofstream bench_json;
+            if (!bench_json_path.empty())
+            {
+                bench_json.open(bench_json_path, std::ios::out | std::ios::trunc);
+                if (!bench_json)
+                    throw std::runtime_error("could not open --bench-json output: " + bench_json_path);
+                bench_json << std::setprecision(9);
+            }
             for (size_t i = 0; i < results.size(); ++i)
+            {
+                const TinyTagResult &result = results[i];
                 printf("  [%zu] id %-4d  center (%.1f, %.1f)  proposal conf %.3f\n",
-                       i, results[i].id, results[i].center.x, results[i].center.y,
-                       results[i].proposal_confidence);
+                       i, result.id, result.center.x, result.center.y,
+                       result.proposal_confidence);
+                if (bench_json)
+                {
+                    bench_json << "{\"id\":" << result.id
+                               << ",\"center\":[" << result.center.x << "," << result.center.y
+                               << "],\"score\":" << result.proposal_confidence
+                               << ",\"corners\":[";
+                    for (int corner = 0; corner < 4; ++corner)
+                    {
+                        if (corner) bench_json << ",";
+                        bench_json << "[" << result.corners[corner].x << ","
+                                   << result.corners[corner].y << "]";
+                    }
+                    bench_json << "]}\n";
+                }
+            }
         }
 
         if (debug_mode > 0)
