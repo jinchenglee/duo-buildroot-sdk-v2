@@ -205,6 +205,57 @@ On the host, watch with `ffplay rtsp://192.168.42.1/h264`.
 /app/tinytag_detect/run_live.sh --input /root/rec_mono.mp4 --rtsp-luma
 ```
 
+Hardware lens correction is available in both live AprilTag detectors through
+the VPSS LDC block. Calibrate the lens and choose the correction parameters
+with [`tools/ldc_calibrate.py`](../../tools/ldc_calibrate.md), then pass the
+reported JSON file with `--ldc-calibration ldc-calibration.json` to `run_live.sh`.
+It is off unless a calibration file is supplied. The
+calibration tool can read image sets, recorded video, or the board's RTSP live
+preview; its fit RMS indicates how well Sophgo's single-ratio model describes
+the lens.
+
+With LDC enabled, VPSS stores the visible 1280x720 and 640x360 images in
+1280x768 and 640x384 surfaces. The extra bottom rows are padding, not part of
+the camera image. The live apps allocate VB blocks for the full stored sizes
+and additional blocks for GDC's temporary rotated surfaces. The TinyTag path
+accepts a model/full pair only when both the sensor frame counter and PTS
+match; a malformed GDC frame is discarded.
+
+The first start with a given LDC JSON and output size generates a GDC mesh and
+stores it beside the JSON as `.sg2000-ldc-*.mesh`. Later starts load that mesh;
+the two channels took about 13 s + 3.4 s to generate and 2 ms + 30 ms to load
+on this board. Changing the LDC values automatically selects a new cache key.
+If the cache directory is not writable, correction still works but generation
+repeats at each start. After an SDK/firmware change, remove these mesh files
+to force regeneration. Caching only improves startup, not per-frame throughput.
+
+On this Duo S, a 1920x1080 sensor run with RTSP luma preview and the v40c
+model measured about 31 fps without LDC and 14-15 fps with both corrected
+VPSS channels. A single corrected channel delivered about 31 fps in the
+capture-only test. The existing copied-input mode corrected only the
+1280x720 channel and resized/copied into the TPU input in about 1.7 ms;
+it measured about 31 fps with RTSP in this scene. To compare it on the board:
+
+```sh
+TINYTAG_LIVE_DIRECT_COMPACT_INPUT=0 ./run_live.sh --rtsp-luma \
+    --ldc-calibration /root/ldc-calibration.json
+```
+
+The direct 640x384 model channel remains the default. The copied mode uses
+the same corrected full-resolution frame for inference and crop decode, so
+there is no cross-channel pairing step. These figures depend on scene content
+and decoder crop load; use the per-second `[camera]` and `[crop-profile]`
+reports for your scene.
+
+The OV5647 720p60 mode uses a wider, binned sensor region than 1080p30. A
+calibration made from 1080p30 images is not valid for accurate 720p60 pose
+estimation, even if both feed a 1280x720 VPSS channel; calibrate the uncorrected
+720p60 stream separately. On this board, single-channel LDC on 720p60 gave
+about 31 corrected frames/s in `--capture-only` (versus about 60 without LDC),
+and roughly 13 detector frames/s with copied input and RTSP in the test scene.
+Avoid assuming that removing the VPSS downscale will make this path faster:
+the GDC correction still runs on each output frame.
+
 The hardware H.264 decoder (VDEC) is bound to the same VPSS group, device
 and channels that VI feeds live, so scaling, the model-input channel, the
 detector, crop-decode and the previews are all unchanged. Only the source

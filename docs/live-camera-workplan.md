@@ -725,103 +725,42 @@ baselines. Exact-luma remains the production preview; do not retire colour
 
 ---
 
-## 10. Hardware lens-distortion correction -- NOT STARTED, CALIBRATION FIRST
+## 10. Hardware lens-distortion correction -- IMPLEMENTED, OPT-IN; GEOMETRY/PERF GATES OPEN
 
-**Goal.** Correct OV5647/lens barrel or pincushion distortion in hardware before
-the proposal/decode split, without adding CPU remap work or breaking geometric
-agreement between the TPU image and full-resolution decode image. This is an
-accuracy/geometry task; keep it disabled unless calibrated images show a real
-benefit and latency/throughput gates pass.
+VPSS LDC is implemented in both live AprilTag apps and remains off unless a
+calibration JSON is supplied. The calibration utility, mesh persistence,
+aligned-frame handling, board deployment, and current handover are in
+[`docs/handover.md#hardware-ldc-current-state`](handover.md#hardware-ldc-current-state).
+The implementation uses the VPSS LDC API with the current
+VI-offline/VPSS-online topology.
 
-**Authoritative references.** Milk-V's
-[camera tuning page](https://milkv.io/docs/duo/camera/tuning) points to the
-SOPHGO ISP Development Reference, ISP Tuning Guide, PQ Tools, and
-`isp_tool_daemon`. SOPHGO documents hardware GDC/LDC for barrel and pincushion
-correction in the
-[LDC debugging guide](https://doc.sophgo.com/cvitek-develop-docs/master/docs_latest_release/CV180x_CV181x/en/01.software/MPI/LDC_Debugging_Guide/build/html/2_LDC_Function_and_Specification_Description.html).
+TinyTag applies LDC to the 1280x720 crop/detector channel and, in direct compact
+input mode, independently to the 640x360 TPU channel. Both outputs use
+resolution-specific meshes. GDC stores them in 1280x768 and 640x384 surfaces;
+the apps size their VB pools for these aligned outputs and intermediate GDC
+surfaces, honor valid-area offsets, and reject malformed frames.
 
-**Use VPSS LDC, not VI LDC, with the current topology.** The VI API reference
-states that VI-channel LDC does not support either `VI_ONLINE_VPSS_ONLINE` or
-`VI_OFFLINE_VPSS_ONLINE`; this application uses the latter by default. The
-[VPSS API](https://doc.sophgo.com/cvitek-develop-docs/master/docs_latest_release/CV180x_CV181x/en/01.software/MPI/Media_Processing_Software_Development_Reference/build/html/6_Video_Processing_Subsystem/API_Reference.html)
-provides `CVI_VPSS_SetChnLDCAttr()` after channel attributes are set and
-supports both output formats used here, YUV400 and NV21. Local headers expose
-`VPSS_LDC_ATTR_S`/`LDC_ATTR_S`: aspect/field-angle ratios, center offsets, and
-distortion ratio (-300..500).
+Frame identity remains a hard geometry invariant: TinyTag only combines model
+and full-resolution frames with the same sensor sequence and PTS. Under load,
+different channel readiness can cause candidate pairs to be discarded. Do not
+relax matching to pair unlike frames.
 
-**The two detector channels are one geometry contract.** Channel 1 proposes in
-640x360 while channel 0 crops/decodes in 1280x720. Applying LDC to only one
-channel, or applying resolution-inconsistent parameters, silently moves ROIs
-away from their tags. Exact-luma preview follows channel 0 automatically; an
-optional colour channel must use matching correction if it remains enabled.
+The board tests found a substantial throughput cost: 1080p/30 with both LDC
+channels and luma RTSP measured about 14-15 fps, versus about 31 fps with one
+corrected full channel and copied/resized TPU input. On 720p/60, LDC capture
+alone delivered about 31 fps versus about 63 fps without correction. The GDC
+proc counter showed roughly 16.6 ms whole-job time and 4.2 ms measured task
+execution for a 1280x720 correction. See the handover for counter semantics,
+exact test conditions, mesh paths, calibration identity, and deployed binary
+hashes. Mesh caching removes multi-second startup generation; it does not
+reduce per-frame work.
 
-The preferred geometry is a single corrected image followed by the existing
-scale split:
-
-    sensor/ISP -> one corrected 1280x720 image
-                         |-> channel 0: crop/decode and luma preview
-                         `-> 640x360 model input
-
-That arrangement makes the model image a true downscale of the image used for
-crop decoding. The current implementation does not have that guarantee: it
-configures 1280x720 channel 0 and 640x360 channel 1 as independent VPSS
-outputs. Even if both channels receive the same nominal LDC calibration,
-independent output-size-specific mesh generation, coordinate grids,
-interpolation, center/FOV handling, and edge behavior can make them different
-resamplings of the sensor image. “Same calibration parameters” is therefore
-not the same claim as “channel 1 is channel 0 scaled down.”
-
-Do not implement or enable LDC before lens calibration exists. The first
-follow-up is measurement only. If calibration shows a benefit, use corrected
-channel 0 resized in software as the correctness reference, then compare the
-independently corrected 640x360 VPSS output against it. The direct 640x360
-path may be retained only if the comparison proves that proposals and
-proposal-to-crop geometry remain valid; otherwise use the reference resize or
-move correction upstream/shared. The current VI_OFFLINE_VPSS_ONLINE topology
-does not make VI-channel LDC an assumed upstream solution, so changing the
-topology is a separate design decision, not part of the first LDC patch.
-
-**Plan.**
-
-1. **Calibration and baseline only; no code change.** Capture a calibration
-   grid/checkerboard across the full field and quantify
-   baseline reprojection/line-curvature error. Preserve the raw frame and
-   lens/module identity; LDC parameters are lens-specific.
-2. Use Milk-V's PQ Tools/`isp_tool_daemon` workflow and the SOPHGO LDC guide to
-   derive distortion ratio, optical-center offsets, and FOV ratios. Do not tune
-   by visual preference alone.
-3. Only after calibration, add an opt-in `TINYTAG_LIVE_LDC=1` path that calls
-   `CVI_VPSS_SetChnLDCAttr()` after `CVI_VPSS_SetChnAttr()` and before enabling
-   each affected channel. Log read-back attributes and fail closed if either
-   detector channel rejects them. Default remains off until all gates pass.
-4. Treat corrected channel 0 plus a CPU resize/copy as the reference path.
-   Compare independently corrected channel 1 on the same `u32TimeRef`. Exact
-   pixels are not required, but compare tensor outputs, proposal peaks/order/
-   ROIs, decoded IDs, and a tag-position sweep across center, edges, and
-   corners. Never decode corrected proposals against uncorrected pixels.
-   If the geometry cannot be matched, reject independent per-channel LDC and
-   either retain the reference resize or investigate a shared/upstream
-   correction path.
-5. Measure corrected grid error, retained FOV, px-per-tag-module, edge/corner
-   recall, false positives, and crop area. LDC may straighten edges while
-   shrinking/cropping the usable image or softening resampled tag borders.
-6. Run the no-RTSP/colour/luma benchmark with LDC off and on. Gate on detector
-   fps, process CPU, acquisition/result-age tails, sequence freshness, pairing
-   mismatches, VPSS block ownership, and preview behavior. Confirm work is in
-   GDC/VPSS hardware rather than a hidden CPU remap.
-7. Test LDC together with mirror/flip and document operation order. Revalidate
-   saved-frame orientation because optical-center offsets and mirrored
-   coordinates must use the same convention.
-8. Promote calibrated parameters only after reproducible geometry/recall gain
-   with no material detector latency or throughput regression. Store them with
-   the exact sensor mode and lens identity; 720p60 needs separate validation
-   because its crop/binning/FOV changes the calibration.
-
-**Acceptance gates.** Quantified grid error improves; channel pairing remains
-zero-mismatch; proposal-to-crop geometry remains valid across the full image;
-tag recall does not regress; detector fps/freshness and result-age tails remain
-within measurement noise; and disabling LDC restores the current bit-for-bit
-path.
+**Still open before promotion.** Validate corrected grid residuals and
+AprilTag corner/pose error across the image. The current calibration is specific
+to the 1080p/30 recording and is not valid for pose work in the wider, binned
+720p/60 sensor mode. Benchmark GDC queue/task costs and decide whether its
+throughput is acceptable. Keep LDC opt-in until geometry and performance gains
+are accepted. Preserve exact sequence+PTS pairing throughout any optimization.
 
 ---
 
@@ -830,8 +769,8 @@ path.
 **Priority: low.** This needs continued sensor-driver validation against an NDA datasheet.
 Sections 3-9 address correctness and remove more immediate latency/throughput
 bottlenecks without changing the sensor. The mode is being brought up
-independently of LDC; LDC remains calibration-gated and is not part of this
-change.
+independently of LDC. Hardware LDC is now implemented as an opt-in path, but
+the mode still needs its own calibration and remains performance-gated.
 
 **Why it is still worth doing eventually.** The detector channel is exactly
 1280x720. Capturing natively at that

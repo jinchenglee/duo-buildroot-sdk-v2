@@ -60,6 +60,7 @@ bakes it into the image.
 run_aruco_nano.sh                                   # strict, mirror=1, camera feed
 run_aruco_nano.sh --mode tolerant                   # accept marginal tags
 run_aruco_nano.sh --max-exposure-us 10000           # cap AE shutter for fixed fps
+run_aruco_nano.sh --ldc-calibration /root/ldc-calibration.json  # hardware lens correction
 ARUCO_NANO_LIVE_OV5647_720P60=1 run_aruco_nano.sh   # opt-in 720p60
 ```
 
@@ -68,6 +69,7 @@ Or call the binary directly:
 ```
 aruco_nano [--mode strict|tolerant] [--mirror 0|1] [--flip 0|1]
            [--max-exposure-us N] [--save-frame frame.png]
+           [--ldc-calibration FILE.json]
            [--tag-output 0|1] [--rtsp|--rtsp-luma|--no-rtsp]
            [--quiet] [--debug n]
 ```
@@ -86,6 +88,18 @@ aruco_nano [--mode strict|tolerant] [--mirror 0|1] [--flip 0|1]
 `strict` matches the K230/tinytag production setting
 (`errorCorrectionRate` and `maxErroneousBitsInBorderRate` both 0.0). `tolerant`
 raises both to 1.0: more marginal tags, more false positives, slower.
+
+LDC uses a 1280x768 aligned VPSS surface for a visible 1280x720 image.
+Detection and `--rtsp-luma` use only the valid 720 rows; the bottom 48 rows
+are hardware padding. The VB pool includes the full surface and space for
+GDC's temporary rotation buffer.
+
+The first LDC start stores a GDC mesh beside the calibration JSON as
+`.sg2000-ldc-*.mesh`; later starts load it in milliseconds. The cache is shared
+with TinyTag when the output size and LDC parameters match. Changing those
+parameters selects a new cache file. Remove mesh files after an SDK/firmware
+change to regenerate them. Mesh reuse reduces startup time, not the per-frame
+cost of hardware correction.
 
 ## Comparison with tinytag
 

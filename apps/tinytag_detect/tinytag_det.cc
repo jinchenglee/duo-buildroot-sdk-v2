@@ -427,6 +427,7 @@ void TinyTagDet::detect_physical(uint64_t luma_paddr, cv::Size full_frame_size,
 void TinyTagDet::detect_compact_physical(uint64_t luma_paddr, cv::Size input_frame_size,
                                          size_t input_stride, size_t input_length,
                                          const uint8_t *validation_copy,
+                                         int input_crop_y,
                                          cv::Size full_frame_size,
                                          std::vector<Proposal> &proposals)
 {
@@ -438,14 +439,16 @@ void TinyTagDet::detect_compact_physical(uint64_t luma_paddr, cv::Size input_fra
     if (input_->fmt != CVI_FMT_UINT8 || input_->pixel_format != CVI_NN_PIXEL_GRAYSCALE)
         throw std::runtime_error(
             "compact physical input requires a fused uint8 GRAYSCALE model tensor");
-    if (input_frame_size.width != input_w_ || input_frame_size.height != input_h_)
-        throw std::runtime_error("compact physical frame dimensions do not match the model input");
+    if (input_frame_size.width != input_w_ || input_crop_y < 0 ||
+        input_crop_y + input_h_ > input_frame_size.height)
+        throw std::runtime_error("compact physical crop is outside the VPSS frame");
 
     const size_t dense_size = static_cast<size_t>(input_w_) * input_h_;
-    if (input_stride != static_cast<size_t>(input_w_) || input_length < dense_size ||
+    if (input_stride != static_cast<size_t>(input_w_) ||
+        input_length < input_stride * static_cast<size_t>(input_frame_size.height) ||
         input_->mem_size != dense_size)
         throw std::runtime_error(
-            "compact physical frame is not byte-for-byte the dense model tensor");
+            "compact physical crop is not a dense model tensor plane");
 
     std::vector<float> copied_output;
     if (validation_copy != nullptr)
@@ -459,7 +462,9 @@ void TinyTagDet::detect_compact_physical(uint64_t luma_paddr, cv::Size input_fra
     }
 
     const double started = now_ms();
-    const CVI_RC ret = CVI_NN_SetTensorPhysicalAddr(input_, luma_paddr);
+    const uint64_t crop_paddr = luma_paddr +
+                                static_cast<uint64_t>(input_crop_y) * input_stride;
+    const CVI_RC ret = CVI_NN_SetTensorPhysicalAddr(input_, crop_paddr);
     if (ret != CVI_RC_SUCCESS)
         throw std::runtime_error("CVI_NN_SetTensorPhysicalAddr failed (err " +
                                  std::to_string(ret) + ")");

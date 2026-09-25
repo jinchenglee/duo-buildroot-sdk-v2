@@ -90,6 +90,7 @@ public:
     void detect_compact_physical(uint64_t luma_paddr, cv::Size input_frame_size,
                                  size_t input_stride, size_t input_length,
                                  const uint8_t *validation_copy,
+                                 int input_crop_y,
                                  cv::Size full_frame_size,
                                  std::vector<Proposal> &proposals);
     bool uses_aligned_input() const { return input_->aligned; }

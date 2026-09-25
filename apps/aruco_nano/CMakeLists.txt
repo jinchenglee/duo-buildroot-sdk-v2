@@ -53,6 +53,7 @@ if(NOT DEFINED CVI_RTSP_ROOT)
   message(FATAL_ERROR "Set CVI_RTSP_ROOT to the cvi_rtsp directory (see build.sh)")
 endif()
 include_directories(${CVI_RTSP_ROOT}/include/cvi_rtsp)
+include_directories(${CVI_RTSP_ROOT}/service/3rdparty/nlohmann_json/include)
 
 # ArUco Nano plus the single OpenCV 4.10 translation unit that provides
 # cv::aruco::Dictionary. Compiling that TU standalone avoids pulling in the
@@ -65,6 +66,7 @@ include_directories(
 
 add_executable(aruco_nano
     main.cc
+    ../common/ldc_config.cc
     tag_crop_decoder.cc
     third_party/opencv_aruco_dict/aruco_dictionary.cpp
     ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_sys.c

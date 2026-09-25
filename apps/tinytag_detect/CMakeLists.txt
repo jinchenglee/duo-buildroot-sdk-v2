@@ -79,9 +79,11 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
     message(FATAL_ERROR "Set CVI_RTSP_ROOT to the cvi_rtsp directory (see build.sh)")
   endif()
   include_directories(${CVI_RTSP_ROOT}/include/cvi_rtsp)
+  include_directories(${CVI_RTSP_ROOT}/service/3rdparty/nlohmann_json/include)
 
   add_executable(tinytag_detect_live
       live_camera.cc
+      ../common/ldc_config.cc
       tinytag_det.cc
       tag_crop_decoder.cc
       third_party/opencv_aruco_dict/aruco_dictionary.cpp

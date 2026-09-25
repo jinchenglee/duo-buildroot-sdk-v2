@@ -34,6 +34,7 @@
 
 #include "mp4_reader.h"
 #include "mp4_writer.h"
+#include "../common/ldc_config.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
 
@@ -377,6 +378,7 @@ void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
             "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png]\n"
+            "       [--save-ldc-pair prefix]\n"
             "       [--save-native-frame frame.png] [--rtsp|--no-rtsp]\n"
             "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
@@ -386,6 +388,7 @@ void usage(const char *argv0)
             "              ZERO tags (AprilTag markers are chiral) while proposals still\n"
             "              look correct. Applied in VI hardware: no per-frame cost.\n"
             "  --flip 1    same, vertically.\n"
+            "  --ldc-calibration FILE.json  apply calibrated VPSS lens correction (default off).\n"
             "  --crop-align N  widen each decode crop horizontally to a multiple of N\n"
             "              pixels (default 4, so every crop row starts 4-byte aligned\n"
             "              and is a whole number of 32-bit words). 0 or 1 disables.\n"
@@ -670,6 +673,7 @@ struct CameraContext
     // cv::flip would cost a full pass over the ~900 KB luma plane every frame.
     bool mirror = false;
     bool flip = false;
+    AppLdcConfig ldc;
     CaptureSlot capture;
     std::thread capture_worker;
     CaptureSlot model_capture;
@@ -1086,15 +1090,25 @@ bool setup_camera(CameraContext &ctx)
         ctx.width, ctx.height, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
     vb_config.astCommPool[0].u32BlkCnt = 5;
 
+    // VPSS/GDC writes 64-pixel-aligned surfaces when LDC is enabled, even
+    // though the requested visible channel size stays 1280x720 / 640x360.
+    // Pool storage must cover that full surface, including its tail rows.
+    const CVI_U32 det_storage_width = ctx.ldc.enabled ? ALIGN(kDetWidth, 64) : kDetWidth;
+    const CVI_U32 det_storage_height = ctx.ldc.enabled ? ALIGN(kDetHeight, 64) : kDetHeight;
     vb_config.astCommPool[kDetPool].u32BlkSize = COMMON_GetPicBufferSize(
-        kDetWidth, kDetHeight, PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-    vb_config.astCommPool[kDetPool].u32BlkCnt = 5;
+        det_storage_width, det_storage_height, PIXEL_FORMAT_YUV_400,
+        DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+    // Each active LDC channel borrows a second same-size VB block as a
+    // temporary rotated GDC surface. Leave headroom for queued output and
+    // RTSP's borrowed luma frames as well.
+    vb_config.astCommPool[kDetPool].u32BlkCnt = ctx.ldc.enabled ? 12 : 5;
 
     if (ctx.direct_model_input)
     {
         vb_config.astCommPool[kModelPool].u32BlkSize = COMMON_GetPicBufferSize(
-            640, 360, PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-        vb_config.astCommPool[kModelPool].u32BlkCnt = 5;
+            640, ctx.ldc.enabled ? ALIGN(360, 64) : 360,
+            PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+        vb_config.astCommPool[kModelPool].u32BlkCnt = ctx.ldc.enabled ? 10 : 5;
     }
 
     if ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn)
@@ -1191,6 +1205,9 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kVpssChn, &vpss_chn_attr);
     if (vpss_ret == CVI_SUCCESS)
         vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kVpssChn);
+    if (vpss_ret == CVI_SUCCESS && ctx.ldc.enabled &&
+        !apply_app_ldc(kVpssGrp, kVpssChn, kDetWidth, kDetHeight, ctx.ldc))
+        vpss_ret = CVI_FAILURE;
     if (vpss_ret == CVI_SUCCESS && ctx.direct_model_input)
     {
         VPSS_CHN_ATTR_S model_attr{};
@@ -1198,6 +1215,9 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kModelChn, &model_attr);
         if (vpss_ret == CVI_SUCCESS)
             vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kModelChn);
+        if (vpss_ret == CVI_SUCCESS && ctx.ldc.enabled &&
+            !apply_app_ldc(kVpssGrp, kModelChn, 640, 360, ctx.ldc))
+            vpss_ret = CVI_FAILURE;
     }
     if (vpss_ret == CVI_SUCCESS && !ctx.save_native_frame_path.empty())
     {
@@ -1381,13 +1401,43 @@ void draw_label(cv::Mat &y, const std::string &text, cv::Point org, double scale
 // Pulls one VPSS output as fast as it produces frames and keeps only the
 // newest. Direct-input mode runs this independently for channels 0 and 1, so
 // full-resolution capture proceeds while synchronous TPU inference is active.
-void capture_loop(VPSS_CHN channel, CaptureSlot *slot)
+void capture_loop(VPSS_CHN channel, CaptureSlot *slot,
+                  CVI_U32 expected_width, CVI_U32 expected_height)
 {
+    const bool trace_frames = std::getenv("TINYTAG_TRACE_FRAMES") != nullptr;
+    size_t trace_count = 0;
+    size_t rejected_count = 0;
     while (!g_stop)
     {
         VIDEO_FRAME_INFO_S frame{};
         if (CVI_VPSS_GetChnFrame(kVpssGrp, channel, &frame, 1000) != CVI_SUCCESS)
             continue;
+
+        if (trace_frames && (++trace_count <= 60 || trace_count % 60 == 0))
+            fprintf(stderr, "[frame-trace] ch=%d n=%zu seq=%u pts=%llu phy=%llx size=%ux%u len=%u pool=%u\n",
+                    channel, trace_count, frame.stVFrame.u32TimeRef,
+                    (unsigned long long)frame.stVFrame.u64PTS,
+                    (unsigned long long)frame.stVFrame.u64PhyAddr[0],
+                    frame.stVFrame.u32Width, frame.stVFrame.u32Height,
+                    frame.stVFrame.u32Length[0], frame.u32PoolId);
+
+        // A failed GDC job can expose its intermediate rotated surface or a
+        // buffer whose frame metadata has been cleared. Neither is a camera
+        // frame suitable for inference, matching, cropping, or RTSP.
+        if (frame.stVFrame.u64PTS == 0 ||
+            frame.stVFrame.u32Width != expected_width ||
+            frame.stVFrame.u32Height != expected_height)
+        {
+            if (++rejected_count <= 5 || rejected_count % 60 == 0)
+                fprintf(stderr,
+                        "[camera] discarding invalid VPSS ch%d frame: seq=%u pts=%llu size=%ux%u (rejected %zu)\n",
+                        channel, frame.stVFrame.u32TimeRef,
+                        (unsigned long long)frame.stVFrame.u64PTS,
+                        frame.stVFrame.u32Width, frame.stVFrame.u32Height,
+                        rejected_count);
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, channel, &frame);
+            continue;
+        }
 
         VIDEO_FRAME_INFO_S superseded{};
         bool release_superseded = false;
@@ -2360,6 +2410,7 @@ int main(int argc, char *argv[])
     int max_proposals = 8, debug_mode = 1;
     bool decode = false, decode_tolerant = false;
     std::string save_frame_path;
+    std::string save_ldc_pair_prefix;
     std::string save_native_frame_path;
     bool rtsp = false, rtsp_luma = false;
     std::string record_path;
@@ -2374,6 +2425,7 @@ int main(int argc, char *argv[])
     bool direct_compact_input = false;
     bool validate_compact_input = false;
     int crop_align = 4;
+    std::string ldc_calibration_path;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -2385,8 +2437,10 @@ int main(int argc, char *argv[])
         else if (flag == "--iou" && has_value) roi_iou_thres = std::atof(argv[++i]);
         else if (flag == "--debug" && has_value) debug_mode = std::atoi(argv[++i]);
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
+        else if (flag == "--save-ldc-pair" && has_value) save_ldc_pair_prefix = argv[++i];
         else if (flag == "--save-native-frame" && has_value) save_native_frame_path = argv[++i];
         else if (flag == "--crop-align" && has_value) crop_align = std::atoi(argv[++i]);
+        else if (flag == "--ldc-calibration" && has_value) ldc_calibration_path = argv[++i];
         else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
         else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
         else if (flag == "--tag-output" && has_value) tag_output = std::atoi(argv[++i]) != 0;
@@ -2483,10 +2537,27 @@ int main(int argc, char *argv[])
     ctx.save_native_frame_path = save_native_frame_path;
     ctx.mirror = mirror;
     ctx.flip = flip;
+    if (!ldc_calibration_path.empty())
+    {
+        std::string error;
+        if (!load_app_ldc_config(ldc_calibration_path, ctx.ldc, error))
+        {
+            fprintf(stderr, "[ldc] %s\n", error.c_str());
+            return 1;
+        }
+    }
     ctx.compact_direct_input = direct_compact_input && !detector.uses_aligned_input();
     ctx.validate_compact_input = validate_compact_input && ctx.compact_direct_input;
     ctx.direct_model_input = !capture_only &&
                              (detector.uses_aligned_input() || ctx.compact_direct_input);
+    if (!save_ldc_pair_prefix.empty() && (!ctx.ldc.enabled || !ctx.compact_direct_input))
+    {
+        fprintf(stderr, "[ldc] --save-ldc-pair requires LDC and compact direct model input\n");
+        return 1;
+    }
+    if (ctx.ldc.enabled && ctx.compact_direct_input)
+        fprintf(stderr,
+                "[ldc] compact path active: use top 360 rows of 640x384 GDC-aligned output\n");
     if (const char *online = std::getenv("TINYTAG_LIVE_VI_ONLINE"))
         ctx.vi_online = std::atoi(online) != 0;
     if (const char *delay = std::getenv("TINYTAG_LIVE_PREVIEW_DELAY_MS"))
@@ -2558,9 +2629,11 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[camera] preview worker stress delay: %u ms\n", ctx.preview_delay_ms);
     }
 
-    ctx.capture_worker = std::thread(capture_loop, kVpssChn, &ctx.capture);
+    ctx.capture_worker = std::thread(capture_loop, kVpssChn, &ctx.capture,
+                                     kDetWidth, ctx.ldc.enabled ? ALIGN(kDetHeight, 64) : kDetHeight);
     if (ctx.direct_model_input)
-        ctx.model_capture_worker = std::thread(capture_loop, kModelChn, &ctx.model_capture);
+        ctx.model_capture_worker = std::thread(capture_loop, kModelChn, &ctx.model_capture,
+                                               640, ctx.ldc.enabled ? ALIGN(360, 64) : 360);
 
     // Interactive ISP control only makes sense for the live sensor.
     std::thread isp_control;
@@ -2633,11 +2706,15 @@ int main(int argc, char *argv[])
                                           : "CPU resize/copy to 640x360"));
 
     bool logged_first_frame = false;
+    bool logged_ldc_model_tail = false;
+    bool logged_ldc_detector_tail = false;
     int frames_seen = 0;
     size_t total_frames = 0;
     size_t stale_prev = 0;
     size_t pair_mismatch_prev = 0;
     bool compact_needs_validation = ctx.validate_compact_input;
+    unsigned ldc_pair_model_frames = 0;
+    bool ldc_pair_saved = false;
     LumaRtspStats preview_prev;
     while (!g_stop)
     {
@@ -2645,6 +2722,7 @@ int main(int argc, char *argv[])
         VIDEO_FRAME_INFO_S model_frame{};
         double model_ready_ms = 0.0;
         double full_ready_ms = 0.0;
+        bool save_ldc_pair_this_frame = false;
         const double t_wait = now_ms();
         // Direct mode is driven by the newest small model frame. The larger
         // full-resolution channel is deliberately not awaited here: its
@@ -2653,6 +2731,9 @@ int main(int argc, char *argv[])
         {
             if (!take_latest_frame(ctx.model_capture, model_frame, &model_ready_ms))
                 break;
+            if (!save_ldc_pair_prefix.empty() && !ldc_pair_saved)
+                save_ldc_pair_this_frame =
+                    ++ldc_pair_model_frames >= static_cast<unsigned>(kSaveFrameIndex);
         }
         else if (!take_latest_frame(ctx.capture, frame))
         {
@@ -2666,8 +2747,16 @@ int main(int argc, char *argv[])
         {
             const VIDEO_FRAME_S &mf = model_frame.stVFrame;
             const cv::Size expected = detector.input_size();
+            const int active_width = static_cast<int>(mf.u32Width) -
+                                     mf.s16OffsetLeft - mf.s16OffsetRight;
+            const int active_height = static_cast<int>(mf.u32Height) -
+                                      mf.s16OffsetTop - mf.s16OffsetBottom;
+            const bool has_ldc_tail = ctx.ldc.enabled && ctx.compact_direct_input &&
+                                      mf.u32Height > static_cast<CVI_U32>(expected.height);
             if (mf.u32Width != static_cast<CVI_U32>(expected.width) ||
-                mf.u32Height != static_cast<CVI_U32>(expected.height) ||
+                active_width != expected.width || active_height != expected.height ||
+                mf.s16OffsetTop < 0 || mf.s16OffsetBottom < 0 ||
+                mf.s16OffsetLeft != 0 || mf.s16OffsetRight != 0 ||
                 mf.u32Stride[0] != static_cast<CVI_U32>(expected.width) ||
                 mf.u32Length[0] < mf.u32Stride[0] * mf.u32Height ||
                 mf.enPixelFormat != PIXEL_FORMAT_YUV_400)
@@ -2680,6 +2769,14 @@ int main(int argc, char *argv[])
                 CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 break;
             }
+            if (has_ldc_tail && !logged_ldc_model_tail)
+            {
+                fprintf(stderr,
+                        "[ldc] model frame %ux%u valid area x=%d y=%d size=%dx%d\n",
+                        mf.u32Width, mf.u32Height, mf.s16OffsetLeft, mf.s16OffsetTop,
+                        expected.width, expected.height);
+                logged_ldc_model_tail = true;
+            }
             model_info = mf;
         }
 
@@ -2688,6 +2785,7 @@ int main(int argc, char *argv[])
         const VIDEO_FRAME_S &timing_frame =
             ctx.direct_model_input ? model_frame.stVFrame : frame.stVFrame;
         const CVI_U32 seq = timing_frame.u32TimeRef;
+        const CVI_U64 capture_pts = timing_frame.u64PTS;
         if (have_prev_seq)
         {
             const unsigned gap = static_cast<unsigned>(seq - prev_seq);
@@ -2700,9 +2798,9 @@ int main(int argc, char *argv[])
         have_prev_seq = true;
 
         double acquisition_age_ms = -1.0;
-        if (timing_frame.u64PTS != 0)
+        if (capture_pts != 0)
         {
-            const double age_ms = t_got - static_cast<double>(timing_frame.u64PTS) / 1000.0;
+            const double age_ms = t_got - static_cast<double>(capture_pts) / 1000.0;
             if (age_ms >= 0.0 && age_ms < 10000.0)
             {
                 acquisition_age_ms = age_ms;
@@ -2736,7 +2834,7 @@ int main(int argc, char *argv[])
                         cv::Size(model_frame.stVFrame.u32Width,
                                  model_frame.stVFrame.u32Height),
                         model_frame.stVFrame.u32Stride[0], model_frame.stVFrame.u32Length[0],
-                        compact_validation_copy,
+                        compact_validation_copy, model_frame.stVFrame.s16OffsetTop,
                         cv::Size(kDetWidth, kDetHeight), proposals);
                 else
                     detector.detect_physical(model_frame.stVFrame.u64PhyAddr[0],
@@ -2756,12 +2854,60 @@ int main(int argc, char *argv[])
                 CVI_SYS_Munmap(compact_validation_copy, model_frame.stVFrame.u32Length[0]);
                 compact_needs_validation = false;
             }
-            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
-            model_frame = VIDEO_FRAME_INFO_S{};
+            if (!save_ldc_pair_this_frame)
+            {
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                model_frame = VIDEO_FRAME_INFO_S{};
+            }
 
             const double pair_started = now_ms();
             if (!take_matching_full_frame(ctx, seq, frame, full_ready_ms))
+            {
+                if (save_ldc_pair_this_frame)
+                {
+                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                    model_frame = VIDEO_FRAME_INFO_S{};
+                }
                 continue;
+            }
+            if (frame.stVFrame.u64PTS != capture_pts)
+            {
+                fprintf(stderr,
+                        "[model-input] seq=%u has inconsistent capture PTS: model=%llu full=%llu\n",
+                        seq, (unsigned long long)capture_pts,
+                        (unsigned long long)frame.stVFrame.u64PTS);
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+                if (save_ldc_pair_this_frame)
+                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                ctx.pair_mismatches.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (save_ldc_pair_this_frame)
+            {
+                const VIDEO_FRAME_S &mf = model_frame.stVFrame;
+                const CVI_U32 model_len = mf.u32Length[0] ? mf.u32Length[0]
+                                                           : mf.u32Stride[0] * mf.u32Height;
+                uint8_t *model_pixels = static_cast<uint8_t *>(
+                    CVI_SYS_MmapCache(mf.u64PhyAddr[0], model_len));
+                const std::string model_path = save_ldc_pair_prefix + "-640x384.png";
+                bool model_saved = false;
+                if (model_pixels != nullptr)
+                {
+                    cv::Mat model_image(mf.u32Height, mf.u32Width, CV_8UC1,
+                                        model_pixels, mf.u32Stride[0]);
+                    model_saved = cv::imwrite(model_path, model_image);
+                    CVI_SYS_Munmap(model_pixels, model_len);
+                }
+                fprintf(stderr,
+                        "[ldc-pair] model seq=%u %ux%u stride=%u offsets T/B/L/R=%d/%d/%d/%d: %s %s\n",
+                        mf.u32TimeRef, mf.u32Width, mf.u32Height, mf.u32Stride[0],
+                        mf.s16OffsetTop, mf.s16OffsetBottom, mf.s16OffsetLeft,
+                        mf.s16OffsetRight, model_saved ? "saved" : "SAVE FAILED",
+                        model_path.c_str());
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                model_frame = VIDEO_FRAME_INFO_S{};
+                ldc_pair_saved = model_saved;
+            }
             pair_wait_ms = now_ms() - pair_started;
             const double ready_delta_ms = full_ready_ms - model_ready_ms;
             win.ready_delta_sum += ready_delta_ms;
@@ -2799,14 +2945,63 @@ int main(int argc, char *argv[])
         }
         const double t_mapped = now_ms();
 
-        // Wrap the mapped plane without copying. u32Stride may exceed width
-        // (alignment padding), so the Mat uses the real stride.
-        cv::Mat gray(vf.u32Height, vf.u32Width, CV_8UC1, luma, vf.u32Stride[0]);
+        if (save_ldc_pair_this_frame && ldc_pair_saved)
+        {
+            const std::string detector_path = save_ldc_pair_prefix + "-1280x768.png";
+            cv::Mat detector_image(vf.u32Height, vf.u32Width, CV_8UC1,
+                                   luma, vf.u32Stride[0]);
+            const bool detector_saved = cv::imwrite(detector_path, detector_image);
+            fprintf(stderr,
+                    "[ldc-pair] detector seq=%u %ux%u stride=%u offsets T/B/L/R=%d/%d/%d/%d: %s %s\n",
+                    vf.u32TimeRef, vf.u32Width, vf.u32Height, vf.u32Stride[0],
+                    vf.s16OffsetTop, vf.s16OffsetBottom, vf.s16OffsetLeft,
+                    vf.s16OffsetRight, detector_saved ? "saved" : "SAVE FAILED",
+                    detector_path.c_str());
+            g_stop = 1;
+        }
+
+        // VIDEO_FRAME_S carries the valid display rectangle in its offset
+        // fields. GDC-aligned LDC outputs use bottom offsets for invalid tail
+        // rows (24 on the 640x360 channel, 48 on 1280x720); honor the frame
+        // metadata rather than inferring a crop from an aligned height.
+        const int visible_x = vf.s16OffsetLeft;
+        const int visible_y = vf.s16OffsetTop;
+        const int visible_width = static_cast<int>(vf.u32Width) -
+                                  vf.s16OffsetLeft - vf.s16OffsetRight;
+        const int visible_height = static_cast<int>(vf.u32Height) -
+                                   vf.s16OffsetTop - vf.s16OffsetBottom;
+        if (visible_x < 0 || visible_y < 0 || visible_width <= 0 || visible_height <= 0 ||
+            visible_x + visible_width > static_cast<int>(vf.u32Width) ||
+            visible_y + visible_height > static_cast<int>(vf.u32Height))
+        {
+            fprintf(stderr, "[camera] invalid VPSS valid-area offsets T/B/L/R=%d/%d/%d/%d\n",
+                    vf.s16OffsetTop, vf.s16OffsetBottom,
+                    vf.s16OffsetLeft, vf.s16OffsetRight);
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            continue;
+        }
+        if (ctx.ldc.enabled && (visible_height != static_cast<int>(vf.u32Height) ||
+                                visible_width != static_cast<int>(vf.u32Width)) &&
+            !logged_ldc_detector_tail)
+        {
+            fprintf(stderr,
+                    "[ldc] detector valid area x=%d y=%d size=%dx%d; raw frame %ux%u\n",
+                    visible_x, visible_y, visible_width, visible_height,
+                    vf.u32Width, vf.u32Height);
+            logged_ldc_detector_tail = true;
+        }
+        const CVI_U64 visible_y_paddr = vf.u64PhyAddr[0] +
+                                        static_cast<CVI_U64>(visible_y) * vf.u32Stride[0] +
+                                        visible_x;
+        uint8_t *visible_luma = luma + static_cast<size_t>(visible_y) * vf.u32Stride[0] +
+                                visible_x;
+        cv::Mat gray(visible_height, visible_width, CV_8UC1,
+                     visible_luma, vf.u32Stride[0]);
 
         if (!logged_first_frame)
         {
-            // If u64PTS is non-zero the kernel populates it and true frame age
-            // could be measured directly; nothing in this tree sets it.
+            // VPSS carries the sensor-frame PTS through both LDC channels;
+            // it is also used to reject a sequence match with different PTS.
             fprintf(stderr, "[camera] first frame: timeRef=%u pts=%llu\n", vf.u32TimeRef,
                     (unsigned long long)vf.u64PTS);
             fprintf(stderr, "[camera] first frame: %ux%u stride=%u len=%u fmt=%d\n", vf.u32Width,
@@ -2858,10 +3053,17 @@ int main(int argc, char *argv[])
             {
                 rtsp_frame = frame;
                 VIDEO_FRAME_S &rf = rtsp_frame.stVFrame;
+                // Hand VENC a self-consistent cropped Y plane and NV21 frame:
+                // dimensions, base address, length, and offsets all describe
+                // the same valid rectangle.
+                rf.u32Width = static_cast<CVI_U32>(visible_width);
+                rf.u32Height = visible_height;
+                rf.u64PhyAddr[0] = visible_y_paddr;
+                rf.u32Length[0] = rf.u32Stride[0] * static_cast<CVI_U32>(visible_height);
+                rf.s16OffsetTop = rf.s16OffsetBottom = 0;
+                rf.s16OffsetLeft = rf.s16OffsetRight = 0;
                 rf.enPixelFormat = PIXEL_FORMAT_NV21;
-                // Keep the exact detector plane and its existing mapping.
-                // Ownership moves to the preview item after enqueue.
-                rf.pu8VirAddr[0] = luma;
+                rf.pu8VirAddr[0] = visible_luma;
                 rf.u32Stride[1] = surface->c_stride;
                 rf.u32Length[1] = surface->c_len;
                 rf.u64PhyAddr[1] = surface->c_phy;
@@ -2880,7 +3082,8 @@ int main(int argc, char *argv[])
             // cached mapping remains valid until application teardown.
             const bool preview_queued = enqueue_luma_rtsp(
                 ctx, rtsp_frame, surface, proposals, results, detector.last_crop_rects(),
-                overlay_fps, overlay_busy_ms, frame, luma, map_len);
+                overlay_fps, overlay_busy_ms, frame, visible_luma,
+                vf.u32Stride[0] * static_cast<CVI_U32>(visible_height));
             if (!preview_queued)
             {
                 CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);

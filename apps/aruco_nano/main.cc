@@ -25,6 +25,7 @@
 //     to zero; the network would still "see" them but nothing matches.
 
 #include "tag_crop_decoder.h"
+#include "../common/ldc_config.h"
 
 extern "C" {
 #include <core/utils/vpss_helper.h>
@@ -237,6 +238,7 @@ struct CameraContext
     unsigned preview_delay_ms = 0;
     bool mirror = false;
     bool flip = false;
+    AppLdcConfig ldc;
     CaptureSlot capture;
     std::thread capture_worker;
     std::vector<CachedLumaMapping> luma_mappings;
@@ -305,6 +307,7 @@ void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s [--mode strict|tolerant] [--debug n] [--mirror 0|1]\n"
             "       [--flip 0|1] [--max-exposure-us N] [--save-frame frame.png]\n"
+            "       [--ldc-calibration FILE.json]\n"
             "       [--tag-output 0|1] [--rtsp|--rtsp-luma|--no-rtsp] [--quiet]\n"
             "\n"
             "  --mode strict|tolerant  ArUco Nano decode acceptance. strict (default)\n"
@@ -315,6 +318,7 @@ void usage(const char *argv0)
             "              frames decode ZERO AprilTag markers (markers are chiral). Applied\n"
             "              in VI hardware so there is no per-frame cost.\n"
             "  --flip 0|1      same, vertically (default 0).\n"
+            "  --ldc-calibration FILE.json  apply calibrated VPSS lens correction (default off).\n"
             "  --max-exposure-us N  retain auto exposure but cap shutter time, so AE\n"
             "              slow-shutter cannot reduce capture cadence (default 0 = uncapped).\n"
             "  --save-frame frame.png  save one annotated frame ~1s in.\n"
@@ -1067,9 +1071,12 @@ bool setup_camera(CameraContext &ctx)
     vb_config.astCommPool[0].u32BlkSize = COMMON_GetPicBufferSize(
         ctx.width, ctx.height, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
     vb_config.astCommPool[0].u32BlkCnt = 5;
+    // VPSS/GDC stores an LDC frame in a 64-aligned surface and borrows a
+    // second same-size block while rotating through the correction mesh.
     vb_config.astCommPool[kDetPool].u32BlkSize = COMMON_GetPicBufferSize(
-        kDetWidth, kDetHeight, PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
-    vb_config.astCommPool[kDetPool].u32BlkCnt = 5;
+        kDetWidth, ctx.ldc.enabled ? ALIGN(kDetHeight, 64) : kDetHeight,
+        PIXEL_FORMAT_YUV_400, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+    vb_config.astCommPool[kDetPool].u32BlkCnt = ctx.ldc.enabled ? 12 : 5;
     if (ctx.preview && !ctx.preview_luma)
     {
         vb_config.astCommPool[ctx.preview_pool].u32BlkSize = COMMON_GetPicBufferSize(
@@ -1164,6 +1171,9 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kVpssChn, &vpss_chn_attr);
     if (vpss_ret == CVI_SUCCESS)
         vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kVpssChn);
+    if (vpss_ret == CVI_SUCCESS && ctx.ldc.enabled &&
+        !apply_app_ldc(kVpssGrp, kVpssChn, kDetWidth, kDetHeight, ctx.ldc))
+        vpss_ret = CVI_FAILURE;
     if (vpss_ret == CVI_SUCCESS && ctx.preview && !ctx.preview_luma)
     {
         VPSS_CHN_ATTR_S preview_attr{};
@@ -1202,13 +1212,27 @@ bool setup_camera(CameraContext &ctx)
     return true;
 }
 
-void capture_loop(VPSS_CHN channel, CaptureSlot *slot)
+void capture_loop(VPSS_CHN channel, CaptureSlot *slot, CVI_U32 expected_height)
 {
+    size_t rejected_count = 0;
     while (!g_stop)
     {
         VIDEO_FRAME_INFO_S frame{};
         if (CVI_VPSS_GetChnFrame(kVpssGrp, channel, &frame, 1000) != CVI_SUCCESS)
             continue;
+        if (frame.stVFrame.u64PTS == 0 || frame.stVFrame.u32Width != kDetWidth ||
+            frame.stVFrame.u32Height != expected_height)
+        {
+            if (++rejected_count <= 5 || rejected_count % 60 == 0)
+                fprintf(stderr,
+                        "[camera] discarding invalid VPSS frame: seq=%u pts=%llu size=%ux%u (rejected %zu)\n",
+                        frame.stVFrame.u32TimeRef,
+                        (unsigned long long)frame.stVFrame.u64PTS,
+                        frame.stVFrame.u32Width, frame.stVFrame.u32Height,
+                        rejected_count);
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, channel, &frame);
+            continue;
+        }
         VIDEO_FRAME_INFO_S superseded{};
         bool release_superseded = false;
         bool stopping = false;
@@ -1371,6 +1395,7 @@ int main(int argc, char *argv[])
     bool tolerant = false;
     bool mirror = true;  // OV5647 module on this board is horizontally mirrored.
     bool flip = false;
+    std::string ldc_calibration_path;
     bool tag_output = false;
     bool quiet = false;
     bool rtsp = false, rtsp_luma = false;
@@ -1391,6 +1416,7 @@ int main(int argc, char *argv[])
         }
         else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
         else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
+        else if (flag == "--ldc-calibration" && has_value) ldc_calibration_path = argv[++i];
         else if (flag == "--max-exposure-us" && has_value)
             max_exposure_us = static_cast<CVI_U32>(std::strtoul(argv[++i], nullptr, 10));
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
@@ -1443,6 +1469,15 @@ int main(int argc, char *argv[])
     ctx.preview_luma = rtsp_luma;
     ctx.mirror = mirror;
     ctx.flip = flip;
+    if (!ldc_calibration_path.empty())
+    {
+        std::string error;
+        if (!load_app_ldc_config(ldc_calibration_path, ctx.ldc, error))
+        {
+            fprintf(stderr, "[ldc] %s\n", error.c_str());
+            return 1;
+        }
+    }
     if (const char *online = std::getenv("ARUCO_NANO_LIVE_VI_ONLINE"))
         ctx.vi_online = std::atoi(online) != 0;
     if (const char *delay = std::getenv("ARUCO_NANO_LIVE_PREVIEW_DELAY_MS"))
@@ -1465,7 +1500,8 @@ int main(int argc, char *argv[])
         for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
             ctx.preview_surfaces[i].dirty.reserve(ctx.preview_item_capacity * 2);
     }
-    ctx.capture_worker = std::thread(capture_loop, kVpssChn, &ctx.capture);
+    ctx.capture_worker = std::thread(capture_loop, kVpssChn, &ctx.capture,
+                                     ctx.ldc.enabled ? ALIGN(kDetHeight, 64) : kDetHeight);
     std::thread isp_control(isp_control_loop);
 
     std::thread preview;
@@ -1569,7 +1605,31 @@ int main(int argc, char *argv[])
         }
         const double t_mapped = now_ms();
 
-        const cv::Mat gray(vf.u32Height, vf.u32Width, CV_8UC1, luma, vf.u32Stride[0]);
+        const int visible_x = vf.s16OffsetLeft;
+        const int visible_y = vf.s16OffsetTop;
+        const int visible_width = static_cast<int>(vf.u32Width) -
+                                  vf.s16OffsetLeft - vf.s16OffsetRight;
+        const int visible_height = static_cast<int>(vf.u32Height) -
+                                   vf.s16OffsetTop - vf.s16OffsetBottom;
+        if (visible_x < 0 || visible_y < 0 ||
+            visible_width != static_cast<int>(kDetWidth) ||
+            visible_height != static_cast<int>(kDetHeight) ||
+            visible_x + visible_width > static_cast<int>(vf.u32Width) ||
+            visible_y + visible_height > static_cast<int>(vf.u32Height))
+        {
+            fprintf(stderr, "[camera] invalid VPSS visible rectangle T/B/L/R=%d/%d/%d/%d\n",
+                    vf.s16OffsetTop, vf.s16OffsetBottom,
+                    vf.s16OffsetLeft, vf.s16OffsetRight);
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            continue;
+        }
+        const CVI_U64 visible_y_paddr = vf.u64PhyAddr[0] +
+                                        static_cast<CVI_U64>(visible_y) * vf.u32Stride[0] +
+                                        visible_x;
+        uint8_t *visible_luma = luma + static_cast<size_t>(visible_y) * vf.u32Stride[0] +
+                                visible_x;
+        const cv::Mat gray(visible_height, visible_width, CV_8UC1,
+                           visible_luma, vf.u32Stride[0]);
 
         std::vector<TagDetection> tags;
         try
@@ -1617,8 +1677,14 @@ int main(int argc, char *argv[])
             {
                 VIDEO_FRAME_INFO_S rtsp_frame = frame;
                 VIDEO_FRAME_S &rf = rtsp_frame.stVFrame;
+                rf.u32Width = visible_width;
+                rf.u32Height = visible_height;
+                rf.u64PhyAddr[0] = visible_y_paddr;
+                rf.u32Length[0] = rf.u32Stride[0] * visible_height;
+                rf.s16OffsetTop = rf.s16OffsetBottom = 0;
+                rf.s16OffsetLeft = rf.s16OffsetRight = 0;
                 rf.enPixelFormat = PIXEL_FORMAT_NV21;
-                rf.pu8VirAddr[0] = luma;
+                rf.pu8VirAddr[0] = visible_luma;
                 rf.u32Stride[1] = surface->c_stride;
                 rf.u32Length[1] = surface->c_len;
                 rf.u64PhyAddr[1] = surface->c_phy;
@@ -1629,7 +1695,7 @@ int main(int argc, char *argv[])
                 rf.pu8VirAddr[2] = nullptr;
                 const bool queued = enqueue_luma_rtsp(
                     ctx, rtsp_frame, surface, tags, last_fps, last_busy_ms,
-                    frame, luma, map_len);
+                    frame, visible_luma, rf.u32Length[0]);
                 if (!queued)
                     CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
             }
