@@ -35,6 +35,34 @@ bool load_app_ldc_config(const std::string &path, AppLdcConfig &config,
         const std::string::size_type slash = path.find_last_of('/');
         parsed.cache_dir = slash == std::string::npos ? "." :
                            slash == 0 ? "/" : path.substr(0, slash);
+        if (root.find("camera_matrix") != root.end() &&
+            root.find("distortion_coefficients") != root.end())
+        {
+            const nlohmann::json &camera = root.at("camera_matrix");
+            if (!camera.is_array() || camera.size() != 3)
+            {
+                error = "camera_matrix must be 3x3";
+                return false;
+            }
+            for (int r = 0; r < 3; ++r)
+            {
+                if (!camera.at(r).is_array() || camera.at(r).size() != 3)
+                {
+                    error = "camera_matrix must be 3x3";
+                    return false;
+                }
+                for (int c = 0; c < 3; ++c)
+                    parsed.camera_matrix[r * 3 + c] = camera.at(r).at(c).get<double>();
+            }
+            parsed.distortion = root.at("distortion_coefficients").get<std::vector<double>>();
+            const size_t n = parsed.distortion.size();
+            if (n != 4 && n != 5 && n != 8 && n != 12 && n != 14)
+            {
+                error = "distortion_coefficients must have 4, 5, 8, 12 or 14 values";
+                return false;
+            }
+            parsed.has_opencv_model = true;
+        }
         if (!parsed.calibration_width || !parsed.calibration_height)
         {
             error = "image_size dimensions must be positive";

@@ -35,6 +35,7 @@
 #include "mp4_reader.h"
 #include "mp4_writer.h"
 #include "../common/ldc_config.h"
+#include "../common/sw_ldc.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
 
@@ -153,6 +154,23 @@ constexpr CVI_U32 kVdecDisplayFrameNum = 2;
 constexpr int kRecordBitrateKbps = 4000;
 constexpr int kPreviewBitrateKbps = 3000;
 constexpr int kVencTimeoutMs = 2000;
+// --ldc-mode sw: corrected detector frames live in a private VB pool. One is
+// held by the detector, up to two by the luma preview (pending + encoding),
+// and one spare absorbs release/acquire ordering.
+constexpr CVI_U32 kSwLdcBlockCount = 4;
+
+// Detector-channel frames are normally VPSS output. In --ldc-mode sw the
+// detector and preview use a corrected copy in a private VB block instead,
+// identified by that pool's ID.
+VB_POOL g_sw_ldc_pool = VB_INVALID_POOLID;
+
+void release_detector_frame(VIDEO_FRAME_INFO_S *frame)
+{
+    if (g_sw_ldc_pool != VB_INVALID_POOLID && frame->u32PoolId == g_sw_ldc_pool)
+        CVI_VB_ReleaseBlock(CVI_VB_PhysAddr2Handle(frame->stVFrame.u64PhyAddr[0]));
+    else
+        CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, frame);
+}
 
 enum RtspSendFailure : unsigned
 {
@@ -388,7 +406,12 @@ void usage(const char *argv0)
             "              ZERO tags (AprilTag markers are chiral) while proposals still\n"
             "              look correct. Applied in VI hardware: no per-frame cost.\n"
             "  --flip 1    same, vertically.\n"
-            "  --ldc-calibration FILE.json  apply calibrated VPSS lens correction (default off).\n"
+            "  --ldc-calibration FILE.json  apply calibrated lens correction (default off).\n"
+            "  --ldc-mode hw|sw  hw (default): VPSS/GDC with the one-ratio radial fit.\n"
+            "              sw: CPU remap of the 1280x720 detector frame with the full OpenCV\n"
+            "              model; the model input is resized from the corrected frame and\n"
+            "              --rtsp-luma shows corrected pixels. Adds per-frame CPU time.\n"
+            "  --ldc-sw-interp linear|nearest  software LDC sampling (default linear).\n"
             "  --crop-align N  widen each decode crop horizontally to a multiple of N\n"
             "              pixels (default 4, so every crop row starts 4-byte aligned\n"
             "              and is a whole number of 32-bit words). 0 or 1 disables.\n"
@@ -674,6 +697,12 @@ struct CameraContext
     bool mirror = false;
     bool flip = false;
     AppLdcConfig ldc;
+    // --ldc-mode sw. ldc.enabled stays false so VPSS/GDC is untouched; the
+    // detector remaps the uncorrected channel-0 frame into sw_ldc_pool.
+    bool sw_ldc_enabled = false;
+    SoftwareLdc sw_ldc;
+    std::vector<CachedLumaMapping> sw_ldc_mappings;
+    size_t sw_ldc_no_block = 0;
     CaptureSlot capture;
     std::thread capture_worker;
     CaptureSlot model_capture;
@@ -727,6 +756,76 @@ uint8_t *map_luma_for_cpu(CameraContext &ctx, CVI_U64 phy, CVI_U32 len)
     ctx.luma_mappings.push_back(mapping);
     ++ctx.luma_mapping_misses;
     return vir;
+}
+
+// --ldc-mode sw: remap an uncorrected detector frame into a private VB block
+// and describe that block as the detector frame. Only the CPU writes these
+// blocks and only the CPU or VENC reads them, so each keeps one cached mapping
+// with no per-frame invalidation. Consumers other than the CPU must see a
+// flushed plane; the luma preview worker flushes Y before every VENC submit.
+bool correct_detector_frame(CameraContext &ctx, const VIDEO_FRAME_INFO_S &source,
+                            const cv::Mat &source_y, VIDEO_FRAME_INFO_S &corrected,
+                            uint8_t *&corrected_y, CVI_U32 &corrected_len)
+{
+    const CVI_U32 stride = kDetWidth;
+    const CVI_U32 len = stride * kDetHeight;
+    const VB_BLK block = CVI_VB_GetBlock(g_sw_ldc_pool, len);
+    if (block == VB_INVALID_HANDLE)
+    {
+        ++ctx.sw_ldc_no_block;
+        return false;
+    }
+    const CVI_U64 phy = CVI_VB_Handle2PhysAddr(block);
+    uint8_t *vir = nullptr;
+    for (const auto &mapping : ctx.sw_ldc_mappings)
+    {
+        if (mapping.phy == phy)
+        {
+            vir = mapping.vir;
+            break;
+        }
+    }
+    if (vir == nullptr)
+    {
+        vir = static_cast<uint8_t *>(CVI_SYS_MmapCache(phy, len));
+        if (vir == nullptr)
+        {
+            fprintf(stderr, "[ldc] cannot map software LDC block %#llx\n",
+                    (unsigned long long)phy);
+            CVI_VB_ReleaseBlock(block);
+            return false;
+        }
+        CachedLumaMapping mapping;
+        mapping.phy = phy;
+        mapping.vir = vir;
+        mapping.len = len;
+        ctx.sw_ldc_mappings.push_back(mapping);
+    }
+
+    ctx.sw_ldc.apply(source_y.data, source_y.step, vir, stride);
+
+    // Keep the camera sequence, PTS and pixel format; replace the plane.
+    corrected = source;
+    VIDEO_FRAME_S &vf = corrected.stVFrame;
+    vf.u32Width = kDetWidth;
+    vf.u32Height = kDetHeight;
+    vf.u32Stride[0] = stride;
+    vf.u32Length[0] = len;
+    vf.u64PhyAddr[0] = phy;
+    vf.pu8VirAddr[0] = vir;
+    for (int plane = 1; plane < 3; ++plane)
+    {
+        vf.u32Stride[plane] = 0;
+        vf.u32Length[plane] = 0;
+        vf.u64PhyAddr[plane] = 0;
+        vf.pu8VirAddr[plane] = nullptr;
+    }
+    vf.s16OffsetTop = vf.s16OffsetBottom = 0;
+    vf.s16OffsetLeft = vf.s16OffsetRight = 0;
+    corrected.u32PoolId = g_sw_ldc_pool;
+    corrected_y = vir;
+    corrected_len = len;
+    return true;
 }
 
 void unmap_cached_luma(CameraContext &ctx)
@@ -1124,6 +1223,22 @@ bool setup_camera(CameraContext &ctx)
         return false;
     }
     ctx.sys_initialized = true;
+
+    if (ctx.sw_ldc_enabled)
+    {
+        VB_POOL_CONFIG_S pool{};
+        pool.u32BlkSize = kDetWidth * kDetHeight;
+        pool.u32BlkCnt = kSwLdcBlockCount;
+        pool.enRemapMode = VB_REMAP_MODE_NONE;
+        g_sw_ldc_pool = CVI_VB_CreatePool(&pool);
+        if (g_sw_ldc_pool == VB_INVALID_POOLID)
+        {
+            fprintf(stderr, "[ldc] cannot create software LDC pool (%u x %u bytes)\n",
+                    pool.u32BlkCnt, pool.u32BlkSize);
+            return false;
+        }
+        ctx.sw_ldc_mappings.reserve(kSwLdcBlockCount);
+    }
 
     if (ctx.preview_luma)
     {
@@ -1727,7 +1842,7 @@ void release_borrowed_y(BorrowedYResources &resources)
 {
     if (!resources.valid)
         return;
-    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &resources.frame);
+    release_detector_frame(&resources.frame);
     resources.valid = false;
 }
 
@@ -1920,6 +2035,9 @@ void luma_rtsp_loop(CameraContext *ctx)
             // encoded before any overlay is drawn. Flush the chroma we just reset.
             if (ctx->mp4)
             {
+                // Software-LDC Y was written by the CPU, unlike VPSS output.
+                if (ctx->sw_ldc_enabled)
+                    CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], y_vir, item.source_map_len);
                 CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
                 if (!record_frame(*ctx, item.encoded))
                     ++ctx->record_failures;
@@ -2381,6 +2499,15 @@ void teardown_camera(CameraContext &ctx)
         }
     }
 
+    for (auto &mapping : ctx.sw_ldc_mappings)
+        CVI_SYS_Munmap(mapping.vir, mapping.len);
+    ctx.sw_ldc_mappings.clear();
+    if (g_sw_ldc_pool != VB_INVALID_POOLID)
+    {
+        CVI_VB_DestroyPool(g_sw_ldc_pool);
+        g_sw_ldc_pool = VB_INVALID_POOLID;
+    }
+
     if (ctx.vdec_pool != VB_INVALID_POOLID)
     {
         CVI_VB_DestroyPool(ctx.vdec_pool);
@@ -2426,6 +2553,8 @@ int main(int argc, char *argv[])
     bool validate_compact_input = false;
     int crop_align = 4;
     std::string ldc_calibration_path;
+    std::string ldc_mode = "hw";
+    std::string ldc_sw_interp = "linear";
 
     for (int i = 2; i < argc; ++i)
     {
@@ -2441,6 +2570,8 @@ int main(int argc, char *argv[])
         else if (flag == "--save-native-frame" && has_value) save_native_frame_path = argv[++i];
         else if (flag == "--crop-align" && has_value) crop_align = std::atoi(argv[++i]);
         else if (flag == "--ldc-calibration" && has_value) ldc_calibration_path = argv[++i];
+        else if (flag == "--ldc-mode" && has_value) ldc_mode = argv[++i];
+        else if (flag == "--ldc-sw-interp" && has_value) ldc_sw_interp = argv[++i];
         else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
         else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
         else if (flag == "--tag-output" && has_value) tag_output = std::atoi(argv[++i]) != 0;
@@ -2537,6 +2668,21 @@ int main(int argc, char *argv[])
     ctx.save_native_frame_path = save_native_frame_path;
     ctx.mirror = mirror;
     ctx.flip = flip;
+    if (ldc_mode != "hw" && ldc_mode != "sw")
+    {
+        fprintf(stderr, "[ldc] --ldc-mode must be hw or sw\n");
+        return 1;
+    }
+    if (ldc_sw_interp != "linear" && ldc_sw_interp != "nearest")
+    {
+        fprintf(stderr, "[ldc] --ldc-sw-interp must be linear or nearest\n");
+        return 1;
+    }
+    if (ldc_mode == "sw" && ldc_calibration_path.empty())
+    {
+        fprintf(stderr, "[ldc] --ldc-mode sw requires --ldc-calibration\n");
+        return 1;
+    }
     if (!ldc_calibration_path.empty())
     {
         std::string error;
@@ -2545,6 +2691,76 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[ldc] %s\n", error.c_str());
             return 1;
         }
+    }
+    if (ldc_mode == "sw")
+    {
+        const SoftwareLdc::Interp interp = ldc_sw_interp == "nearest"
+                                               ? SoftwareLdc::Interp::Nearest
+                                               : SoftwareLdc::Interp::Linear;
+        std::string error;
+        if (!ctx.sw_ldc.init(ctx.ldc, kDetWidth, kDetHeight, interp, error))
+        {
+            fprintf(stderr, "[ldc] %s\n", error.c_str());
+            return 1;
+        }
+        // VPSS/GDC stays uncorrected; the detector remaps channel 0 instead.
+        ctx.ldc.enabled = false;
+        ctx.sw_ldc_enabled = !capture_only;
+        const cv::Matx33d &k = ctx.sw_ldc.camera_matrix();
+        fprintf(stderr,
+                "[ldc] software LDC %s on %ux%u, %.1f KB mesh (max %.3f px from OpenCV map); "
+                "corrected intrinsics fx=%.2f fy=%.2f cx=%.2f cy=%.2f, zero distortion\n",
+                ldc_sw_interp.c_str(), kDetWidth, kDetHeight, ctx.sw_ldc.table_bytes() / 1024.0,
+                ctx.sw_ldc.max_mesh_error_px(), k(0, 0), k(1, 1), k(0, 2), k(1, 2));
+
+        // Isolated remap cost on an otherwise idle core, before capture starts,
+        // plus a bit-exact check of the SIMD path against the scalar path.
+        cv::Mat bench_src(kDetHeight, kDetWidth, CV_8UC1);
+        cv::randu(bench_src, 0, 256);
+        cv::Mat bench_dst(kDetHeight, kDetWidth, CV_8UC1);
+        cv::Mat scalar_dst(kDetHeight, kDetWidth, CV_8UC1);
+        auto time_remap = [&](bool simd, cv::Mat &dst) {
+            constexpr int kBenchRuns = 10;
+            ctx.sw_ldc.set_simd(simd);
+            double best = 1e9, sum = 0.0;
+            for (int run = -2; run < kBenchRuns; ++run)
+            {
+                const double started = now_ms();
+                ctx.sw_ldc.apply(bench_src.data, bench_src.step, dst.data, dst.step);
+                const double elapsed = now_ms() - started;
+                if (run < 0)
+                    continue;
+                sum += elapsed;
+                best = std::min(best, elapsed);
+            }
+            fprintf(stderr, "[ldc] software remap self-test (%s): mean %.2f min %.2f ms over %d runs\n",
+                    simd ? "NEON" : "scalar", sum / kBenchRuns, best, kBenchRuns);
+        };
+        time_remap(false, scalar_dst);
+        if (SoftwareLdc::simd_available())
+        {
+            time_remap(true, bench_dst);
+            const int differing = cv::countNonZero(bench_dst != scalar_dst);
+            fprintf(stderr, "[ldc] NEON vs scalar remap: %d differing pixels\n", differing);
+            if (differing != 0)
+            {
+                fprintf(stderr, "[ldc] NEON remap disagrees with the scalar reference; using scalar\n");
+                ctx.sw_ldc.set_simd(false);
+            }
+        }
+
+        if (capture_only)
+            fprintf(stderr, "[ldc] --capture-only measures VPSS delivery; software LDC is not applied\n");
+        if (direct_compact_input)
+        {
+            // Channel 1 would feed the model uncorrected pixels.
+            fprintf(stderr, "[ldc] software LDC feeds the model from the corrected frame; "
+                            "direct compact input disabled\n");
+            direct_compact_input = false;
+        }
+        if (rtsp && !rtsp_luma)
+            fprintf(stderr, "[ldc] warning: colour --rtsp shows uncorrected VPSS pixels under "
+                            "corrected-frame overlays; use --rtsp-luma\n");
     }
     ctx.compact_direct_input = direct_compact_input && !detector.uses_aligned_input();
     ctx.validate_compact_input = validate_compact_input && ctx.compact_direct_input;
@@ -2662,7 +2878,7 @@ int main(int argc, char *argv[])
     struct StageTotals
     {
         long frames = 0;
-        double wait = 0, pair = 0, map = 0, pre = 0, infer = 0, decode = 0, crop = 0;
+        double wait = 0, pair = 0, map = 0, ldc = 0, pre = 0, infer = 0, decode = 0, crop = 0;
         double release = 0;
         double output = 0;
         double service_cpu = 0;
@@ -2712,6 +2928,7 @@ int main(int argc, char *argv[])
     size_t total_frames = 0;
     size_t stale_prev = 0;
     size_t pair_mismatch_prev = 0;
+    size_t sw_ldc_no_block_prev = 0;
     bool compact_needs_validation = ctx.validate_compact_input;
     unsigned ldc_pair_model_frames = 0;
     bool ldc_pair_saved = false;
@@ -2933,7 +3150,7 @@ int main(int argc, char *argv[])
         // every CPU read through it is slow. Measured on a Duo S at 1080p:
         // pre_process 20-23 ms -> 2.1 ms, 8-ROI crop-decode 11-13 ms -> ~5 ms.
         const VIDEO_FRAME_S &vf = frame.stVFrame;
-        const CVI_U32 map_len = vf.u32Length[0] ? vf.u32Length[0] : vf.u32Stride[0] * vf.u32Height;
+        CVI_U32 map_len = vf.u32Length[0] ? vf.u32Length[0] : vf.u32Stride[0] * vf.u32Height;
         const double t_map_started = now_ms();
         uint8_t *luma = map_luma_for_cpu(ctx, vf.u64PhyAddr[0], map_len);
         if (luma == nullptr)
@@ -2960,6 +3177,38 @@ int main(int argc, char *argv[])
             g_stop = 1;
         }
 
+        // --ldc-mode sw: VPSS LDC is off, so the source is the full
+        // uncorrected plane. Return it to VPSS as soon as the remap is done;
+        // everything below uses the corrected block in its place.
+        double sw_ldc_ms = 0.0;
+        if (ctx.sw_ldc_enabled)
+        {
+            if (vf.u32Width != kDetWidth || vf.u32Height != kDetHeight ||
+                vf.s16OffsetTop != 0 || vf.s16OffsetBottom != 0 ||
+                vf.s16OffsetLeft != 0 || vf.s16OffsetRight != 0)
+            {
+                fprintf(stderr, "[ldc] unexpected software LDC source %ux%u offsets T/B/L/R=%d/%d/%d/%d\n",
+                        vf.u32Width, vf.u32Height, vf.s16OffsetTop, vf.s16OffsetBottom,
+                        vf.s16OffsetLeft, vf.s16OffsetRight);
+                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+                continue;
+            }
+            const cv::Mat source_y(kDetHeight, kDetWidth, CV_8UC1, luma, vf.u32Stride[0]);
+            VIDEO_FRAME_INFO_S corrected{};
+            uint8_t *corrected_y = nullptr;
+            CVI_U32 corrected_len = 0;
+            const double t_ldc = now_ms();
+            const bool corrected_ok = correct_detector_frame(ctx, frame, source_y, corrected,
+                                                             corrected_y, corrected_len);
+            sw_ldc_ms = now_ms() - t_ldc;
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            if (!corrected_ok)
+                continue;
+            frame = corrected;
+            luma = corrected_y;
+            map_len = corrected_len;
+        }
+
         // VIDEO_FRAME_S carries the valid display rectangle in its offset
         // fields. GDC-aligned LDC outputs use bottom offsets for invalid tail
         // rows (24 on the 640x360 channel, 48 on 1280x720); honor the frame
@@ -2977,7 +3226,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[camera] invalid VPSS valid-area offsets T/B/L/R=%d/%d/%d/%d\n",
                     vf.s16OffsetTop, vf.s16OffsetBottom,
                     vf.s16OffsetLeft, vf.s16OffsetRight);
-            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            release_detector_frame(&frame);
             continue;
         }
         if (ctx.ldc.enabled && (visible_height != static_cast<int>(vf.u32Height) ||
@@ -3035,7 +3284,7 @@ int main(int argc, char *argv[])
         catch (const std::exception &e)
         {
             fprintf(stderr, "[camera] detector runtime failed: %s\n", e.what());
-            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            release_detector_frame(&frame);
             g_stop = 1;
             break;
         }
@@ -3086,12 +3335,12 @@ int main(int argc, char *argv[])
                 vf.u32Stride[0] * static_cast<CVI_U32>(visible_height));
             if (!preview_queued)
             {
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+                release_detector_frame(&frame);
             }
         }
         else
         {
-            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
+            release_detector_frame(&frame);
         }
         const double t_released = now_ms();
         ++win.frames;
@@ -3099,6 +3348,7 @@ int main(int argc, char *argv[])
         win.wait += t_got - t_wait;
         win.pair += pair_wait_ms;
         win.map += t_mapped - t_map_started;
+        win.ldc += sw_ldc_ms;
         win.pre += detector.last_preprocess_ms();
         win.infer += detector.last_inference_ms();
         win.decode += detector.last_decode_ms();
@@ -3194,7 +3444,7 @@ int main(int argc, char *argv[])
                 stale_now = freshness_slot.dropped;
             }
             const double n = static_cast<double>(win.frames);
-            const double busy = (win.pair + win.map + win.pre + win.infer + win.decode +
+            const double busy = (win.pair + win.map + win.ldc + win.pre + win.infer + win.decode +
                                  win.crop + win.release) / n;
             const double loop = busy + win.output / n;
             const double process_cpu_now = process_cpu_ms();
@@ -3208,13 +3458,13 @@ int main(int argc, char *argv[])
             else
             {
                 fprintf(stderr,
-                        "[camera] %.1f fps | per frame ms: wait %.2f pair %.2f map %.2f pre %.2f infer %.2f "
+                        "[camera] %.1f fps | per frame ms: wait %.2f pair %.2f map %.2f ldc %.2f pre %.2f infer %.2f "
                         "decode %.2f crop %.2f release %.2f output %.2f = busy %.2f loop %.2f cpu %.2f proc-cpu %.2f | "
                         "%.1f proposals | %zu stale"
                         " | seq mean %.2f max %u sum %u | age mean %.2f max %.2f ms | "
                         "map-cache hit %zu miss %zu blocks %zu\n",
                         window_fps, win.wait / n, win.pair / n,
-                        win.map / n, win.pre / n,
+                        win.map / n, win.ldc / n, win.pre / n,
                         win.infer / n, win.decode / n, win.crop / n, win.release / n, win.output / n,
                         busy, loop, win.service_cpu / n, process_cpu_per_frame,
                         win.proposals / n, stale_now - stale_prev,
@@ -3258,6 +3508,12 @@ int main(int argc, char *argv[])
                         win.ready_delta_samples ? win.ready_delta_sum / win.ready_delta_samples : 0.0,
                         win.ready_delta_samples ? win.ready_delta_max : 0.0);
                 pair_mismatch_prev = pair_mismatches;
+            }
+            if (ctx.sw_ldc_enabled && ctx.sw_ldc_no_block != sw_ldc_no_block_prev)
+            {
+                fprintf(stderr, "[ldc] software LDC frames dropped without a free block: %zu total %zu\n",
+                        ctx.sw_ldc_no_block - sw_ldc_no_block_prev, ctx.sw_ldc_no_block);
+                sw_ldc_no_block_prev = ctx.sw_ldc_no_block;
             }
             if (ctx.preview_luma)
             {

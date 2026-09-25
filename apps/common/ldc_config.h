@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -26,6 +27,11 @@ struct AppLdcConfig
     CVI_U32 calibration_width = 0;
     CVI_U32 calibration_height = 0;
     std::string cache_dir;
+    // Full OpenCV model from the same calibration, used by software LDC.
+    // Row-major 3x3 camera matrix; 4, 5, 8, 12 or 14 distortion coefficients.
+    bool has_opencv_model = false;
+    double camera_matrix[9] = {};
+    std::vector<double> distortion;
 };
 
 bool load_app_ldc_config(const std::string &path, AppLdcConfig &config,

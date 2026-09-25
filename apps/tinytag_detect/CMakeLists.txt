@@ -84,6 +84,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
   add_executable(tinytag_detect_live
       live_camera.cc
       ../common/ldc_config.cc
+      ../common/sw_ldc.cc
       tinytag_det.cc
       tag_crop_decoder.cc
       third_party/opencv_aruco_dict/aruco_dictionary.cpp

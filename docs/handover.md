@@ -394,6 +394,43 @@ corrected full frame. Direct corrected 640x384 input remains the default. If
 60 fps corrected output is required, investigate the VPSS/GDC path and its
 task/queue costs; mesh persistence will not improve frame rate.
 
+### Software LDC comparison
+
+`--ldc-mode sw` (TinyTag only) leaves VPSS/GDC uncorrected and remaps the
+1280x720 detector frame on the CPU into a private four-block VB pool, so
+detection and the borrowed `--rtsp-luma` Y plane both use corrected pixels.
+It uses the calibration's full OpenCV model rather than the one-ratio fit.
+The output camera matrix equals the calibrated matrix. The remap stores
+source coordinates on a 16-pixel mesh (29 KB, max 0.044 px from
+`cv::initUndistortRectifyMap`) and uses 7-bit bilinear weights. On AArch64,
+NEON table lookups gather full 16-pixel runs; about 12% of runs use scalar
+code because they span three source rows. At startup, the NEON and scalar
+results must be bit-identical. Software LDC forces copied model input.
+
+The board's OpenCV 3.2 `cv::remap` took 74 ms per frame on an idle core, and
+its worker threads compete on the single core. The mesh remap took 44 ms
+scalar and 25 ms NEON while idle, or 36 ms in the live loop. The CPU runs
+at 800 MHz (`clk_a53`), so the NEON path costs about 22 cycles per pixel.
+2026-09-25, 720p60, `--rtsp-luma --max-exposure-us 10000`, 15 s per case,
+same scene; means exclude the first three windows:
+
+| Case | fps | loop | ldc | detCPU | procCPU | acqAge | result-age p50/p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no LDC | 61.1 | 14.40 | 0 | 9.16 | 14.66 | 5.25 | 20.6 / 28.3 |
+| HW LDC, direct compact | 55.7 | 17.47 | 0 | 9.80 | 15.16 | 12.80 | 28.7 / 38.7 |
+| HW LDC, copied input | 48.5 | 20.56 | 0 | 10.65 | 18.03 | 14.22 | 36.2 / 42.6 |
+| SW LDC linear | 18.0 | 55.59 | 36.03 | 37.21 | 51.74 | 9.45 | 63.6 / 73.1 |
+| SW LDC nearest | 25.1 | 39.79 | 21.50 | 25.60 | 36.92 | 9.09 | 47.6 / 58.5 |
+
+In this bright-enough capped-AE run, hardware LDC with both channels ran at
+56 fps, not the 14-15 fps of the earlier 1080p30 test. Hardware correction
+adds roughly 7.5 ms of acquisition age but little CPU. Full-frame software
+correction costs more CPU than the rest of the detector and loses on both
+latency and throughput. A faster kernel alone cannot close that gap on this
+single core. The remaining low-latency option is to correct only what
+detection consumes: undistort decoded corner points and, where
+edge distortion hurts decoding, remap only proposal ROIs.
+
 ### Build, deploy, and continue
 
 Incremental cross-builds that produced the deployed binaries:

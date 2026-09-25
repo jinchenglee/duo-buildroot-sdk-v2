@@ -247,6 +247,29 @@ there is no cross-channel pairing step. These figures depend on scene content
 and decoder crop load; use the per-second `[camera]` and `[crop-profile]`
 reports for your scene.
 
+For comparison, `--ldc-mode sw` skips VPSS/GDC LDC and corrects the
+uncorrected 1280x720 detector frame on the CPU with the JSON's full OpenCV
+model (`camera_matrix` and `distortion_coefficients`), not the one-ratio
+Sophgo fit. The corrected frame keeps the calibrated camera matrix, so its
+intrinsics are that matrix (scaled to 1280x720) with zero distortion. The model
+input is resized from the corrected frame, and `--rtsp-luma` shows corrected
+pixels; colour `--rtsp` does not. `--ldc-sw-interp nearest` trades
+interpolation quality for speed. The `[camera]` line reports its per-frame
+`ldc` time, and startup prints an isolated self-test time for the scalar and
+NEON paths plus their bit-exact comparison.
+
+```sh
+TINYTAG_LIVE_OV5647_720P60=1 ./run_live.sh --rtsp-luma --max-exposure-us 10000 \
+    --ldc-calibration /root/ldc-calibration.json --ldc-mode sw
+```
+
+Full-frame software correction is much slower than the hardware path on the
+800 MHz A53. With 720p60 and `--max-exposure-us 10000` in one scene, the mean
+`[tails]` result age was 20.6 ms at 61 fps without LDC. It was 28.7 ms at 56
+fps with hardware direct input, and 36.2 ms at 49 fps with hardware
+copied input. Software linear LDC took 36 ms of CPU per frame and reached 63.6
+ms at 18 fps; software nearest took 21.5 ms and reached 47.6 ms at 25 fps.
+
 The OV5647 720p60 mode uses a wider, binned sensor region than 1080p30. A
 calibration made from 1080p30 images is not valid for accurate 720p60 pose
 estimation, even if both feed a 1280x720 VPSS channel; calibrate the uncorrected
