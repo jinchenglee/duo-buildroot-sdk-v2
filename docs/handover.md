@@ -431,6 +431,73 @@ single core. The remaining low-latency option is to correct only what
 detection consumes: undistort decoded corner points and, where
 edge distortion hurts decoding, remap only proposal ROIs.
 
+### HW versus SW correction geometry
+
+With the same 720p calibration JSON, the HW-corrected preview showed visible
+distortion at the far left, while the SW-corrected preview did not. The two
+modes read different parts of the JSON and show different fields of view:
+
+| | HW (VPSS/GDC) | SW (`--ldc-mode sw`) |
+| --- | --- | --- |
+| Model | `sophgo_vpss_ldc`: one ratio (-250), center offset (-66,-50) | `camera_matrix` + `distortion_coefficients` (k1,k2,p1,p2,k3) |
+| Checkerboard fit | 5.0 px RMS | 1.58 px RMS |
+| Output view | Aspect gain 0.94; shows source x 69..1134, y -3..705 | Calibrated matrix; shows source x 89..1129, y 18..684 |
+
+The SDK mesh generator (`cvi_mpi/modules/sys/src/gdc_mesh.c`, around line
+1240) maps each output point with `r * (1 + k * r^2 / norm^2)`. `norm` is the
+half-diagonal (734 px at 1280x720), and `r` is clamped to `norm`. It cannot
+represent this lens's higher-order terms, and the clamp changes the edge
+slope abruptly. For the current calibration, the source radius predicted by
+each model is:
+
+| Ideal radius | OpenCV source radius | HW source radius | Difference |
+| ---: | ---: | ---: | ---: |
+| 500 px | 437 | 442 | +5 px |
+| 600 px | 500 | 500 | 0 px |
+| 700 px | 553 | 541 | -12 px |
+| 734 px | 570 | 551 | -20 px |
+
+A host simulation, `gdc_mesh.c` compared with the OpenCV model, fits a
+similarity on the central region and reports residual geometric error for
+HW output pixels:
+
+| Region of the HW output | Share | Mean | p95 | Max |
+| --- | ---: | ---: | ---: | ---: |
+| Also visible in SW | 90% | 4.6 px | 28 px | 48 px |
+| HW-only band cropped by SW | 10% | 8.5 px | 31 px | 47 px |
+| SW view, left 10% | | 5.3 px | 23 px | 48 px |
+| SW view, right 10% | | 22.4 px | 41 px | 45 px |
+
+Interpretation:
+
+- Inside the shared view, SW is more accurate; this is not caused by cropping
+  alone. The comparison uses the OpenCV model as the reference, so it is
+  reliable only where the calibration views provided support.
+- SW keeps the calibrated camera matrix, as `cv::undistort` does by default,
+  and so discards about 10% of the HW view: roughly 89 px on the left, 150 px
+  on the right, 18 px at the top, and 36 px at the bottom of the source. The
+  distortion there remains; SW simply does not display it. A tag in that band
+  is detectable with HW but not with SW.
+- In that outer band, both models are probably extrapolating beyond the
+  checkerboard coverage, so SW accuracy there is unverified.
+- The simulation predicts that HW error is worst on the right, yet the
+  observed artifact was on the left. That remains unexplained. A mirror
+  applied after LDC, which would reflect the center offset, predicts about
+  100 px errors on both edges, so it does not match either.
+
+Next checks:
+
+1. Save one frame of the same scene in each mode (`--save-frame`), with
+   straight lines reaching all four edges. Compare line straightness on the
+   left and right to confirm or refute the simulation.
+2. For an equal field-of-view comparison, add a SW output zoom (for example,
+   the HW aspect gain of 0.94) so that SW also shows the outer band. If SW
+   lines bend there, recalibrate with checkerboard views that reach the edges
+   and corners.
+3. Refitting the HW ratio over the full visible radius, or reducing
+   `view_ratio` to hide the outer band, can reduce HW error. A single
+   coefficient cannot remove the k2/k3 shape mismatch.
+
 ### Build, deploy, and continue
 
 Incremental cross-builds that produced the deployed binaries:
