@@ -4,16 +4,22 @@ SHELL = /bin/bash
 PARAM_FILE := $(CURDIR)/mpi_param.mk
 include $(PARAM_FILE)
 #
+# The subdirectory Makefiles are not parallel-safe (isp_bin links tmp_lib/*.o
+# before prepare_3rdparty_module extracts them; audio installs libs while
+# building them). Upstream only ever ran them at -j1, because they were started
+# with plain `make`, which loses the jobserver. Keep that with an explicit -j1
+# (spelled out, since make only treats a literal $(MAKE) as a recursive call).
+#
 .PHONY: clean all module component sample install uninstall package 3rdparty self_test clean_all
 
 all: prepare 3rdparty module component sample self_test
 
 module: prepare 3rdparty
-	@make -C modules/
+	@$(MAKE) -j1 -C modules/
 
 prepare:
 	@if [ -f "mpi_prepare.mk" ]; then \
-		make -f mpi_prepare.mk prepare; \
+		$(MAKE) -f mpi_prepare.mk prepare; \
 		sed -i '19i#ifndef __CV181X__\n\t#define __CV181X__\n#endif\n' include/linux/cvi_defines.h; \
 	fi
 	@if [ "$(CHIP_ARCH)" = "CV181X" ]; then \
@@ -26,25 +32,25 @@ prepare:
 
 3rdparty:
 	@if [ -d "3rdparty/" ]; then \
-		make -C 3rdparty/; \
+		$(MAKE) -j1 -C 3rdparty/; \
 	fi
 
 sample: module component
 	@if [ -d "sample/" ]; then \
-		make -C sample/; \
+		$(MAKE) -j1 -C sample/; \
 	fi
 
 self_test: module sample
 	@if [ -d "self_test/" ]; then \
-		make -C self_test/; \
+		$(MAKE) -j1 -C self_test/; \
 	fi
 
 component:
-	@make -C component/isp/ all
+	@$(MAKE) -j1 -C component/isp/ all
 
 dl_daemon: sample
 	@cmake self_test/dl_daemon -Bself_test/dl_daemon/build
-	@make -C self_test/dl_daemon/build/
+	@$(MAKE) -j1 -C self_test/dl_daemon/build/
 
 ifneq ($(SUBTYPE), fpga)
 install:
@@ -101,17 +107,17 @@ package:
 endif
 
 clean:
-	@make -C modules/ clean
-	@make -C 3rdparty/ clean
-	@make -C sample/ clean
-	@make -C component/isp/ clean
+	@$(MAKE) -j1 -C modules/ clean
+	@$(MAKE) -j1 -C 3rdparty/ clean
+	@$(MAKE) -j1 -C sample/ clean
+	@$(MAKE) -j1 -C component/isp/ clean
 	@rm -rf self_test/dl_daemon/build
 	@if [ -d "self_test/" ]; then \
-		make -C self_test/ clean; \
+		$(MAKE) -j1 -C self_test/ clean; \
 	fi
 	@if [ -f "mpi_prepare.mk" ]; then \
-		make -f mpi_prepare.mk clean; \
+		$(MAKE) -f mpi_prepare.mk clean; \
 	fi
 
 clean_all:
-	@make -C modules/ clean_all
+	@$(MAKE) -j1 -C modules/ clean_all

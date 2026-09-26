@@ -28,20 +28,20 @@ endif
 all : algo_ae algo_awb algo_af
 
 algo_ae:
-	cd $(AE_LIB); make;
+	cd $(AE_LIB); $(MAKE);
 
 algo_awb:
-	cd $(AWB_LIB); make;
+	cd $(AWB_LIB); $(MAKE);
 
 algo_af:
-	cd $(AF_LIB); make;
+	cd $(AF_LIB); $(MAKE);
 
 clean:
-	make -C $(AE_LIB) clean
-	make -C $(AWB_LIB) clean
-	make -C $(AF_LIB) clean
+	$(MAKE) -C $(AE_LIB) clean
+	$(MAKE) -C $(AWB_LIB) clean
+	$(MAKE) -C $(AF_LIB) clean
 
 clean_all:
-	make -C $(AE_LIB) clean_all
-	make -C $(AWB_LIB) clean_all
-	make -C $(AF_LIB) clean_all
+	$(MAKE) -C $(AE_LIB) clean_all
+	$(MAKE) -C $(AWB_LIB) clean_all
+	$(MAKE) -C $(AF_LIB) clean_all

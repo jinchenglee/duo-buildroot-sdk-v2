@@ -45,10 +45,10 @@ $(TARGET): $(OBJS) $(MW_LIB)/libvo.a $(MW_LIB)/libsys.a $(MW_LIB)/libmipi_tx.a
 	@echo -e $(BLUE)[LINK]$(END)[$(notdir $(CC))] $(notdir $@)
 
 lt9611:
-	cd $(SDIR)/lt9611;make clean;make
+	cd $(SDIR)/lt9611;$(MAKE) clean;$(MAKE)
 
 clean_lt9611:
-	cd $(SDIR)/lt9611;make clean;
+	cd $(SDIR)/lt9611;$(MAKE) clean;
 
 clean: clean_lt9611
 	@rm -f $(OBJS) $(DEPS) $(TARGET)
