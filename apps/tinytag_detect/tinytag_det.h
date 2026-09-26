@@ -32,6 +32,9 @@ struct TinyTagResult
     cv::Rect2f roi;
     cv::Point2f center;
     cv::Point2f corners[4];
+    // Point-level LDC only: corners in ideal (undistorted pinhole) pixels.
+    bool has_ideal = false;
+    cv::Point2f ideal_corners[4];
 };
 
 // TinyTag proposal detector on the cv181x/SG2000 TPU.

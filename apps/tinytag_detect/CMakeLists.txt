@@ -44,6 +44,7 @@ add_executable(tinytag_detect
     tinytag_det.cc
     golden.cc
     tag_crop_decoder.cc
+    ../common/point_ldc.cc
     third_party/opencv_aruco_dict/aruco_dictionary.cpp)
 
 # The dictionary TU defines every predefined ArUco/AprilTag table; only 36h11
@@ -56,6 +57,18 @@ target_link_libraries(tinytag_detect
     dl stdc++ pthread z m)
 
 install(TARGETS tinytag_detect DESTINATION app/tinytag_detect)
+
+# Offline check and per-ROI timing of point-level LDC on a still frame
+# (see point_ldc_check.cc). Needs only OpenCV, no TPU or MPI.
+add_executable(point_ldc_check
+    point_ldc_check.cc
+    tag_crop_decoder.cc
+    ../common/point_ldc.cc
+    third_party/opencv_aruco_dict/aruco_dictionary.cpp)
+target_compile_options(point_ldc_check PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(point_ldc_check PRIVATE -Wl,--gc-sections)
+target_link_libraries(point_ldc_check ${OPENCV_LIBS} stdc++ pthread z m)
+install(TARGETS point_ldc_check DESTINATION app/tinytag_detect)
 
 # --- live camera capture (VI -> VPSS, no V4L2 on this SoC) -----------------
 # Separate binary: it needs cvi_mpi's MPI libraries on top of everything
@@ -84,6 +97,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
   add_executable(tinytag_detect_live
       live_camera.cc
       ../common/ldc_config.cc
+      ../common/point_ldc.cc
       ../common/sw_ldc.cc
       tinytag_det.cc
       tag_crop_decoder.cc

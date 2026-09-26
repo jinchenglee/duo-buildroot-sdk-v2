@@ -498,6 +498,69 @@ Next checks:
    `view_ratio` to hide the outer band, can reduce HW error. A single
    coefficient cannot remove the k2/k3 shape mismatch.
 
+### Point-level LDC (`--ldc-mode point`)
+
+This mode corrects only the geometry the detector consumes; no pixels are
+remapped. VPSS stays uncorrected, and direct compact TPU input remains valid.
+ArUco Nano decodes each crop as usual. Then, per decoded tag:
+
+1. Sample 8 points per edge, skipping 15% at each corner. Pass 1 samples along
+   the raw chord between corners; pass 2 samples along the pass-1 corrected
+   edge, forward-distorted onto the curved raw edge.
+2. Move each sample to the subpixel mid-grey crossing along the local normal.
+3. Undistort the samples with the calibration's full OpenCV model (Newton's
+   method), fit a Huber-reweighted line per edge, and intersect adjacent lines.
+
+`[tag]` lines gain `ideal=(...)` corners: pinhole pixels with the calibration's
+camera matrix and zero distortion, ready for `solvePnP` without distortion
+coefficients. With `--point-ldc-fallback 1` (the default), up to 8 rejected
+candidates per crop are refined the same way and read through a
+forward-distorted bit grid. Code: `apps/common/point_ldc.{h,cc}` and
+`PointLdcDecoder` in `apps/tinytag_detect/tag_crop_decoder.cc`.
+
+Design and validation are in `tools/ldc_point_correction/`. The notebook
+compares this with full-frame and ROI remapping on synthetic frames with ground
+truth; `ldcpt.point_ldc_detect` is the Python reference for the C++.
+Synthetic results, mean corner error in ideal px:
+
+| Case | point LDC | ROI remap + stock | full remap (SW) | HW one-ratio sim |
+| --- | ---: | ---: | ---: | ---: |
+| 80 mm tags, 0.7-1.4 m | 0.135 | 0.30 | 0.27 | 3.2 |
+| 120 mm tags, 0.35-0.7 m | 0.075 | 0.37 | 0.29 | 3.2 |
+| lens distortion x1.5 | 0.103 | 0.45 | 0.25 | n/a |
+
+Recall is 96-99%, against 60-74% for full remap, which loses the outer band.
+C++ and Python agree to a median of 0.0001 px on the same frames. A few
+small-tag outliers (up to 0.8 px) start from stock corners that differ by about
+1 px between the two contour tracers; a third pass removes most of that.
+`apps/tinytag_detect/point_ldc_check` (built for host and board) reruns this
+check on a still frame and times it.
+
+Duo-S cost, measured 2026-09-25:
+
+| Measurement | Cost |
+| --- | ---: |
+| point stage per decoded tag, `point_ldc_check`, 80 mm synthetic tags | 0.34-0.36 ms |
+| same, `test_post_ldc.png` | 0.38 ms |
+| same, large tags | 0.53 ms |
+| each fallback candidate | about 0.12 ms |
+| live 720p60, one tag in view, `[point-ldc]` | 0.60 ms per frame |
+| full-frame SW remap, for comparison | 25-36 ms per frame |
+
+In the live run, the detector held 58-59 fps with capped AE, against 59-62 fps
+without LDC; crop time varied 1-2 ms with the scene.
+`cv::fitLine(DIST_HUBER)` cost 68 us per call on the A53, so the line fit is a
+closed-form reweighted fit of about 2 us. The model round trip is exact to
+1e-12 px on the board.
+
+Limits:
+
+- The 720p calibration model folds at a raw radius of 686 px. Three frame
+  corners have no inverse, and samples there are dropped.
+- Two passes do not fully converge from a stock quad that is off by about 1 px
+  on small tags.
+- The static-image `tinytag_detect` and ArUco Nano apps do not use this mode.
+
 ### Build, deploy, and continue
 
 Incremental cross-builds that produced the deployed binaries:
@@ -513,11 +576,12 @@ The board is `root@192.168.42.1` on USB Ethernet (password `milkv`). Deployed
 cache-enabled binary hashes were:
 
 ```text
-/app/tinytag_detect/tinytag_detect_live  md5 74c638eb4c80a7395cc0dc23ded6c7b9
+/app/tinytag_detect/tinytag_detect_live  md5 2302867945627dbba82f8f2d785badfb  (point LDC, 2026-09-25)
 /app/aruco_nano/aruco_nano              md5 44b69326e86fe58e3140ad75f3d1e36a
 ```
 
-Recoverable backups are beside the binaries with suffix
+The previous live binary (md5 affb9109217a84660fa9c52e556bdcf1, with SW LDC)
+is kept as `tinytag_detect_live.before-point-ldc`. Recoverable backups are beside the binaries with suffix
 `.before-ldc-mesh-cache`; earlier backups with `.before-ldc-vb-fix` also exist.
 The last bounded smoke test exited cleanly and left no app process running.
 Board trial logs are under `/tmp/ldc-cache-*.log`,

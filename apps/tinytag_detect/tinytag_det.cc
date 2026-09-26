@@ -580,6 +580,12 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         decoder_profile_.candidates += profile.candidates;
         decoder_profile_.attempts += profile.attempts;
         decoder_profile_.markers += profile.markers;
+        decoder_profile_.point_ms += profile.point_ms;
+        decoder_profile_.point_refined += profile.point_refined;
+        decoder_profile_.point_refine_failed += profile.point_refine_failed;
+        decoder_profile_.point_fallback_tried += profile.point_fallback_tried;
+        decoder_profile_.point_fallback_decoded += profile.point_fallback_decoded;
+        decoder_profile_.point_samples += profile.point_samples;
 
         for (const auto &tag : tags)
         {
@@ -592,6 +598,9 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             result.center = tag.center + origin;
             for (int corner = 0; corner < 4; ++corner)
                 result.corners[corner] = tag.corners[corner] + origin;
+            result.has_ideal = tag.has_ideal;
+            for (int corner = 0; corner < 4 && tag.has_ideal; ++corner)
+                result.ideal_corners[corner] = tag.ideal_corners[corner];
             results.push_back(result);
         }
     }

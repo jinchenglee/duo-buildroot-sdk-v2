@@ -35,6 +35,7 @@
 #include "mp4_reader.h"
 #include "mp4_writer.h"
 #include "../common/ldc_config.h"
+#include "../common/point_ldc.h"
 #include "../common/sw_ldc.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
@@ -407,11 +408,17 @@ void usage(const char *argv0)
             "              look correct. Applied in VI hardware: no per-frame cost.\n"
             "  --flip 1    same, vertically.\n"
             "  --ldc-calibration FILE.json  apply calibrated lens correction (default off).\n"
-            "  --ldc-mode hw|sw  hw (default): VPSS/GDC with the one-ratio radial fit.\n"
+            "  --ldc-mode hw|sw|point  hw (default): VPSS/GDC with the one-ratio radial fit.\n"
             "              sw: CPU remap of the 1280x720 detector frame with the full OpenCV\n"
             "              model; the model input is resized from the corrected frame and\n"
             "              --rtsp-luma shows corrected pixels. Adds per-frame CPU time.\n"
             "  --ldc-sw-interp linear|nearest  software LDC sampling (default linear).\n"
+            "              point: no image correction. Decoded tags get corners refined in\n"
+            "              the corrected domain from undistorted edge samples, and rejected\n"
+            "              candidates are retried through a forward-distorted bit grid.\n"
+            "              [tag] lines then include ideal=... corners (pinhole pixels,\n"
+            "              zero distortion, the calibration's camera matrix).\n"
+            "  --point-ldc-fallback 0|1  point mode: retry rejected candidates (default 1).\n"
             "  --crop-align N  widen each decode crop horizontally to a multiple of N\n"
             "              pixels (default 4, so every crop row starts 4-byte aligned\n"
             "              and is a whole number of 32-bit words). 0 or 1 disables.\n"
@@ -2555,6 +2562,7 @@ int main(int argc, char *argv[])
     std::string ldc_calibration_path;
     std::string ldc_mode = "hw";
     std::string ldc_sw_interp = "linear";
+    bool point_ldc_fallback = true;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -2572,6 +2580,8 @@ int main(int argc, char *argv[])
         else if (flag == "--ldc-calibration" && has_value) ldc_calibration_path = argv[++i];
         else if (flag == "--ldc-mode" && has_value) ldc_mode = argv[++i];
         else if (flag == "--ldc-sw-interp" && has_value) ldc_sw_interp = argv[++i];
+        else if (flag == "--point-ldc-fallback" && has_value)
+            point_ldc_fallback = std::atoi(argv[++i]) != 0;
         else if (flag == "--mirror" && has_value) mirror = std::atoi(argv[++i]) != 0;
         else if (flag == "--flip" && has_value) flip = std::atoi(argv[++i]) != 0;
         else if (flag == "--tag-output" && has_value) tag_output = std::atoi(argv[++i]) != 0;
@@ -2668,9 +2678,9 @@ int main(int argc, char *argv[])
     ctx.save_native_frame_path = save_native_frame_path;
     ctx.mirror = mirror;
     ctx.flip = flip;
-    if (ldc_mode != "hw" && ldc_mode != "sw")
+    if (ldc_mode != "hw" && ldc_mode != "sw" && ldc_mode != "point")
     {
-        fprintf(stderr, "[ldc] --ldc-mode must be hw or sw\n");
+        fprintf(stderr, "[ldc] --ldc-mode must be hw, sw or point\n");
         return 1;
     }
     if (ldc_sw_interp != "linear" && ldc_sw_interp != "nearest")
@@ -2678,9 +2688,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ldc] --ldc-sw-interp must be linear or nearest\n");
         return 1;
     }
-    if (ldc_mode == "sw" && ldc_calibration_path.empty())
+    if (ldc_mode != "hw" && ldc_calibration_path.empty())
     {
-        fprintf(stderr, "[ldc] --ldc-mode sw requires --ldc-calibration\n");
+        fprintf(stderr, "[ldc] --ldc-mode %s requires --ldc-calibration\n", ldc_mode.c_str());
         return 1;
     }
     if (!ldc_calibration_path.empty())
@@ -2691,6 +2701,39 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[ldc] %s\n", error.c_str());
             return 1;
         }
+    }
+    if (ldc_mode == "point")
+    {
+        if (!ctx.ldc.has_opencv_model)
+        {
+            fprintf(stderr, "[ldc] point LDC needs camera_matrix and distortion_coefficients "
+                            "in the calibration JSON\n");
+            return 1;
+        }
+        auto model = std::make_shared<LensModel>();
+        std::string error;
+        if (!model->init(ctx.ldc.camera_matrix, ctx.ldc.distortion,
+                         static_cast<int>(ctx.ldc.calibration_width),
+                         static_cast<int>(ctx.ldc.calibration_height), kDetWidth, kDetHeight,
+                         error))
+        {
+            fprintf(stderr, "[ldc] %s\n", error.c_str());
+            return 1;
+        }
+        // VPSS/GDC stays uncorrected; only decoded tag geometry is corrected.
+        ctx.ldc.enabled = false;
+        const PointLdcParams params;
+        if (decode)
+            detector.set_decoder(make_point_ldc_decoder(decode_tolerant, model, params,
+                                                        point_ldc_fallback));
+        const cv::Matx33d &k = model->camera_matrix();
+        fprintf(stderr,
+                "[ldc] point LDC on %ux%u: %d samples/edge, %d passes, fallback %s; model "
+                "invertible to raw radius %.0f px; ideal intrinsics fx=%.2f fy=%.2f cx=%.2f "
+                "cy=%.2f, zero distortion%s\n",
+                kDetWidth, kDetHeight, params.samples_per_edge, params.passes,
+                point_ldc_fallback ? "on" : "off", model->fold_radius_px(), k(0, 0), k(1, 1),
+                k(0, 2), k(1, 2), decode ? "" : " (inactive: decoding is off)");
     }
     if (ldc_mode == "sw")
     {
@@ -2886,6 +2929,9 @@ int main(int argc, char *argv[])
         double crop_marker_decode = 0, crop_refine = 0;
         size_t crop_pixels = 0, crop_contours = 0, crop_candidates = 0;
         size_t crop_attempts = 0, crop_markers = 0;
+        double crop_point = 0;
+        size_t point_refined = 0, point_refine_failed = 0, point_fallback_tried = 0,
+               point_fallback_decoded = 0;
         double ready_delta_sum = 0, ready_delta_max = -10000.0;
         long ready_delta_samples = 0;
         double age_sum = 0, age_max = 0;
@@ -3366,6 +3412,11 @@ int main(int argc, char *argv[])
             win.crop_candidates += profile.candidates;
             win.crop_attempts += profile.attempts;
             win.crop_markers += profile.markers;
+            win.crop_point += profile.point_ms;
+            win.point_refined += profile.point_refined;
+            win.point_refine_failed += profile.point_refine_failed;
+            win.point_fallback_tried += profile.point_fallback_tried;
+            win.point_fallback_decoded += profile.point_fallback_decoded;
         }
         win.release += t_released - t_detected;
         win.proposals += proposals.size();
@@ -3477,9 +3528,20 @@ int main(int argc, char *argv[])
             if (tag_output)
             {
                 for (const auto &r : window_tags)
+                {
+                    char ideal[160] = "";
+                    if (r.has_ideal)
+                        std::snprintf(ideal, sizeof(ideal),
+                                      " ideal=(%.2f,%.2f;%.2f,%.2f;%.2f,%.2f;%.2f,%.2f)",
+                                      r.ideal_corners[0].x, r.ideal_corners[0].y,
+                                      r.ideal_corners[1].x, r.ideal_corners[1].y,
+                                      r.ideal_corners[2].x, r.ideal_corners[2].y,
+                                      r.ideal_corners[3].x, r.ideal_corners[3].y);
                     dprintf(g_result_fd,
-                            "[tag] id=%d confidence=%.2f roi=(%.0f,%.0f,%.0fx%.0f)\n", r.id,
-                            r.proposal_confidence, r.roi.x, r.roi.y, r.roi.width, r.roi.height);
+                            "[tag] id=%d confidence=%.2f roi=(%.0f,%.0f,%.0fx%.0f)%s\n", r.id,
+                            r.proposal_confidence, r.roi.x, r.roi.y, r.roi.width, r.roi.height,
+                            ideal);
+                }
                 window_tags.clear();
             }
             if (decode)
@@ -3497,6 +3559,14 @@ int main(int argc, char *argv[])
                         static_cast<double>(win.crop_candidates) / n,
                         static_cast<double>(win.crop_attempts) / n,
                         static_cast<double>(win.crop_markers) / n);
+                if (win.point_refined + win.point_refine_failed + win.point_fallback_tried)
+                    fprintf(stderr,
+                            "[point-ldc] per frame ms %.3f (inside crop) | refined %.2f "
+                            "failed %.2f fallback tried %.2f decoded %.2f\n",
+                            win.crop_point / n, static_cast<double>(win.point_refined) / n,
+                            static_cast<double>(win.point_refine_failed) / n,
+                            static_cast<double>(win.point_fallback_tried) / n,
+                            static_cast<double>(win.point_fallback_decoded) / n);
             }
             if (ctx.direct_model_input)
             {
