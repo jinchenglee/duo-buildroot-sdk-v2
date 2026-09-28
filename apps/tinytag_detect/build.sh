@@ -103,10 +103,12 @@ fi
 find "${OVERLAY_DIR}" -type d -exec chmod 0755 {} +
 chmod 0700 "${OVERLAY_DIR}/root/.ssh" 2>/dev/null || true
 
-# The current A+C model (INT8 by default) is kept with the app sources. Set TINYTAG_CVIMODEL
-# to stage a different build.
+# The current A+C models (INT8 default, BF16 alternative) are committed to the
+# overlay, so a fresh clone already has them (see overlay/.gitignore). Only stage
+# over them when a freshly built model is present in the toolchain work directory
+# (or TINYTAG_CVIMODEL points somewhere).
 CVIMODEL_DST="${OVERLAY_DIR}/app/tinytag_detect/cvimodel"
-CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${APP_DIR}/cvimodel/coverage_roi_context_aug03.int8.cvimodel}"
+CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${TOP_DIR}/tools/tinytag_cvimodel/work/coverage_roi_context_aug03.int8.cvimodel}"
 if [ -f "${CVIMODEL_SRC}" ]; then
     install -Dm644 "${CVIMODEL_SRC}" "${CVIMODEL_DST}/$(basename "${CVIMODEL_SRC}")"
     info "Staged model: $(basename "${CVIMODEL_SRC}")"
@@ -122,7 +124,7 @@ fi
 
 # The golden bundle is optional and deliberately not tracked (3.2 MB); it only
 # enables --selftest. Detection works without it.
-GOLDEN_SRC="${TINYTAG_GOLDEN:-${APP_DIR}/cvimodel/coverage_roi_context_aug03.ttgold}"
+GOLDEN_SRC="${TINYTAG_GOLDEN:-${TOP_DIR}/tools/tinytag_cvimodel/work/coverage_roi_context_aug03.ttgold}"
 if [ -f "${GOLDEN_SRC}" ]; then
     install -Dm644 "${GOLDEN_SRC}" "${CVIMODEL_DST}/$(basename "${GOLDEN_SRC}")"
     info "Staged golden bundle: $(basename "${GOLDEN_SRC}") ($(du -h "${GOLDEN_SRC}" | cut -f1))"
