@@ -205,8 +205,8 @@ private:
     static constexpr int kCropH = 720;
     static constexpr float kScaleClampLo = -4.0f;
     static constexpr float kScaleClampHi = 6.0f;
-    // Channels 0-4 are the trained head (heatmap, offset_x, offset_y, scale_w,
-    // scale_h); 5-20 are dormant corner/visibility outputs, deliberately unread.
+    // The deployed A+C model has 6 channels (mask, heat, offsets, log sizes).
+    // Legacy TinyTag proposal models retain their 5-channel trained prefix.
     static constexpr int kTrainedChannels = 5;
     // Two proposals overlapping one physical tag decode to the same id; treat
     // hits closer than this as the same tag. Not a value from the training

@@ -8,9 +8,12 @@ A port of the K230 two-stage AprilTag detector (see
 network proposes tag ROIs on a downscaled frame, then a traditional-CV decoder
 reads the AprilTag 36h11 id out of each proposal at full resolution.
 
-Stage one always runs. Stage two is opt-in via `--decode`, so the TPU path can
-be exercised on its own, and the CV cost can be measured separately from it.
-ArUco Nano is the decoder, matching the K230 production default.
+The current `coverage_roi_context_aug03` checkpoint combines a coverage mask
+with TinyTag ROI predictions. Its default INT8 cvimodel is
+`cvimodel/coverage_roi_context_aug03.int8.cvimodel`; cviruntime exposes its
+six-channel output as FP32. Stage one decodes the mask into separate tag
+regions, using ROI peaks to split connected regions; stage two optionally runs
+ArUco Nano on full-resolution crops with `--decode`.
 
 ## Build and install
 
@@ -42,11 +45,14 @@ in `install/soc_<project>/tpu_64bit/`, then installs into
 `device/<board>/overlay/`:
 
 ```
-app/tinytag_detect/tinytag_detect             the binary                  (284 KB)
-app/tinytag_detect/run_tinytag.sh             launcher with defaults baked in
-app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel  the model          (43 KB)
-app/tinytag_detect/cvimodel/tinytag-v40c.ttgold         golden references  (3.2 MB)
-app/tinytag_detect/samples/                   sample frames from samples/  (740 KB)
+app/tinytag_detect/tinytag_detect             static-image binary
+app/tinytag_detect/tinytag_detect_live        live-camera binary
+app/tinytag_detect/run_tinytag.sh             static launcher with defaults
+app/tinytag_detect/run_live.sh                live launcher with defaults
+app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel   default model (~42 KB)
+app/tinytag_detect/cvimodel/coverage_roi_context_aug03.bf16.cvimodel  alternate BF16 model (143 KB)
+app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel                legacy model (43 KB)
+app/tinytag_detect/samples/                   sample frames from samples/
 usr/local/bin/run_tinytag.sh -> /app/tinytag_detect/run_tinytag.sh  (symlink, keeps it on PATH)
 ```
 
@@ -329,22 +335,22 @@ Or any image of your own:
 run_tinytag.sh /path/to/frame.jpg
 ```
 
-Defaults are the K230 production operating point and can be overridden from the
-environment:
+The defaults use the coverage-mask A+C model. Values can be overridden from
+the environment:
 
 | variable | default | meaning |
 |---|---|---|
-| `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel` | cvimodel to load |
-| `TINYTAG_THRES` | `0.35` | heatmap threshold |
-| `TINYTAG_MAX` | `8` | max proposals per frame |
-| `TINYTAG_EXPAND` | `1.5` | ROI expansion factor |
-| `TINYTAG_IOU` | `0.5` | ROI IoU suppression (<= 0 disables) |
+| `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel` | cvimodel to load |
+| `TINYTAG_THRES` | `0.30` | ROI heat threshold |
+| `TINYTAG_MAX` | `20` | max proposals per frame |
+| `TINYTAG_EXPAND` | `1.0` | legacy model ROI expansion; unused by A+C |
+| `TINYTAG_IOU` | `0.5` | legacy model ROI IoU suppression; unused by A+C |
 | `TINYTAG_OUT` | `/tmp/tinytag_det.jpg` | annotated output image |
 | `TINYTAG_DEBUG` | `1` | 0 quiet, 1 timing, 2 verbose |
 | `TINYTAG_REPEAT` | `20` | timed inference runs |
 | `TINYTAG_WARMUP` | `2` | untimed runs before measuring |
-| `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/tinytag-v40c.ttgold` | self-test bundle |
-| `TINYTAG_MAX_MAE` | `0.05` | self-test error gate |
+| `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.ttgold` | optional, model-matched self-test bundle |
+| `TINYTAG_MAX_MAE` | `0.06` | self-test error gate (accepted INT8 validation MAE is 0.0558) |
 | `TINYTAG_DECODE` | `strict` | `strict` or `tolerant`; empty disables stage two |
 
 ```sh
@@ -410,14 +416,14 @@ figure that scales with proposal count — so it is what a higher or lower
 run_tinytag.sh --selftest
 ```
 
-Replays frames from the golden bundle — each carrying the exact uint8 input,
-the FP32 ONNX Runtime output, and the host simulator's INT8 output — and reports:
+Replays frames from a model-matched golden bundle — each carrying the exact
+uint8 input, the FP32 ONNX Runtime output, and the host simulator output — and reports:
 
 | comparison | meaning | gate |
 |---|---|---|
-| hardware-INT8 vs **FP32** | quantization error: how much accuracy the INT8 model gives up | worst-frame MAE <= `--max-mae` (0.05) |
+| hardware vs **FP32** | quantization error against the source model | worst-frame MAE <= `--max-mae` (binary default 0.05; `run_tinytag.sh` passes `TINYTAG_MAX_MAE`, 0.06) |
 | heatmap peak | did the argmax move? | all frames within 2 cells |
-| hardware-INT8 vs **simulator** | does real silicon reproduce what the model was signed off against? | worst element < 1e-3 |
+| hardware vs **simulator** | does real silicon reproduce what the model was signed off against? | worst element < 1e-3 |
 
 That third row is the important one. The model is validated on the host against
 tpu-mlir's simulator; if the board disagrees with the simulator, that validation
@@ -455,12 +461,11 @@ Each frame adds ~816 KB (`--frames`, default 4).
   [2] inference()            CVI_NN_Forward
         |
         v
-  proposal_maps: f32 [1,21,45,80]   (channels 0-4 trained: heatmap,
-        |                            offset_x/y, scale_w/h; 5-20 dormant)
+  mask_and_roi: f32 [1,6,45,80]  (mask, heat, offsets x/y, log w/h)
   [3] decode_proposals()
-        sigmoid -> 3x3 max-pool NMS -> threshold -> top-K
-        -> center/size decode (exp, clamped to [-4,6]) -> roi_expand
-        -> clamp to band -> greedy IoU suppression
+        mask hysteresis (seed 0.4, grow 0.3) -> connected regions
+        -> ROI peaks split regions -> 4 px margin + conditional warm-cell margin
+        -> map boxes to the source frame
         |
         v
   proposals: [{confidence, roi}] in full-frame pixel coordinates
@@ -470,9 +475,9 @@ The crop-then-resize in step 1 is mirrored exactly by
 `tools/tinytag_cvimodel/prepare_calibration.py`, so calibration statistics match
 what the board actually sees. If you change one, change the other.
 
-## Measured on hardware
+## Legacy v40c INT8 measurements
 
-Duo S (SG2000), image built from this tree. Full analysis, including the
+These historical figures are for the older v40c proposal model, not the current A+C model. Duo S (SG2000), image built from this tree. Full analysis, including the
 K230 comparison and its caveats, is in `docs/duo-s-performance-findings.md`.
 
 ```

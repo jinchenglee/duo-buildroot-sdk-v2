@@ -17,21 +17,20 @@
 set -eu
 
 # --- defaults -------------------------------------------------------------
-# These match the K230 production launcher (utils/run.sh there): threshold 0.35,
-# an 8-proposal cap, and ROI expansion 1.5. Threshold 0.20 is the training
-# repo's frozen value: higher recall, roughly twice the proposals.
-TINYTAG_MODEL="${TINYTAG_MODEL:-/app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel}"
-TINYTAG_THRES="${TINYTAG_THRES:-0.35}"
-TINYTAG_MAX="${TINYTAG_MAX:-8}"
-TINYTAG_EXPAND="${TINYTAG_EXPAND:-1.5}"
+# Current coverage-mask decoder operating point: heat threshold 0.30 and a
+# 20-box cap. Seed/grow/margin defaults are implemented in TinyTagDet.
+TINYTAG_MODEL="${TINYTAG_MODEL:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel}"
+TINYTAG_THRES="${TINYTAG_THRES:-0.30}"
+TINYTAG_MAX="${TINYTAG_MAX:-20}"
+TINYTAG_EXPAND="${TINYTAG_EXPAND:-1.0}"
 TINYTAG_IOU="${TINYTAG_IOU:-0.5}"
 TINYTAG_OUT="${TINYTAG_OUT:-/tmp/tinytag_det.jpg}"
 TINYTAG_DEBUG="${TINYTAG_DEBUG:-1}"
 TINYTAG_BIN="${TINYTAG_BIN:-/app/tinytag_detect/tinytag_detect}"
-TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/app/tinytag_detect/cvimodel/tinytag-v40c.ttgold}"
+TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.ttgold}"
 TINYTAG_REPEAT="${TINYTAG_REPEAT:-20}"
 TINYTAG_WARMUP="${TINYTAG_WARMUP:-2}"
-TINYTAG_MAX_MAE="${TINYTAG_MAX_MAE:-0.05}"
+TINYTAG_MAX_MAE="${TINYTAG_MAX_MAE:-0.06}"
 # Strict is the default: run the ArUco Nano AprilTag 36h11 decoder over every
 # proposal, i.e. the full two-stage pipeline, minus camera capture. Set this to
 # empty to recover proposal-only behavior, or to "tolerant" for tolerant IDs.

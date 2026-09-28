@@ -4,11 +4,11 @@
 # caller can override an option by supplying it later on the command line.
 set -eu
 
-MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel}"
+MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel}"
 BIN="${TINYTAG_LIVE_BIN:-/app/tinytag_detect/tinytag_detect_live}"
-THRES="${TINYTAG_LIVE_THRES:-0.20}"
-MAX="${TINYTAG_LIVE_MAX:-8}"
-EXPAND="${TINYTAG_LIVE_EXPAND:-1.3}"
+THRES="${TINYTAG_LIVE_THRES:-0.30}"
+MAX="${TINYTAG_LIVE_MAX:-20}"
+EXPAND="${TINYTAG_LIVE_EXPAND:-1.0}"
 IOU="${TINYTAG_LIVE_IOU:-0.5}"
 DECODE="${TINYTAG_LIVE_DECODE:-strict}"
 DEBUG="${TINYTAG_LIVE_DEBUG:-1}"

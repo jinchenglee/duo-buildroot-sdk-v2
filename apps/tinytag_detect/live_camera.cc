@@ -2540,8 +2540,8 @@ int main(int argc, char *argv[])
     }
 
     const std::string cvimodel_path = argv[1];
-    float heatmap_thres = 0.35f, roi_expand = 1.5f, roi_iou_thres = 0.5f;
-    int max_proposals = 8, debug_mode = 1;
+    float heatmap_thres = 0.30f, roi_expand = 1.0f, roi_iou_thres = 0.5f;
+    int max_proposals = 20, debug_mode = 1;
     bool decode = false, decode_tolerant = false;
     std::string save_frame_path;
     std::string save_ldc_pair_prefix;

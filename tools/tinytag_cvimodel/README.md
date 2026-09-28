@@ -11,13 +11,13 @@ from nncase/kmodel to tpu-mlir/cvimodel.
 
 ## Application contract
 
-The scripts are fixed to what `apps/tinytag_detect` expects:
+The scripts compile stride-8 single-output models accepted by `apps/tinytag_detect`:
 
 | | |
 |---|---|
 | source ONNX input | float `1x1x360x640`, normalized to `[0, 1]` |
 | deployed input | uint8 grayscale `1x1x360x640`, `/255` folded in by `--fuse_preprocess` |
-| output | float `1x21x45x80` (`proposal_maps`) |
+| output | float `1xCx45x80` (generic stride-8 maps; current coverage+ROI model uses `C=6`) |
 | target | `cv181x`, which covers the SG2000/SG2002 on the Duo S |
 
 ## 1. Build the container

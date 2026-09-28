@@ -47,6 +47,14 @@ float sigmoid(float logit)
     return 1.f / (1.f + std::exp(-logit));
 }
 
+float bfloat16_to_float(uint16_t bits)
+{
+    const uint32_t word = static_cast<uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
 } // namespace
 
 TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, int max_proposals,
@@ -225,6 +233,12 @@ void TinyTagDet::copy_output(std::vector<float> &out) const
         for (size_t i = 0; i < out.size(); ++i)
             out[i] = raw[i] * inv;
     }
+    else if (output_->fmt == CVI_FMT_BF16)
+    {
+        const uint16_t *raw = reinterpret_cast<const uint16_t *>(CVI_NN_TensorPtr(output_));
+        for (size_t i = 0; i < out.size(); ++i)
+            out[i] = bfloat16_to_float(raw[i]);
+    }
     else
     {
         throw std::runtime_error(std::string("unsupported output tensor format: ") +
@@ -264,15 +278,195 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
         const float qscale = CVI_NN_TensorQuantScale(output_);
         const float inv = (qscale != 0.0f) ? (1.0f / qscale) : 1.0f;
         const int8_t *raw = reinterpret_cast<const int8_t *>(CVI_NN_TensorPtr(output_));
-        dequantized_.resize(static_cast<size_t>(plane) * kTrainedChannels);
+        dequantized_.resize(static_cast<size_t>(plane) * output_c_);
         for (size_t i = 0; i < dequantized_.size(); ++i)
             dequantized_[i] = raw[i] * inv;
+        out = dequantized_.data();
+    }
+    else if (output_->fmt == CVI_FMT_BF16)
+    {
+        const uint16_t *raw = reinterpret_cast<const uint16_t *>(CVI_NN_TensorPtr(output_));
+        dequantized_.resize(static_cast<size_t>(plane) * output_c_);
+        for (size_t i = 0; i < dequantized_.size(); ++i)
+            dequantized_[i] = bfloat16_to_float(raw[i]);
         out = dequantized_.data();
     }
     else
     {
         throw std::runtime_error(std::string("unsupported output tensor format: ") +
                                  fmt_name(output_->fmt));
+    }
+
+    // The current coverage+ROI checkpoint exposes six channels in this order:
+    // mask logit, heat logit, offsets x/y, and log width/height. Decode blobs
+    // first, then use ROI peaks inside each blob to split neighbouring tags.
+    if (output_c_ == 6)
+    {
+        const float *mask_logit = out;
+        const float *heat_logit = out + plane;
+        const float *off_x = out + 2 * plane;
+        const float *off_y = out + 3 * plane;
+        const float *log_w = out + 4 * plane;
+        const float *log_h = out + 5 * plane;
+        const float seed_thr = 0.4f;
+        const float grow_thr = 0.3f;
+        const float heat_logit_thr = heatmap_logit_thres_; // deployed default: probability .30
+        const float warm_thr = 0.2f;
+        const float margin = 4.f;
+        auto prob = [](float v) { return 1.f / (1.f + std::exp(-v)); };
+        std::vector<float> mask_prob(static_cast<size_t>(plane));
+        std::vector<int> labels(static_cast<size_t>(plane), -1);
+        for (int i = 0; i < plane; ++i)
+            mask_prob[i] = prob(mask_logit[i]);
+
+        struct Cell { int x, y; };
+        struct Peak { int x, y; float heat, cx, cy, w, h; };
+        std::vector<Proposal> decoded;
+        int component_id = 0;
+        std::vector<int> queue;
+        queue.reserve(plane);
+        for (int start = 0; start < plane; ++start)
+        {
+            if (labels[start] >= 0 || mask_prob[start] < grow_thr)
+                continue;
+            queue.clear();
+            queue.push_back(start);
+            labels[start] = component_id;
+            std::vector<Cell> cells;
+            cells.reserve(32);
+            float component_score = 0.f;
+            int min_x = W, min_y = H, max_x = -1, max_y = -1;
+            for (size_t qi = 0; qi < queue.size(); ++qi)
+            {
+                const int idx = queue[qi], y = idx / W, x = idx % W;
+                cells.push_back({x, y});
+                component_score = std::max(component_score, mask_prob[idx]);
+                min_x = std::min(min_x, x); min_y = std::min(min_y, y);
+                max_x = std::max(max_x, x); max_y = std::max(max_y, y);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                        const int ni = ny * W + nx;
+                        if (labels[ni] < 0 && mask_prob[ni] >= grow_thr)
+                        { labels[ni] = component_id; queue.push_back(ni); }
+                    }
+            }
+            ++component_id;
+            if (component_score < seed_thr)
+                continue;
+
+            std::vector<Peak> peaks;
+            for (const Cell &cell : cells)
+            {
+                const int idx = cell.y * W + cell.x;
+                if (heat_logit[idx] < heat_logit_thr) continue;
+                bool local_max = true;
+                for (int dy = -1; dy <= 1 && local_max; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const int nx = cell.x + dx, ny = cell.y + dy;
+                        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                        if (heat_logit[ny * W + nx] > heat_logit[idx])
+                        { local_max = false; break; }
+                    }
+                if (!local_max) continue;
+                const float bw = std::exp(std::max(kScaleClampLo, std::min(kScaleClampHi, log_w[idx]))) * kStride;
+                const float bh = std::exp(std::max(kScaleClampLo, std::min(kScaleClampHi, log_h[idx]))) * kStride;
+                peaks.push_back({cell.x, cell.y, heat_logit[idx],
+                                 (cell.x + off_x[idx]) * kStride,
+                                 (cell.y + off_y[idx]) * kStride, bw, bh});
+            }
+            std::sort(peaks.begin(), peaks.end(), [](const Peak &a, const Peak &b) { return a.heat > b.heat; });
+            std::vector<Peak> unique_peaks;
+            for (const Peak &p : peaks)
+            {
+                bool duplicate = false;
+                for (const Peak &k : unique_peaks)
+                    if (std::abs(p.cx - k.cx) <= k.w * .5f && std::abs(p.cy - k.cy) <= k.h * .5f)
+                    { duplicate = true; break; }
+                if (!duplicate) unique_peaks.push_back(p);
+            }
+
+            if (unique_peaks.empty())
+            {
+                const float x0 = std::max(0.f, min_x * kStride - margin);
+                const float y0 = std::max(0.f, min_y * kStride - margin);
+                const float x1 = std::min(static_cast<float>(input_w_), (max_x + 1) * kStride + margin);
+                const float y1 = std::min(static_cast<float>(input_h_), (max_y + 1) * kStride + margin);
+                decoded.push_back({component_score, cv::Rect2f(x0,y0,x1-x0,y1-y0)});
+                continue;
+            }
+
+            std::vector<std::vector<Cell>> owned(unique_peaks.size());
+            for (const Cell &cell : cells)
+            {
+                int owner = 0;
+                float best = std::numeric_limits<float>::infinity();
+                for (size_t j = 0; j < unique_peaks.size(); ++j)
+                {
+                    const Peak &p = unique_peaks[j];
+                    const float scale = std::max(p.w, p.h);
+                    const float dx = (cell.x + .5f) * kStride - p.cx;
+                    const float dy = (cell.y + .5f) * kStride - p.cy;
+                    const float d = std::hypot(dx, dy) / std::max(scale, 1.f);
+                    if (d < best) { best = d; owner = static_cast<int>(j); }
+                }
+                owned[owner].push_back(cell);
+            }
+            for (size_t j = 0; j < unique_peaks.size(); ++j)
+            {
+                const Peak &p = unique_peaks[j];
+                float x0 = p.cx - p.w * .5f, y0 = p.cy - p.h * .5f;
+                float x1 = p.cx + p.w * .5f, y1 = p.cy + p.h * .5f;
+                float score = 0.f;
+                if (!owned[j].empty())
+                {
+                    int bx0=W, by0=H, bx1=-1, by1=-1;
+                    for (const Cell &cell : owned[j])
+                    {
+                        bx0=std::min(bx0,cell.x); by0=std::min(by0,cell.y);
+                        bx1=std::max(bx1,cell.x); by1=std::max(by1,cell.y);
+                        score=std::max(score,mask_prob[cell.y*W+cell.x]);
+                    }
+                    x0=std::min(x0,bx0*static_cast<float>(kStride)); y0=std::min(y0,by0*static_cast<float>(kStride));
+                    x1=std::max(x1,(bx1+1)*static_cast<float>(kStride)); y1=std::max(y1,(by1+1)*static_cast<float>(kStride));
+                }
+                else score=mask_prob[p.y*W+p.x];
+
+                // One conditional cell of quiet-zone margin, only on ROI boxes.
+                int c0=std::max(0,static_cast<int>(std::floor(x0/kStride)));
+                int r0=std::max(0,static_cast<int>(std::floor(y0/kStride)));
+                int c1=std::min(W,static_cast<int>(std::ceil(x1/kStride)));
+                int r1=std::min(H,static_cast<int>(std::ceil(y1/kStride)));
+                auto warm = [&](int x,int y) { const float q=mask_prob[y*W+x]; return q>=warm_thr && q<grow_thr; };
+                if (r0>0) for(int x=c0;x<c1;++x) if(warm(x,r0-1)){--r0;y0=std::min(y0,r0*static_cast<float>(kStride));break;}
+                if (r1<H) for(int x=c0;x<c1;++x) if(warm(x,r1)){++r1;y1=std::max(y1,r1*static_cast<float>(kStride));break;}
+                if (c0>0) for(int y=r0;y<r1;++y) if(warm(c0-1,y)){--c0;x0=std::min(x0,c0*static_cast<float>(kStride));break;}
+                if (c1<W) for(int y=r0;y<r1;++y) if(warm(c1,y)){++c1;x1=std::max(x1,c1*static_cast<float>(kStride));break;}
+                x0=std::max(0.f,x0-margin); y0=std::max(0.f,y0-margin);
+                x1=std::max(0.f,std::min(static_cast<float>(input_w_),x1+margin));
+                y1=std::max(0.f,std::min(static_cast<float>(input_h_),y1+margin));
+                x0=std::min(x0,static_cast<float>(input_w_));
+                y0=std::min(y0,static_cast<float>(input_h_));
+                decoded.push_back({score,cv::Rect2f(x0,y0,x1-x0,y1-y0)});
+            }
+        }
+        std::sort(decoded.begin(), decoded.end(), [](const Proposal &a,const Proposal &b){return a.confidence>b.confidence;});
+        if (max_proposals_ > 0 && decoded.size() > static_cast<size_t>(max_proposals_)) decoded.resize(max_proposals_);
+
+        const int band_w=std::min(frame_size.width,kCropW), band_h=std::min(frame_size.height,kCropH);
+        const int crop_y=frame_size.height-band_h;
+        const float xf=static_cast<float>(band_w)/input_w_, yf=static_cast<float>(band_h)/input_h_;
+        for (const Proposal &p : decoded)
+        {
+            float x0=p.roi.x*xf, y0=p.roi.y*yf+crop_y;
+            float x1=(p.roi.x+p.roi.width)*xf, y1=(p.roi.y+p.roi.height)*yf+crop_y;
+            proposals.push_back({p.confidence,cv::Rect2f(x0,y0,x1-x0,y1-y0)});
+        }
+        decode_ms_ = now_ms() - started;
+        return;
     }
 
     const float *heatmap = out + 0 * plane;

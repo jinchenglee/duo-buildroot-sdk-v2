@@ -32,7 +32,7 @@ import onnx
 from onnx import numpy_helper, shape_inference
 
 INPUT_SHAPE = [1, 1, 360, 640]
-OUTPUT_SHAPE = [1, 21, 45, 80]
+OUTPUT_SPATIAL_SHAPE = [45, 80]
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".pgm", ".webp"}
 
 
@@ -154,8 +154,8 @@ def prepare_onnx(source: Path, destination: Path, expand_dilation: bool) -> None
 
     model = shape_inference.infer_shapes(model)
     actual = [dim.dim_value for dim in model.graph.output[0].type.tensor_type.shape.dim]
-    if actual != OUTPUT_SHAPE:
-        raise RuntimeError(f"expected output {OUTPUT_SHAPE}, got {actual}")
+    if len(actual) != 4 or actual[0] != 1 or actual[1] < 1 or actual[2:] != OUTPUT_SPATIAL_SHAPE:
+        raise RuntimeError(f"expected output [1,C,45,80], got {actual}")
     onnx.checker.check_model(model)
     onnx.save(model, str(destination))
 

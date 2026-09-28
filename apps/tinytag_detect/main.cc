@@ -240,8 +240,8 @@ int main(int argc, char **argv)
         image_path = argv[2];
     }
 
-    float heatmap_thres = 0.35f;
-    int max_proposals = 8;
+    float heatmap_thres = 0.30f;
+    int max_proposals = 20;
     float roi_expand = 1.5f;
     float roi_iou_thres = 0.5f;
     std::string output_path = "tinytag_det.jpg";
