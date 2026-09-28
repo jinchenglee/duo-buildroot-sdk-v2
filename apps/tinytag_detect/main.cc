@@ -41,6 +41,7 @@ void usage(const char *argv0)
     printf("  --warmup <n>      untimed runs first       (default 2)\n");
     printf("  --max-mae <f>     self-test error gate     (default 0.05)\n");
     printf("  --decode [mode]   run the ArUco Nano tag decoder on each proposal\n");
+    printf("  --threshold-model <cvimodel>  use precomputed 1280x720 INT8 mask for Nano contours\n");
     printf("                    mode: strict (default) or tolerant\n");
     printf("  --debug <0|1|2>   verbosity                (default 1)\n");
     printf("\nThe detection defaults match the K230 production operating point.\n");
@@ -246,6 +247,7 @@ int main(int argc, char **argv)
     float roi_iou_thres = 0.5f;
     std::string output_path = "tinytag_det.jpg";
     std::string bench_json_path;
+    std::string threshold_model_path;
     bool decode = false;
     bool decode_tolerant = false;
     int repeat = 1;
@@ -263,6 +265,7 @@ int main(int argc, char **argv)
         else if (flag == "--iou" && has_value)    roi_iou_thres = std::atof(argv[++i]);
         else if (flag == "--out" && has_value)    output_path = argv[++i];
         else if (flag == "--bench-json" && has_value) bench_json_path = argv[++i];
+        else if (flag == "--threshold-model" && has_value) threshold_model_path = argv[++i];
         else if (flag == "--repeat" && has_value) repeat = std::atoi(argv[++i]);
         else if (flag == "--warmup" && has_value) warmup = std::atoi(argv[++i]);
         else if (flag == "--max-mae" && has_value) max_mae = std::atof(argv[++i]);
@@ -290,6 +293,11 @@ int main(int argc, char **argv)
         repeat = 1;
     if (warmup < 0)
         warmup = 0;
+    if (!threshold_model_path.empty() && !decode)
+    {
+        printf("--threshold-model requires --decode\n");
+        return 1;
+    }
 
     try
     {
@@ -315,6 +323,8 @@ int main(int argc, char **argv)
         if (decode)
         {
             detector.set_decoder(make_aruco_nano_decoder(decode_tolerant));
+            if (!threshold_model_path.empty())
+                detector.set_threshold_model(threshold_model_path);
             if (debug_mode > 0)
                 printf("decoder: ArUco Nano, AprilTag 36h11, %s\n",
                        decode_tolerant ? "tolerant" : "strict");
@@ -334,6 +344,8 @@ int main(int argc, char **argv)
 
         std::vector<double> preprocess_samples, inference_samples, decode_samples;
         std::vector<double> crop_decode_samples, total_samples;
+        std::vector<double> threshold_input_samples, threshold_inference_samples,
+            threshold_convert_samples;
         for (int i = 0; i < repeat; ++i)
         {
             detector.detect(gray, proposals);
@@ -343,6 +355,12 @@ int main(int argc, char **argv)
             inference_samples.push_back(detector.last_inference_ms());
             decode_samples.push_back(detector.last_decode_ms());
             crop_decode_samples.push_back(decode ? detector.last_crop_decode_ms() : 0.0);
+            if (detector.has_threshold_model())
+            {
+                threshold_input_samples.push_back(detector.last_threshold_input_ms());
+                threshold_inference_samples.push_back(detector.last_threshold_inference_ms());
+                threshold_convert_samples.push_back(detector.last_threshold_convert_ms());
+            }
             total_samples.push_back(detector.last_preprocess_ms() +
                                     detector.last_inference_ms() +
                                     detector.last_decode_ms() +
@@ -400,6 +418,12 @@ int main(int argc, char **argv)
             print_stats("decode", summarize(decode_samples));
             if (decode)
                 print_stats("crop_decode", summarize(crop_decode_samples));
+            if (detector.has_threshold_model())
+            {
+                print_stats("mask_input", summarize(threshold_input_samples));
+                print_stats("mask_tpu", summarize(threshold_inference_samples));
+                print_stats("mask_convert", summarize(threshold_convert_samples));
+            }
             print_stats("total", summarize(total_samples));
 
             const Stats inference_stats = summarize(inference_samples);
@@ -417,6 +441,11 @@ int main(int argc, char **argv)
                 if (crops > 0)
                     printf("  per-ROI decode   : %.2f ms over %zu crop(s)\n",
                            crop_stats.median / crops, crops);
+                const TagDecoderProfile &profile = detector.last_decoder_profile();
+                printf("  crop stage ms    : threshold %.3f contour %.3f quad %.3f "
+                       "marker %.3f refine %.3f | %zu input pixels\n",
+                       profile.threshold_ms, profile.contour_ms, profile.quad_ms,
+                       profile.decode_ms, profile.refine_ms, profile.pixels);
                 printf("  This is the full two-stage pipeline, minus camera capture.\n");
             }
             else

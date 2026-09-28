@@ -59,16 +59,41 @@ cv::Point2f mean_corner(const cv::Point2f corners[4])
 class ArucoNanoDecoder final : public TagCropDecoder
 {
 public:
-    explicit ArucoNanoDecoder(bool tolerant) : parameters_(nano_parameters(tolerant)) {}
+    explicit ArucoNanoDecoder(bool tolerant)
+        : parameters_(nano_parameters(tolerant)), threshold_scratch_(720, 1280, CV_8UC1) {}
 
     std::vector<TagDetection> detect(const cv::Mat &crop) override
+    {
+        return detect_impl(crop, nullptr);
+    }
+
+    std::vector<TagDetection> detect_with_mask(const cv::Mat &crop,
+                                               const cv::Mat &mask) override
+    {
+        if (mask.type() != CV_8UC1 || mask.size() != crop.size() ||
+            mask.cols > threshold_scratch_.cols || mask.rows > threshold_scratch_.rows)
+            throw std::runtime_error("external Nano mask has invalid shape or type");
+        const auto started = std::chrono::steady_clock::now();
+        cv::Mat writable = threshold_scratch_(cv::Rect(0, 0, mask.cols, mask.rows));
+        mask.copyTo(writable); // contour tracing changes its input in place
+        const auto copied = std::chrono::steady_clock::now();
+        auto out = detect_impl(crop, &writable);
+        profile_.threshold_ms += std::chrono::duration<double, std::milli>(copied - started).count();
+        return out;
+    }
+
+    bool supports_external_mask() const override { return true; }
+    const TagDecoderProfile &last_profile() const override { return profile_; }
+
+private:
+    std::vector<TagDetection> detect_impl(const cv::Mat &crop, cv::Mat *mask)
     {
         if (crop.type() != CV_8UC1)
             throw std::runtime_error("TagCropDecoder::detect expects CV_8UC1");
 
         aruco_nano::DetectionProfile measured;
         const auto markers = aruco_nano::MarkerDetector::detect(
-            crop, parameters_, nullptr, &measured);
+            crop, parameters_, nullptr, &measured, mask);
         copy_profile(measured, crop, profile_);
 
         std::vector<TagDetection> out;
@@ -87,11 +112,9 @@ public:
         return out;
     }
 
-    const TagDecoderProfile &last_profile() const override { return profile_; }
-
-private:
     aruco_nano::DetectorParameters parameters_;
     TagDecoderProfile profile_;
+    cv::Mat threshold_scratch_;
 };
 
 double quad_area(const cv::Point2f q[4])

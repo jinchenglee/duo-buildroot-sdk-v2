@@ -397,6 +397,7 @@ void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
             "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png]\n"
+            "       [--threshold-model 1280x720.int8.cvimodel]\n"
             "       [--save-ldc-pair prefix]\n"
             "       [--save-native-frame frame.png] [--rtsp|--no-rtsp]\n"
             "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
@@ -2546,6 +2547,7 @@ int main(int argc, char *argv[])
     std::string save_frame_path;
     std::string save_ldc_pair_prefix;
     std::string save_native_frame_path;
+    std::string threshold_model_path;
     bool rtsp = false, rtsp_luma = false;
     std::string record_path;
     bool record = false;
@@ -2576,6 +2578,7 @@ int main(int argc, char *argv[])
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
         else if (flag == "--save-ldc-pair" && has_value) save_ldc_pair_prefix = argv[++i];
         else if (flag == "--save-native-frame" && has_value) save_native_frame_path = argv[++i];
+        else if (flag == "--threshold-model" && has_value) threshold_model_path = argv[++i];
         else if (flag == "--crop-align" && has_value) crop_align = std::atoi(argv[++i]);
         else if (flag == "--ldc-calibration" && has_value) ldc_calibration_path = argv[++i];
         else if (flag == "--ldc-mode" && has_value) ldc_mode = argv[++i];
@@ -2805,6 +2808,25 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[ldc] warning: colour --rtsp shows uncorrected VPSS pixels under "
                             "corrected-frame overlays; use --rtsp-luma\n");
     }
+    if (!threshold_model_path.empty())
+    {
+        if (!decode || ldc_mode == "point")
+        {
+            fprintf(stderr, "[threshold] --threshold-model needs Nano --decode without point LDC\n");
+            return 1;
+        }
+        try
+        {
+            detector.set_threshold_model(threshold_model_path);
+        }
+        catch (const std::exception &error)
+        {
+            fprintf(stderr, "[threshold] initialization failed: %s\n", error.what());
+            return 1;
+        }
+        fprintf(stderr, "[threshold] preallocated 1280x720 mask: %s\n",
+                threshold_model_path.c_str());
+    }
     ctx.compact_direct_input = direct_compact_input && !detector.uses_aligned_input();
     ctx.validate_compact_input = validate_compact_input && ctx.compact_direct_input;
     ctx.direct_model_input = !capture_only &&
@@ -2926,6 +2948,7 @@ int main(int argc, char *argv[])
         double output = 0;
         double service_cpu = 0;
         double crop_threshold = 0, crop_contour = 0, crop_quad = 0;
+        double mask_input = 0, mask_tpu = 0, mask_convert = 0;
         double crop_marker_decode = 0, crop_refine = 0;
         size_t crop_pixels = 0, crop_contours = 0, crop_candidates = 0;
         size_t crop_attempts = 0, crop_markers = 0;
@@ -3403,6 +3426,9 @@ int main(int argc, char *argv[])
         {
             const TagDecoderProfile &profile = detector.last_decoder_profile();
             win.crop_threshold += profile.threshold_ms;
+            win.mask_input += detector.last_threshold_input_ms();
+            win.mask_tpu += detector.last_threshold_inference_ms();
+            win.mask_convert += detector.last_threshold_convert_ms();
             win.crop_contour += profile.contour_ms;
             win.crop_quad += profile.quad_ms;
             win.crop_marker_decode += profile.decode_ms;
@@ -3559,6 +3585,12 @@ int main(int argc, char *argv[])
                         static_cast<double>(win.crop_candidates) / n,
                         static_cast<double>(win.crop_attempts) / n,
                         static_cast<double>(win.crop_markers) / n);
+                if (detector.has_threshold_model())
+                    fprintf(stderr,
+                            "[threshold-npu] per frame ms: input %.2f TPU %.2f convert %.2f "
+                            "(included in crop %.2f)\n",
+                            win.mask_input / n, win.mask_tpu / n, win.mask_convert / n,
+                            win.crop / n);
                 if (win.point_refined + win.point_refine_failed + win.point_fallback_tried)
                     fprintf(stderr,
                             "[point-ldc] per frame ms %.3f (inside crop) | refined %.2f "

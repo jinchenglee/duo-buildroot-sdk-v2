@@ -153,6 +153,7 @@
 #include <opencv2/core/hal/intrin.hpp>
 #include <opencv2/objdetect/aruco_dictionary.hpp> // only the dictionary is needed
 #include <chrono>
+#include <stdexcept>
 #include <vector>
 
 namespace aruco_nano  {
@@ -194,7 +195,9 @@ struct DetectionProfile {
 class MarkerDetector{
 public:
     // The only function you need to call
-    static inline std::vector<Marker> detect(const cv::Mat &img, const DetectorParameters &params=DetectorParameters(),std::vector<Marker> *candidatesOut=nullptr, DetectionProfile *profile=nullptr);
+    // externalThreshold is a writable 0/255 mask for this image. Contour
+    // tracing modifies it in place; the caller must provide scratch storage.
+    static inline std::vector<Marker> detect(const cv::Mat &img, const DetectorParameters &params=DetectorParameters(),std::vector<Marker> *candidatesOut=nullptr, DetectionProfile *profile=nullptr, cv::Mat *externalThreshold=nullptr);
 private:
     static inline Marker sort( const  Marker &marker);
     static inline float  getSubpixelValue(const cv::Mat &im_grey,const cv::Point2f &p);
@@ -326,7 +329,7 @@ void ArucoDetector::detectMarkers(cv::InputArray _image, cv::OutputArrayOfArrays
     _ids.create((int)idsVec.size(), 1, CV_32SC1);
     cv::Mat(idsVec).copyTo(_ids);
 }
-std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorParameters &params,std::vector<Marker> *candidatesOut, DetectionProfile *profile){
+std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorParameters &params,std::vector<Marker> *candidatesOut, DetectionProfile *profile, cv::Mat *externalThreshold){
     using ProfileClock = std::chrono::steady_clock;
     const auto profileStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
     auto profileMs = [](ProfileClock::time_point begin, ProfileClock::time_point end) {
@@ -342,9 +345,15 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
     /////////////////// Adaptive Threshold to detect border
     //    cv::adaptiveThreshold(bwimage, thresImage, 255.,cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, params.boxFilterSize, params.Thres);
     //this method is achieves a ~1.5 speed up
-    cv::boxFilter( bwimage, thresImage, bwimage.type(), cv::Size(params.boxFilterSize, params.boxFilterSize),cv::Point(-1,-1), true, cv::BORDER_REPLICATE|cv::BORDER_ISOLATED );
-    thresImage=thresImage-bwimage;
-    cv::threshold(thresImage, thresImage, params.thres, 255, cv::THRESH_BINARY);
+    if (externalThreshold != nullptr) {
+        if (externalThreshold->type() != CV_8UC1 || externalThreshold->size() != bwimage.size())
+            throw std::invalid_argument("external ArUco Nano threshold mask must match grayscale image");
+        thresImage = *externalThreshold;
+    } else {
+        cv::boxFilter( bwimage, thresImage, bwimage.type(), cv::Size(params.boxFilterSize, params.boxFilterSize),cv::Point(-1,-1), true, cv::BORDER_REPLICATE|cv::BORDER_ISOLATED );
+        thresImage=thresImage-bwimage;
+        cv::threshold(thresImage, thresImage, params.thres, 255, cv::THRESH_BINARY);
+    }
     const auto thresholdDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
     /////////////////// compute marker candidates by detecting contours
     std::vector<std::vector<cv::Point>> contours;

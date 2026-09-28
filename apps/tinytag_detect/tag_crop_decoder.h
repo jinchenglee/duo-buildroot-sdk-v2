@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <opencv2/core.hpp>
+#include <stdexcept>
 #include <vector>
 
 class LensModel;
@@ -37,8 +38,9 @@ struct TagDecoderProfile
 };
 
 // Stage two of the two-stage detector: crop each neural proposal out of the
-// full-resolution frame and hand it to a *traditional* CV tag decoder --
-// nothing neural past this point.
+// full-resolution frame and hand it to a *traditional* CV tag decoder. An
+// optional precomputed NPU mask replaces only Nano's local threshold stage;
+// contour tracing, bit sampling, and corner refinement remain here.
 //
 // Kept as an interface, matching the K230 application's design, so a different
 // backend can be dropped in without touching proposal code. Only ArUco Nano is
@@ -54,6 +56,16 @@ public:
     // sub-Mat view is expected, and implementations must respect .step rather
     // than assuming packed rows.
     virtual std::vector<TagDetection> detect(const cv::Mat &crop) = 0;
+    // The contour stage reads a precomputed binary mask. Bit extraction and
+    // subpixel refinement still read the original grayscale crop.
+    virtual std::vector<TagDetection> detect_with_mask(const cv::Mat &crop,
+                                                       const cv::Mat &mask)
+    {
+        (void)crop;
+        (void)mask;
+        throw std::runtime_error("this tag decoder does not accept an external mask");
+    }
+    virtual bool supports_external_mask() const { return false; }
     virtual const TagDecoderProfile &last_profile() const = 0;
 };
 

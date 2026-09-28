@@ -10,14 +10,16 @@
 #include <string>
 #include <vector>
 
+class ThresholdModel;
+
 // One neural proposal, in full-frame pixel coordinates.
 //
 // This is the neural half of the K230 two-stage detector (see
 // buildroot-overlay/package/ai_demo/tinytag_detect in the K230 SDK): the
 // network proposes tag ROIs, and a traditional-CV AprilTag decoder reads the
-// 36h11 ID out of each one at full resolution. Only the neural half is ported
-// here -- the CV decode stage is a separate, much larger dependency, and the
-// point of this application is to prove the SG2000 TPU path end to end.
+// 36h11 ID out of each one at full resolution. The optional threshold model
+// supplies a full-resolution contour mask while Nano still samples marker bits
+// and refines corners from the grayscale frame.
 struct Proposal
 {
     float confidence; // sigmoid(heatmap) at the peak cell
@@ -120,6 +122,14 @@ public:
                       const std::vector<Proposal> &proposals,
                       std::vector<TinyTagResult> &results);
 
+    // Optional 1280x720 INT8 signed-difference model. Registration allocates
+    // its tensors and one persistent binary mask surface before any frames run.
+    void set_threshold_model(const std::string &cvimodel_path);
+    bool has_threshold_model() const { return threshold_model_ != nullptr; }
+    double last_threshold_input_ms() const { return threshold_input_ms_; }
+    double last_threshold_inference_ms() const { return threshold_inference_ms_; }
+    double last_threshold_convert_ms() const { return threshold_convert_ms_; }
+
     void set_decoder(std::shared_ptr<TagCropDecoder> decoder) { decoder_ = std::move(decoder); }
 
     // Snap each crop's horizontal extent out to a multiple of `align` pixels.
@@ -196,6 +206,10 @@ private:
     std::vector<cv::Rect> crop_rects_;
     TagDecoderProfile decoder_profile_;
     bool physical_input_bound_ = false;
+    std::unique_ptr<ThresholdModel> threshold_model_;
+    double threshold_input_ms_ = 0.0;
+    double threshold_inference_ms_ = 0.0;
+    double threshold_convert_ms_ = 0.0;
 
     std::shared_ptr<TagCropDecoder> decoder_;
 

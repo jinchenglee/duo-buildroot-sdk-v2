@@ -58,6 +58,11 @@ target_link_libraries(tinytag_detect
 
 install(TARGETS tinytag_detect DESTINATION app/tinytag_detect)
 
+# Standalone TPU threshold timing and per-pixel output check.
+add_executable(threshold_bench threshold_bench.cc)
+target_link_libraries(threshold_bench ${CVI_LIBS} ${OPENCV_LIBS} stdc++ pthread z m)
+install(TARGETS threshold_bench DESTINATION app/tinytag_detect)
+
 # Offline check and per-ROI timing of point-level LDC on a still frame
 # (see point_ldc_check.cc). Needs only OpenCV, no TPU or MPI.
 add_executable(point_ldc_check

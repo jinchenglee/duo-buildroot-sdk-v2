@@ -10,6 +10,9 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -57,6 +60,118 @@ float bfloat16_to_float(uint16_t bits)
 
 } // namespace
 
+// The TPU returns a signed INT8 local-mean-minus-pixel image. Keep the model
+// tensors and binary output surface alive for the detector's whole lifetime.
+// A simple integer cutoff creates the 0/255 mask needed by Nano's contour
+// tracer; no FP32 full-frame conversion or per-frame allocation is involved.
+class ThresholdModel
+{
+public:
+    explicit ThresholdModel(const std::string &path) : mask_(720, 1280, CV_8UC1)
+    {
+        if (CVI_NN_RegisterModel(path.c_str(), &model_) != CVI_RC_SUCCESS)
+            throw std::runtime_error("cannot register threshold model: " + path);
+        try
+        {
+            if (CVI_NN_GetInputOutputTensors(model_, &inputs_, &n_inputs_,
+                                             &outputs_, &n_outputs_) != CVI_RC_SUCCESS ||
+                n_inputs_ != 1 || n_outputs_ != 1)
+                throw std::runtime_error("threshold model needs one input and one output");
+            const CVI_SHAPE in = CVI_NN_TensorShape(&inputs_[0]);
+            const CVI_SHAPE out = CVI_NN_TensorShape(&outputs_[0]);
+            if (in.dim_size != 4 || out.dim_size != 4 ||
+                in.dim[0] != 1 || in.dim[1] != 1 || in.dim[2] != 720 || in.dim[3] != 1280 ||
+                out.dim[0] != 1 || out.dim[1] != 1 || out.dim[2] != 720 || out.dim[3] != 1280 ||
+                inputs_[0].fmt != CVI_FMT_UINT8 || outputs_[0].fmt != CVI_FMT_INT8 ||
+                inputs_[0].aligned || inputs_[0].mem_size < 1280u * 720u ||
+                outputs_[0].mem_size < 1280u * 720u)
+                throw std::runtime_error("threshold model needs dense uint8 1280x720 input and signed INT8 output");
+            const float qscale = CVI_NN_TensorQuantScale(&outputs_[0]);
+            if (!(qscale > 0.f) || !std::isfinite(qscale))
+                throw std::runtime_error("threshold model has invalid output quantization scale");
+            cutoff_q_ = static_cast<int>(std::floor(3.5f * qscale));
+            input_ptr_ = static_cast<uint8_t *>(CVI_NN_TensorPtr(&inputs_[0]));
+            output_ptr_ = static_cast<const int8_t *>(CVI_NN_TensorPtr(&outputs_[0]));
+            if (!input_ptr_ || !output_ptr_)
+                throw std::runtime_error("threshold model tensors are not host accessible");
+        }
+        catch (...)
+        {
+            CVI_NN_CleanupModel(model_);
+            model_ = nullptr;
+            throw;
+        }
+    }
+
+    ~ThresholdModel() { if (model_) CVI_NN_CleanupModel(model_); }
+    ThresholdModel(const ThresholdModel &) = delete;
+    ThresholdModel &operator=(const ThresholdModel &) = delete;
+
+    void run(const cv::Mat &full_res_gray)
+    {
+        if (full_res_gray.type() != CV_8UC1 ||
+            full_res_gray.cols < 1280 || full_res_gray.rows < 720)
+            throw std::runtime_error("threshold model needs at least a 1280x720 grayscale frame");
+        const double begin = now_ms();
+        origin_y_ = full_res_gray.rows - 720;
+        for (int y = 0; y < 720; ++y)
+            std::memcpy(input_ptr_ + static_cast<size_t>(y) * 1280,
+                        full_res_gray.ptr<uint8_t>(origin_y_ + y), 1280);
+        const double copied = now_ms();
+        if (CVI_NN_Forward(model_, inputs_, n_inputs_, outputs_, n_outputs_) != CVI_RC_SUCCESS)
+            throw std::runtime_error("threshold CVI_NN_Forward failed");
+        const double inferred = now_ms();
+        if (cutoff_q_ >= 127)
+        {
+            mask_.setTo(0);
+        }
+        else if (cutoff_q_ < -128)
+        {
+            mask_.setTo(255);
+        }
+        else
+        {
+#if defined(__ARM_NEON)
+            const int8x16_t cutoff = vdupq_n_s8(static_cast<int8_t>(cutoff_q_));
+#endif
+            for (int y = 0; y < 720; ++y)
+            {
+                const int8_t *src = output_ptr_ + static_cast<size_t>(y) * 1280;
+                uint8_t *dst = mask_.ptr<uint8_t>(y);
+                int x = 0;
+#if defined(__ARM_NEON)
+                for (; x + 16 <= 1280; x += 16)
+                    vst1q_u8(dst + x, vcgtq_s8(vld1q_s8(src + x), cutoff));
+#endif
+                for (; x < 1280; ++x)
+                    dst[x] = src[x] > cutoff_q_ ? 255 : 0;
+            }
+        }
+        const double converted = now_ms();
+        input_ms_ = copied - begin;
+        inference_ms_ = inferred - copied;
+        convert_ms_ = converted - inferred;
+    }
+
+    const cv::Mat &mask() const { return mask_; }
+    int origin_y() const { return origin_y_; }
+    double input_ms() const { return input_ms_; }
+    double inference_ms() const { return inference_ms_; }
+    double convert_ms() const { return convert_ms_; }
+
+private:
+    CVI_MODEL_HANDLE model_ = nullptr;
+    CVI_TENSOR *inputs_ = nullptr;
+    CVI_TENSOR *outputs_ = nullptr;
+    int32_t n_inputs_ = 0, n_outputs_ = 0;
+    uint8_t *input_ptr_ = nullptr;
+    const int8_t *output_ptr_ = nullptr;
+    cv::Mat mask_;
+    int cutoff_q_ = 0;
+    int origin_y_ = 0;
+    double input_ms_ = 0.0, inference_ms_ = 0.0, convert_ms_ = 0.0;
+};
+
 TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, int max_proposals,
                        float roi_expand, float roi_iou_thres, int debug_mode)
     : heatmap_logit_thres_(probability_to_logit(heatmap_thres)),
@@ -76,6 +191,21 @@ TinyTagDet::TinyTagDet(const std::string &cvimodel_path, float heatmap_thres, in
 
     input_ = CVI_NN_GetTensorByName(CVI_NN_DEFAULT_TENSOR, input_tensors_, input_num_);
     output_ = CVI_NN_GetTensorByName(CVI_NN_DEFAULT_TENSOR, output_tensors_, output_num_);
+    // A merged model also exposes the full-resolution threshold mask. The
+    // runtime has no default output in that case; select the proposal map.
+    if (output_ == nullptr)
+    {
+        for (int index = 0; index < output_num_; ++index)
+        {
+            CVI_SHAPE candidate = CVI_NN_TensorShape(&output_tensors_[index]);
+            if (candidate.dim_size == 4 &&
+                (candidate.dim[1] == 21 || candidate.dim[1] == 6))
+            {
+                output_ = &output_tensors_[index];
+                break;
+            }
+        }
+    }
     if (input_ == nullptr || output_ == nullptr)
         throw std::runtime_error("cvimodel has no usable input/output tensor");
 
@@ -123,6 +253,13 @@ TinyTagDet::~TinyTagDet()
             CVI_NN_SetTensorPhysicalAddr(input_, 0);
         CVI_NN_CleanupModel(model_);
     }
+}
+
+void TinyTagDet::set_threshold_model(const std::string &cvimodel_path)
+{
+    if (decoder_ && !decoder_->supports_external_mask())
+        throw std::runtime_error("selected tag decoder does not accept a threshold mask");
+    threshold_model_.reset(new ThresholdModel(cvimodel_path));
 }
 
 void TinyTagDet::pre_process(const cv::Mat &ori_img_gray)
@@ -720,6 +857,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     decoder_profile_ = TagDecoderProfile{};
 
     crop_rects_.clear();
+    threshold_input_ms_ = threshold_inference_ms_ = threshold_convert_ms_ = 0.0;
 
     if (!decoder_)
     {
@@ -728,6 +866,20 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     }
     if (full_res_gray.empty() || full_res_gray.type() != CV_8UC1)
         throw std::runtime_error("post_process expects a non-empty CV_8UC1 image");
+
+    const cv::Mat *full_mask = nullptr;
+    int mask_origin_y = 0;
+    if (threshold_model_ && !proposals.empty())
+    {
+        if (!decoder_->supports_external_mask())
+            throw std::runtime_error("selected tag decoder does not accept a threshold mask");
+        threshold_model_->run(full_res_gray);
+        full_mask = &threshold_model_->mask();
+        mask_origin_y = threshold_model_->origin_y();
+        threshold_input_ms_ = threshold_model_->input_ms();
+        threshold_inference_ms_ = threshold_model_->inference_ms();
+        threshold_convert_ms_ = threshold_model_->convert_ms();
+    }
 
     for (const auto &proposal : proposals)
     {
@@ -762,7 +914,18 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         crop_rects_.push_back(crop_rect);
         ++crop_count_;
 
-        const auto tags = decoder_->detect(crop);
+        std::vector<TagDetection> tags;
+        if (full_mask)
+        {
+            const cv::Rect mask_rect(crop_rect.x, crop_rect.y - mask_origin_y,
+                                     crop_rect.width, crop_rect.height);
+            if (mask_rect.x < 0 || mask_rect.y < 0 ||
+                mask_rect.br().x > full_mask->cols || mask_rect.br().y > full_mask->rows)
+                throw std::runtime_error("proposal crop lies outside threshold model's 1280x720 band");
+            tags = decoder_->detect_with_mask(crop, (*full_mask)(mask_rect));
+        }
+        else
+            tags = decoder_->detect(crop);
         const TagDecoderProfile &profile = decoder_->last_profile();
         decoder_profile_.threshold_ms += profile.threshold_ms;
         decoder_profile_.contour_ms += profile.contour_ms;
