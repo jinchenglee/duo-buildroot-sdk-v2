@@ -38,6 +38,7 @@ FLIP="${TINYTAG_LIVE_FLIP:-0}"
 # every crop row starts 4-byte aligned and spans whole 32-bit words. Set 0 or 1
 # to disable and compare. Aligned regions show pink on the preview.
 CROP_ALIGN="${TINYTAG_LIVE_CROP_ALIGN:-4}"
+RETIRE_FRAMES="${TINYTAG_LIVE_RETIRE_FRAMES:-5}"
 
 # For ownership/backlog testing only: TINYTAG_LIVE_PREVIEW_DELAY_MS adds a
 # worker-side delay while it owns a preview surface. The binary reads this
@@ -67,6 +68,7 @@ exec "${BIN}" "${MODEL}" \
     --mirror "${MIRROR}" \
     --flip "${FLIP}" \
     --crop-align "${CROP_ALIGN}" \
+    --retire-frames "${RETIRE_FRAMES}" \
     --debug "${DEBUG}" \
     --tag-output "${TAG_OUTPUT}" \
     --direct-compact-input "${DIRECT_COMPACT_INPUT}" \

@@ -6,7 +6,9 @@
 #include <cviruntime.h>
 #include <opencv2/core.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -136,6 +138,9 @@ public:
     // The aligned rectangles actually handed to the decoder on the last
     // post_process() call, for overlay/diagnostics.
     const std::vector<cv::Rect> &last_crop_rects() const { return crop_rects_; }
+    std::vector<Proposal> maintained_rois() const;
+    void set_track_retire_frames(unsigned frames) { track_retire_frames_ = frames; }
+    unsigned track_retire_frames() const { return track_retire_frames_; }
     bool has_decoder() const { return decoder_ != nullptr; }
 
     static void draw_proposals(cv::Mat &bgr, const std::vector<Proposal> &proposals);
@@ -156,7 +161,26 @@ public:
     const TagDecoderProfile &last_decoder_profile() const { return decoder_profile_; }
 
 private:
+    struct BlobRoiTrack
+    {
+        uint32_t id = 0;
+        cv::Rect2f roi;
+        unsigned missed = 0;
+        std::vector<int> tag_ids;
+    };
+    struct TagTrack
+    {
+        int id = -1;
+        cv::Rect2f box;
+        uint32_t blob_id = 0; // one current blob association; reassigned on detection
+        unsigned missed = 0;
+    };
+
     static float rect_iou(const cv::Rect2f &a, const cv::Rect2f &b);
+    std::vector<BlobRoiTrack> blob_tracks_;
+    std::unordered_map<int, TagTrack> tag_tracks_;
+    uint32_t next_blob_track_id_ = 1;
+    unsigned track_retire_frames_ = 5;
 
     // Writes one network-sized grayscale plane into the input tensor, applying
     // whatever conversion the tensor's format needs.

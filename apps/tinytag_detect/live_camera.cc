@@ -253,6 +253,7 @@ struct LumaRtspItem
     // Owns the neutral chroma plane paired with the borrowed Y plane.
     PreviewSurface *surface = nullptr;
     std::vector<Proposal> proposals;
+    std::vector<Proposal> maintained_rois;
     std::vector<TinyTagResult> tags;
     std::vector<cv::Rect> crops;
     double fps = 0.0;
@@ -342,11 +343,26 @@ struct Overlay
 {
     std::mutex mutex;
     std::vector<Proposal> proposals;
+    std::vector<Proposal> maintained_rois;
     std::vector<TinyTagResult> tags;
     std::vector<cv::Rect> crops;
     double fps = 0.0;
     double busy_ms = 0.0;
 } g_overlay;
+
+enum class RoiDisplayMode : int { Current = 0, Maintained = 1, Both = 2, None = 3 };
+std::atomic<int> g_roi_display_mode{static_cast<int>(RoiDisplayMode::Current)};
+const char *roi_display_mode_name(RoiDisplayMode mode)
+{
+    switch (mode)
+    {
+    case RoiDisplayMode::Current: return "current";
+    case RoiDisplayMode::Maintained: return "maintained";
+    case RoiDisplayMode::Both: return "both";
+    case RoiDisplayMode::None: return "none";
+    }
+    return "current";
+}
 
 double now_ms()
 {
@@ -402,6 +418,7 @@ void usage(const char *argv0)
             "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
+            "       [--retire-frames N]\n"
             "\n"
             "  --mirror 1  correct a horizontally mirrored sensor. Mirrored frames decode\n"
             "              ZERO tags (AprilTag markers are chiral) while proposals still\n"
@@ -423,6 +440,10 @@ void usage(const char *argv0)
             "              pixels (default 4, so every crop row starts 4-byte aligned\n"
             "              and is a whole number of 32-bit words). 0 or 1 disables.\n"
             "              Aligned regions are drawn in pink on the preview.\n"
+            "  --retire-frames N  frames without a decoded tag before ROI/tag retirement (default 5).\n"
+            "  Press r then Enter to cycle ROI display: current, maintained, both, none.\n"
+            "  Current ROI is yellow/orange; maintained ROI is blue; decoded tag corners are green;\n"
+            "  aligned decoder crops are pink. Tag corners remain visible in every ROI mode.\n"
             "  --tag-output 1  print every decoded tag to stdout (default 1). Set 0\n"
             "              when stdout is not a required result transport; synchronous\n"
             "              output can otherwise stall capture behind a slow consumer.\n"
@@ -477,6 +498,7 @@ void print_isp_help()
             "  ae auto            revert exposure+gain to automatic\n"
             "  awb <r> <g> <b>    manual white balance gains (0x1-0x3FFF each)\n"
             "  awb auto           revert white balance to automatic\n"
+            "  r                  cycle ROI overlay: current -> maintained -> both -> none\n"
             "  help               show this message\n");
 }
 
@@ -635,6 +657,13 @@ void isp_control_loop()
                 isp_set_manual_wb((CVI_U16)r, (CVI_U16)g, (CVI_U16)b);
             else
                 fprintf(stderr, "[isp] usage: awb <r> <g> <b> | awb auto\n");
+        }
+        else if (strcmp(cmd, "r") == 0 || strcmp(cmd, "roi") == 0)
+        {
+            const int next = (g_roi_display_mode.load() + 1) % 4;
+            g_roi_display_mode.store(next);
+            fprintf(stderr, "[preview] ROI display: %s\n",
+                    roi_display_mode_name(static_cast<RoiDisplayMode>(next)));
         }
         else if (strcmp(cmd, "help") == 0)
         {
@@ -1461,9 +1490,10 @@ struct Nv21Color
 {
     uint8_t y, u, v;
 };
-constexpr Nv21Color kProposalColor{210, 16, 146}; // yellow
-constexpr Nv21Color kTagColor{145, 54, 34};       // green
-constexpr Nv21Color kAlignColor{158, 140, 197};   // pink
+constexpr Nv21Color kProposalColor{210, 16, 146}; // yellow/orange: current neural proposal
+constexpr Nv21Color kMaintainedColor{100, 190, 35}; // blue: temporally maintained ROI
+constexpr Nv21Color kTagColor{145, 54, 34};       // green: decoded tag corners
+constexpr Nv21Color kAlignColor{158, 140, 197};   // pink: aligned decoder crop
 
 void draw_box(cv::Mat &y, cv::Mat &vu, const cv::Rect &r, Nv21Color c, int thickness,
               std::vector<cv::Rect> *dirty = nullptr)
@@ -1728,9 +1758,10 @@ int run_capture_only()
 // Defined below, next to the preview loop; declared here because the luma RTSP
 // worker draws before that point in the file.
 void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+                       const std::vector<Proposal> &maintained_rois,
                        const std::vector<TinyTagResult> &tags,
-                       const std::vector<cv::Rect> &crops, double fps, double busy_ms,
-                       std::vector<cv::Rect> *dirty);
+                       const std::vector<cv::Rect> &crops, RoiDisplayMode mode,
+                       double fps, double busy_ms, std::vector<cv::Rect> *dirty);
 
 // Encode one NV21 frame and hand the bitstream to the RTSP server. Same
 // sequence as SAMPLE_TDL_Send_Frame_RTSP in tdl_sdk's middleware_utils.c.
@@ -1801,6 +1832,7 @@ RtspSendResult send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
 void reserve_luma_item(LumaRtspItem &item, size_t capacity)
 {
     item.proposals.reserve(capacity);
+    item.maintained_rois.reserve(capacity);
     item.tags.reserve(capacity);
     item.crops.reserve(capacity);
 }
@@ -1813,6 +1845,7 @@ void clear_luma_item(LumaRtspItem &item)
     item.encoded = VIDEO_FRAME_INFO_S{};
     item.surface = nullptr;
     item.proposals.clear();
+    item.maintained_rois.clear();
     item.tags.clear();
     item.crops.clear();
     item.fps = 0.0;
@@ -1902,6 +1935,7 @@ PreviewSurface *acquire_luma_surface(CameraContext &ctx)
 
 bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
                        PreviewSurface *surface, const std::vector<Proposal> &proposals,
+                       const std::vector<Proposal> &maintained_rois,
                        const std::vector<TinyTagResult> &tags,
                        const std::vector<cv::Rect> &crops, double fps, double busy_ms,
                        const VIDEO_FRAME_INFO_S &source, uint8_t *source_y_vir,
@@ -1953,6 +1987,7 @@ bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
     queue.borrowed_frames_max = std::max(queue.borrowed_frames_max,
                                           queue.borrowed_frames);
     item.proposals = proposals;
+    item.maintained_rois = maintained_rois;
     item.tags = tags;
     item.crops = crops;
     item.fps = fps;
@@ -2050,8 +2085,9 @@ void luma_rtsp_loop(CameraContext *ctx)
                     ++ctx->record_failures;
             }
 
-            draw_overlay_nv21(y, vu, item.proposals, item.tags, item.crops, item.fps,
-                              item.busy_ms, &sfc.dirty);
+            const auto mode = static_cast<RoiDisplayMode>(g_roi_display_mode.load());
+            draw_overlay_nv21(y, vu, item.proposals, item.maintained_rois, item.tags,
+                              item.crops, mode, item.fps, item.busy_ms, &sfc.dirty);
 
             CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], y_vir, item.source_map_len);
             CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
@@ -2186,19 +2222,22 @@ void stop_luma_rtsp(CameraContext &ctx)
 // the caller can reset exactly those regions next frame instead of clearing the
 // whole plane.
 void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+                       const std::vector<Proposal> &maintained_rois,
                        const std::vector<TinyTagResult> &tags,
-                       const std::vector<cv::Rect> &crops, double fps, double busy_ms,
-                       std::vector<cv::Rect> *dirty)
+                       const std::vector<cv::Rect> &crops, RoiDisplayMode mode,
+                       double fps, double busy_ms, std::vector<cv::Rect> *dirty)
 {
-    // Aligned crop regions actually handed to the decoder -- at most --max of
-    // them. Drawn first and thin so the proposal boxes stay readable on top.
-    for (const auto &c : crops)
-        draw_box(y, vu, c, kAlignColor, 1, dirty);
+    const bool show_current = mode == RoiDisplayMode::Current || mode == RoiDisplayMode::Both;
+    const bool show_maintained = mode == RoiDisplayMode::Maintained || mode == RoiDisplayMode::Both;
+    // Aligned crop boxes belong to the current-ROI view.
+    if (show_current)
+        for (const auto &c : crops)
+            draw_box(y, vu, c, kAlignColor, 1, dirty);
 
     // One label per ROI: a decoded tag appends " id N" to its proposal's
     // confidence rather than drawing a second label at the same anchor, which
     // used to overprint and leave both unreadable.
-    for (const auto &p : proposals)
+    if (show_current) for (const auto &p : proposals)
     {
         const TinyTagResult *hit = nullptr;
         for (const auto &t : tags)
@@ -2223,14 +2262,18 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
         draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), hit ? 0.9 : 0.65);
     }
 
-    // The proposal rectangle is intentionally left yellow; only decoder-
-    // confirmed tags receive the green geometry fitted to their real corners.
+    if (show_maintained)
+        for (const auto &roi : maintained_rois)
+            draw_box(y, vu, roi.roi, kMaintainedColor, 2, dirty);
+
+    // Only decoder-confirmed tags receive the green geometry fitted to their
+    // real corners. These detections remain visible in every ROI display mode.
     for (const auto &tag : tags)
         draw_tag_quad(y, vu, tag, kTagColor, 4, dirty);
 
     char status[96];
-    snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop  %zu tags", fps, busy_ms,
-             proposals.size(), tags.size());
+    snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop %zu tags  ROI:%s", fps, busy_ms,
+             proposals.size(), tags.size(), roi_display_mode_name(mode));
     draw_label(y, status, cv::Point(16, 40), 0.9);
 }
 
@@ -2241,6 +2284,7 @@ void preview_loop(CameraContext *ctx)
 {
     configure_preview_priority("colour");
     std::vector<Proposal> proposals;
+    std::vector<Proposal> maintained_rois;
     std::vector<TinyTagResult> tags;
     std::vector<cv::Rect> crops;
     while (!g_stop)
@@ -2272,12 +2316,14 @@ void preview_loop(CameraContext *ctx)
         {
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
             proposals = g_overlay.proposals;
+            maintained_rois = g_overlay.maintained_rois;
             tags = g_overlay.tags;
             crops = g_overlay.crops;
             fps = g_overlay.fps;
             busy_ms = g_overlay.busy_ms;
         }
-        draw_overlay_nv21(y, vu, proposals, tags, crops, fps, busy_ms, nullptr);
+        const auto mode = static_cast<RoiDisplayMode>(g_roi_display_mode.load());
+        draw_overlay_nv21(y, vu, proposals, maintained_rois, tags, crops, mode, fps, busy_ms, nullptr);
 
         // We wrote through a cached mapping; flush so VENC, which reads the
         // physical buffer via DMA, sees the boxes.
@@ -2542,6 +2588,7 @@ int main(int argc, char *argv[])
     const std::string cvimodel_path = argv[1];
     float heatmap_thres = 0.30f, roi_expand = 1.0f, roi_iou_thres = 0.5f;
     int max_proposals = 20, debug_mode = 1;
+    unsigned retire_frames = 5;
     bool decode = false, decode_tolerant = false;
     std::string save_frame_path;
     std::string save_ldc_pair_prefix;
@@ -2572,6 +2619,16 @@ int main(int argc, char *argv[])
         else if (flag == "--max" && has_value) max_proposals = std::atoi(argv[++i]);
         else if (flag == "--expand" && has_value) roi_expand = std::atof(argv[++i]);
         else if (flag == "--iou" && has_value) roi_iou_thres = std::atof(argv[++i]);
+        else if (flag == "--retire-frames" && has_value)
+        {
+            const long value = std::strtol(argv[++i], nullptr, 10);
+            if (value < 1 || value > 10000)
+            {
+                fprintf(stderr, "--retire-frames must be between 1 and 10000\n");
+                return 1;
+            }
+            retire_frames = static_cast<unsigned>(value);
+        }
         else if (flag == "--debug" && has_value) debug_mode = std::atoi(argv[++i]);
         else if (flag == "--save-frame" && has_value) save_frame_path = argv[++i];
         else if (flag == "--save-ldc-pair" && has_value) save_ldc_pair_prefix = argv[++i];
@@ -2659,6 +2716,8 @@ int main(int argc, char *argv[])
     }
     TinyTagDet &detector = *detector_storage;
     detector.set_crop_align(crop_align);
+    detector.set_track_retire_frames(retire_frames);
+    fprintf(stderr, "[camera] ROI/tag retirement: %u missed frames\n", detector.track_retire_frames());
     if (detector.crop_align() > 1)
         fprintf(stderr, "[camera] crop align: %d px\n", detector.crop_align());
     if (decode)
@@ -3376,7 +3435,8 @@ int main(int argc, char *argv[])
             // worker draws, flushes, encodes, then releases the frame. Its
             // cached mapping remains valid until application teardown.
             const bool preview_queued = enqueue_luma_rtsp(
-                ctx, rtsp_frame, surface, proposals, results, detector.last_crop_rects(),
+                ctx, rtsp_frame, surface, proposals, detector.maintained_rois(), results,
+                detector.last_crop_rects(),
                 overlay_fps, overlay_busy_ms, frame, visible_luma,
                 vf.u32Stride[0] * static_cast<CVI_U32>(visible_height));
             if (!preview_queued)
@@ -3425,6 +3485,7 @@ int main(int argc, char *argv[])
         {
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
             g_overlay.proposals = proposals;
+            g_overlay.maintained_rois = detector.maintained_rois();
             g_overlay.crops = detector.last_crop_rects();
             if (decode)
                 g_overlay.tags = results;

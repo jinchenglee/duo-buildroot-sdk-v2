@@ -729,8 +729,71 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     if (full_res_gray.empty() || full_res_gray.type() != CV_8UC1)
         throw std::runtime_error("post_process expects a non-empty CV_8UC1 image");
 
+    // Match current neural ROIs to persistent blob tracks. A track with no
+    // decoded tag is retried for a short grace period; a decode resets its
+    // retirement timer. Tag identity and blob lifetime remain separate.
+    std::vector<Proposal> active_proposals;
+    std::vector<uint32_t> active_blob_ids;
+    std::vector<bool> track_used(blob_tracks_.size(), false);
+    active_proposals.reserve(proposals.size() + blob_tracks_.size());
+    active_blob_ids.reserve(proposals.size() + blob_tracks_.size());
     for (const auto &proposal : proposals)
     {
+        size_t best = blob_tracks_.size();
+        float best_iou = 0.15f;
+        for (size_t i = 0; i < blob_tracks_.size(); ++i)
+        {
+            if (track_used[i]) continue;
+            const float overlap = rect_iou(proposal.roi, blob_tracks_[i].roi);
+            if (overlap > best_iou) { best = i; best_iou = overlap; }
+        }
+        uint32_t blob_id;
+        Proposal effective = proposal;
+        if (best == blob_tracks_.size())
+        {
+            BlobRoiTrack track;
+            track.id = next_blob_track_id_++;
+            track.roi = proposal.roi;
+            blob_tracks_.push_back(track);
+            track_used.push_back(true);
+            blob_id = track.id;
+        }
+        else
+        {
+            track_used[best] = true;
+            // Current geometry is the base. Preserve a small, bounded part
+            // of the prior extent so a fragmented blob does not abruptly
+            // shrink the crop; the old ROI cannot cause unbounded growth.
+            const cv::Rect2f old_roi = blob_tracks_[best].roi;
+            const cv::Rect2f &now_roi = proposal.roi;
+            const float pad_x = now_roi.width * 0.15f;
+            const float pad_y = now_roi.height * 0.15f;
+            const float left = std::max(now_roi.x - pad_x, std::min(now_roi.x, old_roi.x));
+            const float top = std::max(now_roi.y - pad_y, std::min(now_roi.y, old_roi.y));
+            const float right = std::min(now_roi.x + now_roi.width + pad_x,
+                                         std::max(now_roi.x + now_roi.width, old_roi.x + old_roi.width));
+            const float bottom = std::min(now_roi.y + now_roi.height + pad_y,
+                                          std::max(now_roi.y + now_roi.height, old_roi.y + old_roi.height));
+            blob_tracks_[best].roi = cv::Rect2f(left, top, right - left, bottom - top);
+            effective.roi = blob_tracks_[best].roi;
+            blob_id = blob_tracks_[best].id;
+        }
+        active_proposals.push_back(effective);
+        active_blob_ids.push_back(blob_id);
+    }
+    // Retry the last full-resolution crop while a blob track is in its grace
+    // window. It may decode after a transient proposal miss.
+    for (size_t i = 0; i < track_used.size(); ++i)
+    {
+        if (track_used[i]) continue;
+        active_proposals.push_back(Proposal{0.f, blob_tracks_[i].roi});
+        active_blob_ids.push_back(blob_tracks_[i].id);
+    }
+    for (auto &track : blob_tracks_) track.tag_ids.clear();
+
+    for (size_t proposal_index = 0; proposal_index < active_proposals.size(); ++proposal_index)
+    {
+        const auto &proposal = active_proposals[proposal_index];
         // Clamp to integer pixels inside the frame. decode_proposals() already
         // clamped to the band, but rounding can still push a box one pixel out.
         const int x0 = std::max(0, static_cast<int>(std::floor(proposal.roi.x)));
@@ -824,7 +887,57 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     }
     results.swap(deduped);
 
+    // Update tag tracks once per decoded ID. A detection in a different blob
+    // immediately changes its single current association. The latest box is
+    // retained for downstream temporal use; detections themselves stay raw.
+    for (auto &entry : tag_tracks_) ++entry.second.missed;
+    std::vector<bool> blob_detected(blob_tracks_.size(), false);
+    for (const auto &result : results)
+    {
+        size_t winner = active_blob_ids.size();
+        float best_iou = -1.f;
+        for (size_t i = 0; i < active_proposals.size(); ++i)
+        {
+            if (active_blob_ids[i] == 0) continue;
+            const float overlap = rect_iou(result.roi, active_proposals[i].roi);
+            if (overlap > best_iou) { best_iou = overlap; winner = i; }
+        }
+        if (winner == active_blob_ids.size()) continue;
+        const uint32_t blob_id = active_blob_ids[winner];
+        TagTrack &tag = tag_tracks_[result.id];
+        tag.id = result.id;
+        tag.box = result.roi;
+        tag.blob_id = blob_id;
+        tag.missed = 0;
+        for (size_t i = 0; i < blob_tracks_.size(); ++i)
+        {
+            if (blob_tracks_[i].id != blob_id) continue;
+            blob_detected[i] = true;
+            if (std::find(blob_tracks_[i].tag_ids.begin(), blob_tracks_[i].tag_ids.end(), result.id) == blob_tracks_[i].tag_ids.end())
+                blob_tracks_[i].tag_ids.push_back(result.id);
+            break;
+        }
+    }
+    for (size_t i = 0; i < blob_tracks_.size(); ++i)
+        blob_tracks_[i].missed = blob_detected[i] ? 0 : blob_tracks_[i].missed + 1;
+    blob_tracks_.erase(std::remove_if(blob_tracks_.begin(), blob_tracks_.end(),
+        [this](const BlobRoiTrack &track) { return track.missed >= track_retire_frames_; }), blob_tracks_.end());
+    for (auto it = tag_tracks_.begin(); it != tag_tracks_.end(); )
+    {
+        if (it->second.missed >= track_retire_frames_) it = tag_tracks_.erase(it);
+        else ++it;
+    }
+
     crop_decode_ms_ = now_ms() - started;
+}
+
+std::vector<Proposal> TinyTagDet::maintained_rois() const
+{
+    std::vector<Proposal> rois;
+    rois.reserve(blob_tracks_.size());
+    for (const auto &track : blob_tracks_)
+        rois.push_back(Proposal{0.f, track.roi});
+    return rois;
 }
 
 void TinyTagDet::draw_detections(cv::Mat &bgr, const std::vector<TinyTagResult> &results)
