@@ -156,6 +156,9 @@ ov_ov6211:
 ov_ov7251:
 	+$(call MAKE_SENSOR, ${@})
 
+ov_ov9281:
+	+$(call MAKE_SENSOR, ${@})
+
 pixelplus_pr2000:
 	+$(call MAKE_SENSOR, ${@})
 

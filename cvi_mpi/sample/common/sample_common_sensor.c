@@ -127,6 +127,9 @@ CVI_S32 SAMPLE_COMM_SNS_GetSize(SAMPLE_SNS_TYPE_E enMode, PIC_SIZE_E *penSize)
 		return CVI_FAILURE;
 
 	switch (enMode) {
+	case OV_OV9281_MIPI_800P_120FPS_10BIT:
+		*penSize = PIC_1280x800;
+		break;
 	case CHIPUP_XS9922B_MODE_720P_1CH_8BIT:
 	case CHIPUP_XS9922B_MODE_720P_2CH_8BIT:
 	case CHIPUP_XS9922B_MODE_720P_3CH_8BIT:
@@ -406,6 +409,10 @@ CVI_S32 SAMPLE_COMM_SNS_GetPicSize(PIC_SIZE_E enPicSize, SIZE_S *pstSize)
 	case PIC_720P:   /* 1280 * 720 */
 		pstSize->u32Width  = 1280;
 		pstSize->u32Height = 720;
+		break;
+	case PIC_1280x800:
+		pstSize->u32Width = 1280;
+		pstSize->u32Height = 800;
 		break;
 
 	case PIC_1600x1200:
@@ -893,6 +900,7 @@ CVI_S32 SAMPLE_COMM_SNS_GetIspAttrBySns(SAMPLE_SNS_TYPE_E enSnsType, ISP_PUB_ATT
 	case SMS_SC035HGS_1L_MIPI_480P_120FPS_10BIT:
 	case OV_OV6211_MIPI_400P_120FPS_10BIT:
 	case OV_OV7251_MIPI_480P_120FPS_10BIT:
+	case OV_OV9281_MIPI_800P_120FPS_10BIT:
 		pstPubAttr->f32FrameRate = 120;
 		break;
 	case SMS_SC1336_1L_MIPI_1M_60FPS_10BIT:
@@ -1332,6 +1340,11 @@ CVI_VOID *SAMPLE_COMM_SNS_GetSnsObj(SAMPLE_SNS_TYPE_E enSnsType)
 #if defined(SENSOR_OV_OV7251)
 	case OV_OV7251_MIPI_480P_120FPS_10BIT:
 		pSnsObj = &stSnsOv7251_Obj;
+		break;
+#endif
+#if defined(SENSOR_OV_OV9281)
+	case OV_OV9281_MIPI_800P_120FPS_10BIT:
+		pSnsObj = &stSnsOv9281_Obj;
 		break;
 #endif
 #if defined(SENSOR_PICO_384)

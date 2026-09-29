@@ -351,7 +351,7 @@ struct Overlay
 } g_overlay;
 
 enum class RoiDisplayMode : int { Current = 0, Maintained = 1, Both = 2, None = 3 };
-std::atomic<int> g_roi_display_mode{static_cast<int>(RoiDisplayMode::Current)};
+std::atomic<int> g_roi_display_mode{static_cast<int>(RoiDisplayMode::None)};
 const char *roi_display_mode_name(RoiDisplayMode mode)
 {
     switch (mode)
@@ -1036,7 +1036,8 @@ bool setup_sensor_size(CameraContext &ctx)
     }
     ctx.width = sensor_size.u32Width;
     ctx.height = sensor_size.u32Height;
-    if (ov5647_720p60_requested())
+    if (ctx.vi_config.astViInfo[0].stSnsInfo.enSnsType == OV_OV5647_MIPI_2M_30FPS_10BIT &&
+        ov5647_720p60_requested())
     {
         ctx.width = 1280;
         ctx.height = 720;
@@ -1068,7 +1069,10 @@ bool start_vi(CameraContext &ctx)
 
     ISP_PUB_ATTR_S pub_attr{};
     CVI_ISP_GetPubAttr(0, &pub_attr);
-    pub_attr.f32FrameRate = ov5647_720p60_requested() ? 60 : 30;
+    const auto sensor = ctx.vi_config.astViInfo[0].stSnsInfo.enSnsType;
+    pub_attr.f32FrameRate = sensor == OV_OV9281_MIPI_800P_120FPS_10BIT ? 120 :
+                              (sensor == OV_OV5647_MIPI_2M_30FPS_10BIT &&
+                               ov5647_720p60_requested() ? 60 : 30);
     CVI_ISP_SetPubAttr(0, &pub_attr);
 
     // Orientation is fixed in the VI channel rather than per frame. Mirroring
@@ -1346,6 +1350,22 @@ bool setup_camera(CameraContext &ctx)
     VPSS_GRP_DEFAULT_HELPER2(&vpss_grp_attr, ctx.width, ctx.height, VI_PIXEL_FORMAT, /*dev=*/1);
     VPSS_CHN_ATTR_S vpss_chn_attr{};
     VPSS_CHN_DEFAULT_HELPER(&vpss_chn_attr, kDetWidth, kDetHeight, PIXEL_FORMAT_YUV_400, CVI_FALSE);
+    // Keep the detector's 16:9 input undistorted with a 1280x800 sensor.
+    // The native diagnostic channel still sees the complete sensor frame.
+    const bool crop_ov9281 = !ctx.input &&
+        ctx.vi_config.astViInfo[0].stSnsInfo.enSnsType == OV_OV9281_MIPI_800P_120FPS_10BIT;
+    const auto set_camera_crop = [&](VPSS_CHN channel) -> CVI_S32 {
+        if (!crop_ov9281)
+            return CVI_SUCCESS;
+        VPSS_CROP_INFO_S crop{};
+        crop.bEnable = CVI_TRUE;
+        crop.enCropCoordinate = VPSS_CROP_ABS_COOR;
+        crop.stCropRect.s32X = 0;
+        crop.stCropRect.s32Y = 40;
+        crop.stCropRect.u32Width = 1280;
+        crop.stCropRect.u32Height = 720;
+        return CVI_VPSS_SetChnCrop(kVpssGrp, channel, &crop);
+    };
 
     CVI_S32 vpss_ret = CVI_VPSS_CreateGrp(kVpssGrp, &vpss_grp_attr);
     if (vpss_ret == CVI_SUCCESS)
@@ -1356,6 +1376,8 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kVpssChn, &vpss_chn_attr);
     if (vpss_ret == CVI_SUCCESS)
         vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kVpssChn);
+    if (vpss_ret == CVI_SUCCESS)
+        vpss_ret = set_camera_crop(kVpssChn);
     if (vpss_ret == CVI_SUCCESS && ctx.ldc.enabled &&
         !apply_app_ldc(kVpssGrp, kVpssChn, kDetWidth, kDetHeight, ctx.ldc))
         vpss_ret = CVI_FAILURE;
@@ -1366,6 +1388,8 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, kModelChn, &model_attr);
         if (vpss_ret == CVI_SUCCESS)
             vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, kModelChn);
+        if (vpss_ret == CVI_SUCCESS)
+            vpss_ret = set_camera_crop(kModelChn);
         if (vpss_ret == CVI_SUCCESS && ctx.ldc.enabled &&
             !apply_app_ldc(kVpssGrp, kModelChn, 640, 360, ctx.ldc))
             vpss_ret = CVI_FAILURE;
@@ -1391,6 +1415,8 @@ bool setup_camera(CameraContext &ctx)
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, ctx.preview_chn, &preview_attr);
         if (vpss_ret == CVI_SUCCESS)
             vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, ctx.preview_chn);
+        if (vpss_ret == CVI_SUCCESS)
+            vpss_ret = set_camera_crop(ctx.preview_chn);
     }
     if (vpss_ret == CVI_SUCCESS)
         vpss_ret = CVI_VPSS_StartGrp(kVpssGrp);

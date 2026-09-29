@@ -114,12 +114,9 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
 
   # cvi_mpi/sample/common/sample_common_sensor.c gates each sensor's entry in
   # its SAMPLE_COMM_SNS_GetSnsObj() switch behind #if defined(SENSOR_xxx).
-  # This live binary is intentionally OV5647-only: linking the standalone
-  # sensor library makes the opt-in 720p60 experiment use the exact library
-  # rebuilt from the working tree, instead of silently resolving OV5647 from
-  # the prebuilt aggregate libsns_full.so.
+  # Link both J2 sensor libraries so sensor_cfg.ini can select either module.
   target_compile_definitions(tinytag_detect_live PRIVATE
-      SENSOR_OV_OV5647)
+      SENSOR_OV_OV5647 SENSOR_OV_OV9281)
 
   target_compile_options(tinytag_detect_live PRIVATE -ffunction-sections -fdata-sections)
   target_link_options(tinytag_detect_live PRIVATE -Wl,--gc-sections)
@@ -134,6 +131,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       ${MIDDLEWARE_SDK_ROOT}/lib/librgn.so
       ${MIDDLEWARE_SDK_ROOT}/lib/3rd/libini.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libsns_ov5647.so
+      ${MIDDLEWARE_SDK_ROOT}/lib/libsns_ov9281.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libisp.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libisp_algo.so
       ${MIDDLEWARE_SDK_ROOT}/lib/libawb.so

@@ -41,6 +41,9 @@ sensor-$(CONFIG_SENSOR_OV_OV4689)            += ov_ov4689
 sensor-$(CONFIG_SENSOR_OV_OV5647)            += ov_ov5647
 sensor-$(CONFIG_SENSOR_OV_OV6211)            += ov_ov6211
 sensor-$(CONFIG_SENSOR_OV_OV7251)            += ov_ov7251
+ifeq ($(CHIP_ARCH), CV181X)
+sensor-$(CONFIG_SENSOR_OV_OV9281)            += ov_ov9281
+endif
 sensor-$(CONFIG_SENSOR_PIXELPLUS_PR2000)     += pixelplus_pr2000
 sensor-$(CONFIG_SENSOR_PIXELPLUS_PR2020)     += pixelplus_pr2020
 sensor-$(CONFIG_SENSOR_PIXELPLUS_PR2100)     += pixelplus_pr2100

@@ -767,6 +767,21 @@ CVI_S32 SAMPLE_COMM_VI_CreateIsp(SAMPLE_VI_CONFIG_S *pstViConfig)
 			CVI_TRACE_LOG(CVI_DBG_ERR, "ISP_Run failed with %#x!\n", s32Ret);
 			return s32Ret;
 		}
+
+		/* OV9281 has no color filter array. Apply this after the tuning bin,
+		 * which otherwise restores the default color processing settings. */
+		if (pstViInfo->stSnsInfo.enSnsType == OV_OV9281_MIPI_800P_120FPS_10BIT) {
+			ISP_MONO_ATTR_S monoAttr = {
+				.Enable = CVI_TRUE,
+				.UpdateInterval = 1,
+			};
+
+			s32Ret = CVI_ISP_SetMonoAttr(ViPipe, &monoAttr);
+			if (s32Ret != CVI_SUCCESS) {
+				CVI_TRACE_LOG(CVI_DBG_ERR, "Set OV9281 mono mode failed with %#x!\n", s32Ret);
+				return s32Ret;
+			}
+		}
 	}
 	return CVI_SUCCESS;
 }

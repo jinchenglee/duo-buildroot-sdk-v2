@@ -26,12 +26,14 @@ DIRECT_COMPACT_INPUT="${TINYTAG_LIVE_DIRECT_COMPACT_INPUT:-1}"
 VALIDATE_COMPACT_INPUT="${TINYTAG_LIVE_VALIDATE_COMPACT_INPUT:-0}"
 
 # Sensor orientation, applied once in VI hardware (no per-frame cost).
-# MIRROR defaults to 1: the OV5647 module on this board delivers a
-# horizontally mirrored frame, and because AprilTag markers are chiral a
-# mirrored frame decodes ZERO tags while proposals still look correct.
-# Set TINYTAG_LIVE_MIRROR=0 to see the uncorrected image, e.g. on a module
-# that does not need it.
-MIRROR="${TINYTAG_LIVE_MIRROR:-1}"
+# The OV5647 module needs mirroring. OV9281 starts unmirrored; the environment
+# variable can override either profile for a different module orientation.
+DEFAULT_MIRROR=1
+if [ -r /mnt/data/sensor_cfg.ini ] &&
+   grep -Eq '^name[[:space:]]*=[[:space:]]*OV_OV9281_' /mnt/data/sensor_cfg.ini; then
+    DEFAULT_MIRROR=0
+fi
+MIRROR="${TINYTAG_LIVE_MIRROR:-${DEFAULT_MIRROR}}"
 FLIP="${TINYTAG_LIVE_FLIP:-0}"
 
 # Widen each decode crop horizontally to a multiple of this many pixels, so

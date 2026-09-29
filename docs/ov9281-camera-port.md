@@ -1,11 +1,8 @@
 # Porting an OV9281 global-shutter mono camera to the Duo S
 
-Porting plan and implementation notes. The Duo-specific driver is not yet
-implemented, but a separate Jetson OV9281 bring-up now provides a validated
-sensor register sequence, 1280x800 RAW10 timing, and useful exposure/gain
-behavior to port into the SG200X sensor API. The remaining unknowns are
-Duo-specific: MIPI wiring, power/clock/reset behavior, CVI sensor callbacks,
-and ISP treatment of the monochrome stream.
+The Duo S driver and J2 configuration are implemented. The register sequence
+comes from the validated Jetson OV9281 1280x800 RAW10 mode. Cross compilation
+passes, but the Duo hardware path still needs a chip ID, CSI, and ISP test.
 
 Why OV9281: it is 1280x800 global-shutter mono, which is exactly the resolution
 the TinyTag model was trained at (`528.198329.jpg` and `220-225.mp4` are both
@@ -21,7 +18,7 @@ Mostly open. The parts a camera port touches are all source.
 |---|---|
 | fsbl / opensbi / u-boot / linux_5.10 | full source |
 | `cvi_mpi` media pipeline (VI, VPSS, MIPI RX) | source, 1103 `.c` files |
-| **sensor drivers** (`cvi_mpi/component/isp/sensor/`) | **full source**, 101 for sg200x |
+| **sensor drivers** (`cvi_mpi/component/isp/sensor/`) | **full source**, including OV9281 for cv181x |
 | TPU (`cviruntime`, `cvikernel`, `tdl_sdk`) | source |
 | ISP tuning data (`isp_tuning/`) | open: `.json` source compiled to `.bin` |
 | **ISP 3A algorithms** (`libisp_algo.{a,so}`) | **prebuilt blob**, no `.c` under `modules/isp/*/isp_algo` |
@@ -35,8 +32,8 @@ the network to work. Only AE/AGC behaviour is affected.
 
 ## What already exists
 
-101 sensors are compiled-capable for sg200x under
-`cvi_mpi/component/isp/sensor/sg200x/`. Global-shutter mono is well covered:
+The Duo S builds the CV181X middleware sensor tree under
+`cvi_mpi/component/isp/sensor/cv181x/`. Global-shutter mono is covered:
 
 | driver | sensor | notes |
 |---|---|---|
@@ -45,15 +42,15 @@ the network to work. Only AE/AGC behaviour is affected.
 | `sms_sc035gs`, `sms_sc035hgs` | SC035GS 640x480 GS mono | has `_1L` single-lane variants; `sensor_cfg_SC035HGS.ini` already ships for the Duo S |
 | `sms_sc132gs` | SC132GS 1280x1080 GS | closest existing resolution |
 
-Only three sensors are actually *built into* the current image --
-`CONFIG_SENSOR_GCORE_GC2083`, `GCORE_GC4653`, `OV_OV5647` in
+The Duo S image selects `CONFIG_SENSOR_GCORE_GC2083`, `GCORE_GC4653`,
+`OV_OV5647`, and `OV_OV9281` in
 `build/boards/cv181x/sg2000_milkv_duos_glibc_arm64_sd/sg2000_milkv_duos_glibc_arm64_sd_defconfig`.
 The other 98 are opt-in Kconfig entries generated from
 `build/sensors/sensor_list.json` by `build/scripts/gen_sensor_config.py`.
 
 ## Why OV7251 is a good template
 
-`ov_ov7251/` is only 1455 lines in four files:
+The CV181X `ov_ov7251/` driver is the template:
 
 | file | lines | contains |
 |---|---|---|
@@ -75,8 +72,11 @@ ov7251_sensor_ctl.c:198  OV7251_CHIP_ID        0x7750   /* OV9281 reports 0x9281
 ```
 
 Exposure is written as three bytes in `cmos_inttime_update()`
-(`ov7251_cmos.c:207`), gain through a lookup table in `cmos_gains_update()`
-(`ov7251_cmos.c:405`). Both should transfer to OV9281 with only range changes.
+(`ov7251_cmos.c:207`), and the CVI gain callback structure in
+`cmos_gains_update()` (`ov7251_cmos.c:405`) is a useful template. The OV7251
+gain register addresses do **not** transfer: it uses `0x350a/0x350b`, while
+the validated OV9281 table uses `0x3508/0x3509`. Port the OV9281 gain encoding
+and limits from the Jetson reference.
 
 ## New OV9281 reference implementation
 
@@ -144,7 +144,12 @@ From `build/boards/cv181x/sg2000_milkv_duos_glibc_arm64_sd/dts_arm64/sg2000_milk
 &i2c4 { status = "okay"; };   /* also carries the gt9xx touch controller */
 ```
 
-Existing sensor configs use `bus_id = 3`, i.e. i2c3, and a 2-data-lane mapping.
+Use the Duo S **J2** camera connector for this port. J1 has a 1.8 V supply and
+is excluded for the intended module. The existing J2 OV5647 configuration at
+`device/generic/rootfs_overlay/duos/mnt/data/sensor_cfg_OV5647_J2.ini` provides
+the connector routing: `bus_id = 2` (i2c2), `mipi_dev = 0`,
+`lane_id = 5, 3, 4, -1, -1`, and `pn_swap = 0, 0, 0, 0, 0`. These are the
+starting J2 settings for OV9281; verify frame delivery after probing it.
 
 ## Runtime sensor selection
 
@@ -156,59 +161,69 @@ needed to re-test**, as long as the driver is compiled in. Board copies live in
 [source]
 dev_num = 1
 [sensor]
-name = SMS_SC035HGS_MIPI_480P_120FPS_12BIT
-bus_id = 3
-sns_i2c_addr = 30
+name = OV_OV9281_MIPI_800P_120FPS_10BIT
+bus_id = 2
+sns_i2c_addr = 96
 mipi_dev = 0
-lane_id = 2, 0, 1, -1, -1
+lane_id = 5, 3, 4, -1, -1
 pn_swap = 0, 0, 0, 0, 0
+mclk_en = 1
+mclk = 1
 ```
 
-`lane_id = 2, 0, 1` is a clock lane plus two data lanes. OV9281 supports 1 or 2
-data lanes; 2 is needed for 1280x800 at a useful frame rate.
+The name matches the registered CVI sensor-mode enum. The Jetson OV9281 node uses the 7-bit I2C address `0x60`;
+the Duo parser calls `atoi()`, so `sensor_cfg.ini` must spell it as decimal
+`96`. The J2 lane mapping includes a clock lane and two data lanes. The Jetson
+mode also specifies a 24 MHz MCLK, two-lane D-PHY, and RAW10; configure those
+in the Duo sensor driver. Jetson's `lane_polarity` and reset GPIO numbers
+describe its carrier routing and must not replace the J2 values above.
 
-## Duo implementation plan
+## Switching cameras
 
-1. Copy the OV7251 SG200X driver into a new `ov_ov9281` directory and rename
-   its symbols and mode structures.
-2. Port the Jetson register table into `ov9281_sensor_ctl.c`, preserving the
-   Duo I2C access and sensor-control interfaces. Set the chip-ID probe to
-   registers `0x300A/0x300B`, expected value `0x9281`.
-3. Change `ov9281_cmos_param.h` to 1280x800, RAW10, 2-lane MIPI, and the
-   validated HTS/VTS values. Recalculate the Duo AE exposure limits and gain
-   table from OV9281 behavior; do not reuse OV7251 gain limits blindly.
-4. Register the sensor in `cvi_mpi/component/isp/sensor/sg200x/Makefile`,
-   `build/sensors/sensor_list.json`, and the Duo S defconfig.
-5. Add an OV9281 `sensor_cfg.ini` selecting the correct I2C bus, sensor address,
-   MIPI device, lane IDs, and P/N swaps.
-6. Start with a raw capture and no assumptions about color ISP processing.
-   Confirm chip ID, stable frame delivery, 1280x800 dimensions, and RAW10
-   unpacking before enabling the TinyTag application.
-7. Add a minimal mono ISP profile only after raw capture works. For TinyTag,
-   correct luma and exposure are more important than color calibration.
+The board overlay points `sensor_cfg.ini` at `sensor_cfg_OV9281_J2.ini`, so
+the rebuilt SD image starts with OV9281. Both sensor libraries remain in the
+image. To switch a running Duo S, change the symlink and restart the camera
+application:
 
-The first implementation should support one fixed mode, 1280x800 at a
-conservative frame rate. Adding alternate 720p/high-speed modes can wait until
-the basic Duo path is stable.
+```sh
+cd /mnt/data
+# To select the existing OV5647 module:
+ln -sfn sensor_cfg_OV5647_J2.ini sensor_cfg.ini
+# To select OV9281 again:
+ln -sfn sensor_cfg_OV9281_J2.ini sensor_cfg.ini
+```
 
-## Open questions -- verify before starting
+The INI file selects the sensor name, I2C bus/address, MIPI receiver, lanes,
+and MCLK output. A different camera needs its own driver and matching INI
+profile; the OV5647 driver and profile remain available. `run_live.sh` selects
+the orientation default from the profile, with `TINYTAG_LIVE_MIRROR` as an
+override. The live app crops OV9281's central 1280x720 band before its 16:9
+detector and preview outputs; native captures retain all 1280x800 pixels.
 
-- **Duo timing validation.** The Jetson reference validates the sensor values,
-  but its `pix_clk_hz` and CSI timing fields are NVIDIA-specific. The Duo
-  receiver attributes must be derived and verified independently.
-- **Exposure/gain semantics.** The addresses match OV7251 but the *ranges* and
-  the gain table almost certainly differ. `AgainInfo` in `ov7251_cmos.c` will
-  need rebuilding for OV9281.
-- **Mono handling.** The Jetson reference confirms the camera produces
-  monochrome `Y10`, but the OV7251 Duo driver does not explicitly flag mono; it
-  declares `RAW_DATA_10BIT`. We still need to verify whether the CV181X ISP
-  should bypass demosaic/AWB/CCM or expose the stream as a grayscale surface.
+The first Duo S capture reached 120.6 fps without reported frame failures.
+The 1280x800 NV21 frame had detailed luma but magenta false color: the
+monochrome OV9281 has no color channels. The shared sample VI setup now
+enables the CV181X ISP mono control for OV9281 after loading the tuning bin.
+A second 1280x800 dump from the updated `sample_sensor_test` had all U and V
+samples exactly 128 and retained detailed luma. See
+`docs/ov9281-sample-mono-luma.png`; the first capture is preserved in
+`docs/ov9281-sample-luma.png` and `docs/ov9281-sample-color.png`.
+
+## Hardware checks still needed
+
+- **Duo timing.** First capture was stable at 120.6 fps with no reported
+  frame failures. Check longer runs and varying exposure conditions.
+- **Exposure/gain semantics.** The new driver uses OV9281 registers
+  `0x3508/0x3509`, a linear 1/16x gain code, and 2 to VTS minus 12 exposure
+  lines. Check the resulting brightness and AE response on a live frame.
+- **Mono handling.** The dedicated ISP mono control is enabled for OV9281 in
+  the shared sample VI setup. A new YUV dump confirmed neutral chroma.
 - **ISP tuning.** `isp_tuning/` ships `.bin`/`.json` for only 5 sensors, none
   global-shutter or mono. Probably not needed for a grayscale detector, but AE
   behaviour may need attention.
-- **Hardware.** The Duo S CSI connector pinout, lane count, P/N polarity, and
-  whether the module's power rails, reset GPIO, and MCLK match remain to be
-  verified against the actual OV9281 board.
+- **Hardware.** J2 chip-ID probing and CSI frame delivery succeeded. J1 remains
+  excluded because its 1.8 V supply does not meet this module's connection
+  plan.
 
 ## Why this is worth doing
 
