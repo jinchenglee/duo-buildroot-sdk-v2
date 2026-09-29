@@ -89,6 +89,22 @@ public:
 
     const TagDecoderProfile &last_profile() const override { return profile_; }
 
+    bool refine_full_resolution(const cv::Mat &frame, TagDetection &tag) override
+    {
+        std::vector<cv::Point2f> corners(tag.corners, tag.corners + 4);
+        for (const auto &point : corners)
+            if (point.x < 5 || point.y < 5 ||
+                point.x >= frame.cols - 5 || point.y >= frame.rows - 5)
+                return false;
+        cv::cornerSubPix(frame, corners, cv::Size(4, 4), cv::Size(-1, -1),
+                         cv::TermCriteria(cv::TermCriteria::MAX_ITER | cv::TermCriteria::EPS,
+                                          12, 0.005));
+        for (int j = 0; j < 4; ++j)
+            tag.corners[j] = corners[j];
+        tag.center = mean_corner(tag.corners);
+        return true;
+    }
+
 private:
     aruco_nano::DetectorParameters parameters_;
     TagDecoderProfile profile_;
@@ -242,6 +258,24 @@ public:
     }
 
     const TagDecoderProfile &last_profile() const override { return profile_; }
+
+    bool refine_full_resolution(const cv::Mat &frame, TagDetection &tag) override
+    {
+        if (frame.size() != model_->size())
+            return false;
+        cv::Point2d ideal[4];
+        PointLdcRefineStats stats;
+        if (!refine_quad_ideal(*model_, frame, tag.corners, params_, ideal, &stats))
+            return false;
+        for (int j = 0; j < 4; ++j)
+        {
+            tag.ideal_corners[j] = cv::Point2f(ideal[j]);
+            tag.corners[j] = cv::Point2f(model_->distort(ideal[j]));
+        }
+        tag.has_ideal = true;
+        tag.center = mean_corner(tag.corners);
+        return true;
+    }
 
 private:
     void set_from_ideal(TagDetection &detection, const cv::Point2d ideal[4],

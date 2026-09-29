@@ -22,7 +22,7 @@
 // point of this application is to prove the SG2000 TPU path end to end.
 struct Proposal
 {
-    float confidence; // sigmoid(heatmap) at the peak cell
+    float confidence; // A+C model: strongest assigned mask score (not heat peak)
     cv::Rect2f roi;   // full-frame pixel coords, after roi_expand + clamp
 };
 
@@ -37,6 +37,20 @@ struct TinyTagResult
     // Point-level LDC only: corners in ideal (undistorted pinhole) pixels.
     bool has_ideal = false;
     cv::Point2f ideal_corners[4];
+};
+
+struct AdaptiveDecodeStats
+{
+    unsigned low_attempts = 0;
+    unsigned low_hits = 0;
+    unsigned full_fallbacks = 0;
+    unsigned full_audits = 0;
+    unsigned deferred_full = 0;
+    size_t low_pixels = 0;
+    size_t full_pixels = 0;
+    double low_ms = 0.0;
+    double full_ms = 0.0;
+    double full_refine_ms = 0.0;
 };
 
 // TinyTag proposal detector on the cv181x/SG2000 TPU.
@@ -120,7 +134,12 @@ public:
     // Only meaningful with a decoder installed; without one this is a no-op.
     void post_process(const cv::Mat &full_res_gray,
                       const std::vector<Proposal> &proposals,
-                      std::vector<TinyTagResult> &results);
+                      std::vector<TinyTagResult> &results,
+                      const cv::Mat &low_res_gray = cv::Mat());
+    void set_adaptive_decode(std::shared_ptr<TagCropDecoder> low_decoder,
+                             float min_tag_side_px, int min_roi_area_px, unsigned audit_frames);
+    bool wants_low_res_frame(const std::vector<Proposal> &proposals) const;
+    const AdaptiveDecodeStats &last_adaptive_stats() const { return adaptive_stats_; }
 
     void set_decoder(std::shared_ptr<TagCropDecoder> decoder) { decoder_ = std::move(decoder); }
 
@@ -167,6 +186,8 @@ private:
         cv::Rect2f roi;
         unsigned missed = 0;
         std::vector<int> tag_ids;
+        unsigned frames_since_full_decode = 0;
+        unsigned next_full_after = 3;
     };
     struct TagTrack
     {
@@ -174,6 +195,7 @@ private:
         cv::Rect2f box;
         uint32_t blob_id = 0; // one current blob association; reassigned on detection
         unsigned missed = 0;
+        float min_side_px = 0.f;
     };
 
     static float rect_iou(const cv::Rect2f &a, const cv::Rect2f &b);
@@ -181,6 +203,7 @@ private:
     std::unordered_map<int, TagTrack> tag_tracks_;
     uint32_t next_blob_track_id_ = 1;
     unsigned track_retire_frames_ = 5;
+    bool low_res_eligible(const BlobRoiTrack &blob, const cv::Rect2f &roi) const;
 
     // Writes one network-sized grayscale plane into the input tensor, applying
     // whatever conversion the tensor's format needs.
@@ -222,6 +245,11 @@ private:
     bool physical_input_bound_ = false;
 
     std::shared_ptr<TagCropDecoder> decoder_;
+    std::shared_ptr<TagCropDecoder> low_decoder_;
+    float adaptive_min_tag_side_px_ = 64.f;
+    int adaptive_min_roi_area_px_ = 40000;
+    unsigned adaptive_audit_frames_ = 20;
+    AdaptiveDecodeStats adaptive_stats_;
 
     // Head geometry. Keep in sync with tools/tinytag_cvimodel/prepare_calibration.py.
     static constexpr int kStride = 8;

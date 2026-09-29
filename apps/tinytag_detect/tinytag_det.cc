@@ -710,14 +710,66 @@ void TinyTagDet::draw_proposals(cv::Mat &bgr, const std::vector<Proposal> &propo
     }
 }
 
+void TinyTagDet::set_adaptive_decode(std::shared_ptr<TagCropDecoder> low_decoder,
+                                     float min_tag_side_px, int min_roi_area_px,
+                                     unsigned audit_frames)
+{
+    low_decoder_ = std::move(low_decoder);
+    adaptive_min_tag_side_px_ = std::max(1.f, min_tag_side_px);
+    adaptive_min_roi_area_px_ = std::max(1, min_roi_area_px);
+    adaptive_audit_frames_ = std::max(1u, audit_frames);
+}
+
+bool TinyTagDet::low_res_eligible(const BlobRoiTrack &blob, const cv::Rect2f &roi) const
+{
+    if (!low_decoder_ ||
+        blob.frames_since_full_decode >= blob.next_full_after ||
+        roi.width * roi.height < adaptive_min_roi_area_px_)
+        return false;
+    bool has_recent_tag = false;
+    for (const auto &entry : tag_tracks_)
+    {
+        const TagTrack &tag = entry.second;
+        if (tag.blob_id != blob.id || tag.missed > 1)
+            continue;
+        if (tag.min_side_px < adaptive_min_tag_side_px_)
+            return false; // keep a known small tag on the full-size path
+        has_recent_tag = true;
+    }
+    return has_recent_tag || blob.tag_ids.empty(); // unseen large blobs get a cheap first pass
+}
+
+bool TinyTagDet::wants_low_res_frame(const std::vector<Proposal> &proposals) const
+{
+    if (!low_decoder_)
+        return false;
+    for (const auto &proposal : proposals)
+    {
+        if (proposal.roi.width * proposal.roi.height < adaptive_min_roi_area_px_)
+            continue;
+        const BlobRoiTrack *best = nullptr;
+        float best_iou = 0.15f;
+        for (const auto &blob : blob_tracks_)
+        {
+            const float overlap = rect_iou(proposal.roi, blob.roi);
+            if (overlap > best_iou) { best = &blob; best_iou = overlap; }
+        }
+        if (best == nullptr || low_res_eligible(*best, proposal.roi))
+            return true;
+    }
+    return false;
+}
+
 void TinyTagDet::post_process(const cv::Mat &full_res_gray,
                               const std::vector<Proposal> &proposals,
-                              std::vector<TinyTagResult> &results)
+                              std::vector<TinyTagResult> &results,
+                              const cv::Mat &low_res_gray)
 {
     const double started = now_ms();
     results.clear();
     crop_count_ = 0;
     decoder_profile_ = TagDecoderProfile{};
+    adaptive_stats_ = AdaptiveDecodeStats{};
 
     crop_rects_.clear();
 
@@ -728,6 +780,11 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     }
     if (full_res_gray.empty() || full_res_gray.type() != CV_8UC1)
         throw std::runtime_error("post_process expects a non-empty CV_8UC1 image");
+    if (!low_res_gray.empty() &&
+        (low_res_gray.type() != CV_8UC1 ||
+         low_res_gray.cols * 2 != full_res_gray.cols ||
+         low_res_gray.rows * 2 != full_res_gray.rows))
+        throw std::runtime_error("adaptive decode expects a half-size grayscale frame");
 
     // Match current neural ROIs to persistent blob tracks. A track with no
     // decoded tag is retried for a short grace period; a decode resets its
@@ -735,6 +792,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     std::vector<Proposal> active_proposals;
     std::vector<uint32_t> active_blob_ids;
     std::vector<bool> track_used(blob_tracks_.size(), false);
+    std::vector<bool> low_ready;
     active_proposals.reserve(proposals.size() + blob_tracks_.size());
     active_blob_ids.reserve(proposals.size() + blob_tracks_.size());
     for (const auto &proposal : proposals)
@@ -754,6 +812,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             BlobRoiTrack track;
             track.id = next_blob_track_id_++;
             track.roi = proposal.roi;
+            track.next_full_after = proposal.confidence >= 0.75f ? 2u : 4u;
             blob_tracks_.push_back(track);
             track_used.push_back(true);
             blob_id = track.id;
@@ -780,6 +839,8 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         }
         active_proposals.push_back(effective);
         active_blob_ids.push_back(blob_id);
+        low_ready.push_back(!low_res_gray.empty() &&
+                            low_res_eligible(blob_tracks_[best], effective.roi));
     }
     // Retry the last full-resolution crop while a blob track is in its grace
     // window. It may decode after a transient proposal miss.
@@ -788,12 +849,23 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         if (track_used[i]) continue;
         active_proposals.push_back(Proposal{0.f, blob_tracks_[i].roi});
         active_blob_ids.push_back(blob_tracks_[i].id);
+        low_ready.push_back(false);
     }
     for (auto &track : blob_tracks_) track.tag_ids.clear();
 
     for (size_t proposal_index = 0; proposal_index < active_proposals.size(); ++proposal_index)
     {
         const auto &proposal = active_proposals[proposal_index];
+        if (low_decoder_ && proposal_index >= proposals.size())
+        {
+            bool known_tag = false;
+            for (const auto &entry : tag_tracks_)
+                known_tag = known_tag ||
+                    (entry.second.blob_id == active_blob_ids[proposal_index] &&
+                     entry.second.missed < track_retire_frames_);
+            if (!known_tag)
+                continue; // no neural proposal and no prior tag to recover
+        }
         // Clamp to integer pixels inside the frame. decode_proposals() already
         // clamped to the band, but rounding can still push a box one pixel out.
         const int x0 = std::max(0, static_cast<int>(std::floor(proposal.roi.x)));
@@ -825,24 +897,115 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         crop_rects_.push_back(crop_rect);
         ++crop_count_;
 
-        const auto tags = decoder_->detect(crop);
-        const TagDecoderProfile &profile = decoder_->last_profile();
-        decoder_profile_.threshold_ms += profile.threshold_ms;
-        decoder_profile_.contour_ms += profile.contour_ms;
-        decoder_profile_.quad_ms += profile.quad_ms;
-        decoder_profile_.decode_ms += profile.decode_ms;
-        decoder_profile_.refine_ms += profile.refine_ms;
-        decoder_profile_.pixels += profile.pixels;
-        decoder_profile_.contours += profile.contours;
-        decoder_profile_.candidates += profile.candidates;
-        decoder_profile_.attempts += profile.attempts;
-        decoder_profile_.markers += profile.markers;
-        decoder_profile_.point_ms += profile.point_ms;
-        decoder_profile_.point_refined += profile.point_refined;
-        decoder_profile_.point_refine_failed += profile.point_refine_failed;
-        decoder_profile_.point_fallback_tried += profile.point_fallback_tried;
-        decoder_profile_.point_fallback_decoded += profile.point_fallback_decoded;
-        decoder_profile_.point_samples += profile.point_samples;
+        const auto add_profile = [this](const TagDecoderProfile &profile) {
+            decoder_profile_.threshold_ms += profile.threshold_ms;
+            decoder_profile_.contour_ms += profile.contour_ms;
+            decoder_profile_.quad_ms += profile.quad_ms;
+            decoder_profile_.decode_ms += profile.decode_ms;
+            decoder_profile_.refine_ms += profile.refine_ms;
+            decoder_profile_.pixels += profile.pixels;
+            decoder_profile_.contours += profile.contours;
+            decoder_profile_.candidates += profile.candidates;
+            decoder_profile_.attempts += profile.attempts;
+            decoder_profile_.markers += profile.markers;
+            decoder_profile_.point_ms += profile.point_ms;
+            decoder_profile_.point_refined += profile.point_refined;
+            decoder_profile_.point_refine_failed += profile.point_refine_failed;
+            decoder_profile_.point_fallback_tried += profile.point_fallback_tried;
+            decoder_profile_.point_fallback_decoded += profile.point_fallback_decoded;
+            decoder_profile_.point_samples += profile.point_samples;
+        };
+        std::vector<TagDetection> tags;
+        bool full_decoded = !low_ready[proposal_index];
+        bool low_success = false;
+        if (low_ready[proposal_index])
+        {
+            const cv::Rect low_rect(crop_rect.x / 2, crop_rect.y / 2,
+                                    (crop_rect.x + crop_rect.width + 1) / 2 - crop_rect.x / 2,
+                                    (crop_rect.y + crop_rect.height + 1) / 2 - crop_rect.y / 2);
+            const auto low_started = now_ms();
+            tags = low_decoder_->detect(low_res_gray(low_rect));
+            adaptive_stats_.low_ms += now_ms() - low_started;
+            ++adaptive_stats_.low_attempts;
+            adaptive_stats_.low_pixels += low_rect.area();
+            add_profile(low_decoder_->last_profile());
+
+            // A decoded tag ID and four corners are enough to seed precise
+            // full-size refinement; no contour/threshold image is required.
+            for (auto &tag : tags)
+            {
+                for (auto &point : tag.corners)
+                {
+                    point.x = 2.f * (point.x + low_rect.x + .5f) - .5f;
+                    point.y = 2.f * (point.y + low_rect.y + .5f) - .5f;
+                }
+                const auto refine_started = now_ms();
+                if (!decoder_->refine_full_resolution(full_res_gray, tag))
+                {
+                    full_decoded = true;
+                    break;
+                }
+                adaptive_stats_.full_refine_ms += now_ms() - refine_started;
+                for (auto &point : tag.corners)
+                {
+                    point.x -= crop_rect.x;
+                    point.y -= crop_rect.y;
+                }
+                tag.center -= cv::Point2f(static_cast<float>(crop_rect.x),
+                                          static_cast<float>(crop_rect.y));
+            }
+            bool known_tag_missing = false;
+            for (const auto &entry : tag_tracks_)
+            {
+                const TagTrack &known = entry.second;
+                if (known.blob_id != active_blob_ids[proposal_index] || known.missed > 1)
+                    continue;
+                if (std::none_of(tags.begin(), tags.end(), [&entry](const TagDetection &tag) {
+                        return tag.id == entry.first;
+                    }))
+                    known_tag_missing = true;
+            }
+            if (known_tag_missing)
+                full_decoded = true;
+            if (!tags.empty() && !full_decoded)
+            {
+                low_success = true;
+                ++adaptive_stats_.low_hits;
+            }
+            else if (known_tag_missing || !tags.empty())
+                ++adaptive_stats_.full_fallbacks;
+            else
+                ++adaptive_stats_.deferred_full;
+        }
+        if (full_decoded)
+        {
+            if (!low_ready[proposal_index] && low_decoder_ &&
+                proposal.roi.width * proposal.roi.height >= adaptive_min_roi_area_px_)
+                ++adaptive_stats_.full_audits;
+            const auto full_started = now_ms();
+            tags = decoder_->detect(crop);
+            adaptive_stats_.full_ms += now_ms() - full_started;
+            adaptive_stats_.full_pixels += crop.total();
+            add_profile(decoder_->last_profile());
+        }
+        for (auto &blob : blob_tracks_)
+        {
+            if (blob.id != active_blob_ids[proposal_index]) continue;
+            if (full_decoded)
+            {
+                blob.frames_since_full_decode = 0;
+                blob.next_full_after = tags.empty()
+                    ? std::min(32u, std::max(4u, blob.next_full_after * 2u))
+                    : adaptive_audit_frames_;
+            }
+            else
+            {
+                ++blob.frames_since_full_decode;
+                if (low_success)
+                    blob.next_full_after = adaptive_audit_frames_;
+            }
+            break;
+        }
 
         for (const auto &tag : tags)
         {
@@ -909,6 +1072,10 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         tag.box = result.roi;
         tag.blob_id = blob_id;
         tag.missed = 0;
+        tag.min_side_px = std::numeric_limits<float>::infinity();
+        for (int j = 0; j < 4; ++j)
+            tag.min_side_px = std::min(tag.min_side_px,
+                static_cast<float>(cv::norm(result.corners[j] - result.corners[(j + 1) % 4])));
         for (size_t i = 0; i < blob_tracks_.size(); ++i)
         {
             if (blob_tracks_[i].id != blob_id) continue;
@@ -919,7 +1086,8 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         }
     }
     for (size_t i = 0; i < blob_tracks_.size(); ++i)
-        blob_tracks_[i].missed = blob_detected[i] ? 0 : blob_tracks_[i].missed + 1;
+        blob_tracks_[i].missed = blob_detected[i] || track_used[i]
+            ? 0 : blob_tracks_[i].missed + 1;
     blob_tracks_.erase(std::remove_if(blob_tracks_.begin(), blob_tracks_.end(),
         [this](const BlobRoiTrack &track) { return track.missed >= track_retire_frames_; }), blob_tracks_.end());
     for (auto it = tag_tracks_.begin(); it != tag_tracks_.end(); )

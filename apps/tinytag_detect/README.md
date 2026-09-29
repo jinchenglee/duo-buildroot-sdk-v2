@@ -15,6 +15,11 @@ six-channel output as FP32. Stage one decodes the mask into separate tag
 regions, using ROI peaks to split connected regions; stage two optionally runs
 ArUco Nano on full-resolution crops with `--decode`.
 
+The experimental adaptive ROI decode path and its A/B acceptance rules are in
+[`docs/tinytag-adaptive-roi-rules.md`](../../docs/tinytag-adaptive-roi-rules.md).
+Enable it with `--adaptive-decode 1`; the default remains the full-resolution
+decoder.
+
 ## Build and install
 
 Run this **in the Docker container**, like every other build in this tree --
@@ -291,8 +296,11 @@ detector, crop-decode and the previews are all unchanged. Only the source
 differs: VI, the sensor and the ISP are not started.
 
 - `--input-speed f` scales the recorded timing (default 1). `0` is lockstep:
-  the next frame is fed only after the detector has taken the previous one,
-  so no frame is skipped. A 67 s recording replays in about 29 s this way.
+  the feeder keeps one compressed packet ahead because VDEC needs the next
+  packet to release the current picture, then waits for the detector before
+  advancing. Decoded frames are not superseded. VDEC retains the final
+  picture at EOF; a 279-frame no-B-frame recording processed 278 frames in
+  board testing.
 - The run exits at end of file and prints
   `[input] detector processed N of M frames`.
 - `--mirror`/`--flip` are ignored (recordings are already oriented), as are
@@ -304,10 +312,10 @@ differs: VI, the sensor and the ISP are not started.
 
 Known limitations:
 
-- With B-frames, the decoder driver does not flush its reorder queue at end
-  of stream, so the last few frames (3 in testing) are never processed, and
-  lockstep can skip about one frame. `--record` output has no B-frames and
-  loses nothing; use `-bf 0` when re-encoding.
+- The decoder driver does not flush its reorder queue at end of stream, so
+  the last few B-frame pictures (3 in testing) are never processed. It also
+  retained the last picture of a no-B-frame 279-frame recording (278
+  processed). Use `-bf 0` when re-encoding to minimize this loss.
 - VPSS numbers replayed frames in steps of 2, so the per-second `seq mean
   2.00` and the preview's `seq skipped` counts read like dropped frames.
   Trust the `[input]` summary line instead.

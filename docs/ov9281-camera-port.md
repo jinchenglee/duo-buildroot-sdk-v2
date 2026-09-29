@@ -1,8 +1,8 @@
 # Porting an OV9281 global-shutter mono camera to the Duo S
 
-The Duo S driver and J2 configuration are implemented. The register sequence
-comes from the validated Jetson OV9281 1280x800 RAW10 mode. Cross compilation
-passes, but the Duo hardware path still needs a chip ID, CSI, and ISP test.
+The Duo S driver and J2 configuration are implemented and hardware tested:
+chip-ID probing, CSI delivery, and ISP luma capture work. The register
+sequence comes from the validated Jetson OV9281 1280x800 RAW10 mode.
 
 Why OV9281: it is 1280x800 global-shutter mono, which is exactly the resolution
 the TinyTag model was trained at (`528.198329.jpg` and `220-225.mp4` are both
@@ -206,10 +206,37 @@ monochrome OV9281 has no color channels. The shared sample VI setup now
 enables the CV181X ISP mono control for OV9281 after loading the tuning bin.
 A second 1280x800 dump from the updated `sample_sensor_test` had all U and V
 samples exactly 128 and retained detailed luma. See
-`docs/ov9281-sample-mono-luma.png`; the first capture is preserved in
-`docs/ov9281-sample-luma.png` and `docs/ov9281-sample-color.png`.
+`docs/ov9281-sample-mono-luma.png`.
 
-## Hardware checks still needed
+## VI luma-only benchmark (2026-09-29)
+
+We tested whether asking the OV9281 VI channel for `PIXEL_FORMAT_YUV_400`
+instead of its usual NV21 output would reduce TinyTag latency. The temporary
+test changed the VI output format, source buffer size, and VPSS group input
+format together. The ISP, 1280x800 sensor mode, central 1280x720 VPSS crop,
+direct 640x360 model input, and tag decoder remained in use. No RTSP preview
+was enabled. The board accepted YUV_400 and ran normally.
+
+Four 15-second runs alternated NV21 and YUV_400 in NV21/luma/luma/NV21 order.
+Each row averages 12 one-second timing windows from the same TinyTag binary:
+
+| Run | VI output | FPS | Acquisition age | Loop | Tag crop-decode | Loop minus crop-decode | Result age |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | NV21 | 42.79 | 4.77 ms | 18.38 ms | 15.12 ms | 3.26 ms | 23.15 ms |
+| 1 | YUV_400 | 40.07 | 4.96 ms | 19.04 ms | 15.83 ms | 3.21 ms | 24.01 ms |
+| 2 | YUV_400 | 40.99 | 4.87 ms | 18.69 ms | 15.51 ms | 3.18 ms | 23.57 ms |
+| 2 | NV21 | 54.64 | 4.65 ms | 16.15 ms | 12.96 ms | 3.19 ms | 20.80 ms |
+
+`result age` is the application's acquisition age plus loop time, not a
+hardware exposure-to-result measurement. The differences in FPS and result
+age mainly follow the changing tag crop-decode load. The non-crop loop time
+was effectively equal within each pair. Acquisition age differed by about
+0.2 ms, with YUV_400 slightly slower in both pairs. This experiment found no
+measurable latency benefit from luma-only VI output. It did not bypass the
+ISP, so it says nothing about a direct RAW pipeline. NV21 remains the default;
+the temporary YUV_400 application switch and benchmark runner were removed.
+
+## Hardware status and remaining checks
 
 - **Duo timing.** First capture was stable at 120.6 fps with no reported
   frame failures. Check longer runs and varying exposure conditions.
@@ -225,21 +252,12 @@ samples exactly 128 and retained detailed luma. See
   excluded because its 1.8 V supply does not meet this module's connection
   plan.
 
-## Why this is worth doing
+## Live pipeline status
 
-The rest of the pipeline is already measured on hardware: TPU proposals plus
-ArUco Nano tag decode run in **11.25 ms (88.9 fps)** at 1280x800, of which the
-NPU is only 2.11 ms -- see `docs/duo-s-performance-findings.md`. Capture is the
-last missing stage, and there is a large budget left for it.
-
-Note this is single-threaded on the one Cortex-A53 the arm64 build exposes, so
-a capture path that costs CPU competes directly with the 6.5 ms crop-decode
-stage. A VPSS/hardware path is preferable to anything that copies frames in
-software.
-
-Note that a camera-fed pipeline would come through VPSS rather than a file
-read, and a VPSS-fed model wants `--aligned_input` at cvimodel compile time
-(width-aligned frames). `apps/tinytag_detect` deliberately *rejects* such a
-model at load, since it feeds a plain contiguous buffer -- so the live-camera
-path needs either a second cvimodel built with `--aligned_input` or a copy into
-an unaligned buffer. Decide which before building the camera application.
+OV9281 capture delivered about 120.6 fps. The live TinyTag path uses VPSS
+1280x720 luma for tag crops and a separate 640x360 luma channel bound directly
+to the compact TPU model after validating stride and tensor size. The TPU takes
+about 2 ms per detector frame; CPU crop decoding dominates the changing live
+frame time. The earlier 11.25 ms static-image benchmark in
+`docs/duo-s-performance-findings.md` describes a different workload and is
+not the live camera frame time.

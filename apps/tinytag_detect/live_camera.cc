@@ -418,6 +418,7 @@ void usage(const char *argv0)
             "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
+            "       [--adaptive-decode 0|1]\n"
             "       [--retire-frames N]\n"
             "\n"
             "  --mirror 1  correct a horizontally mirrored sensor. Mirrored frames decode\n"
@@ -454,6 +455,7 @@ void usage(const char *argv0)
             "              bit-for-bit before continuing (default 0; diagnostic only).\n"
             "  --capture-only  measure VPSS frame delivery only: no model, decoding, RTSP,\n"
             "              capture queue, or image processing. Prints one rate per second.\n"
+            "  --adaptive-decode 1  try the 640x360 frame first for large ROIs; default 0.\n"
             "  --max-exposure-us N  retain auto exposure but cap its shutter time. This\n"
             "              prevents AE slow-shutter from reducing capture cadence.\n"
             "  --quiet  suppress application diagnostics on stderr; detected tag IDs\n"
@@ -2433,9 +2435,10 @@ void input_feed_loop(CameraContext *ctx)
     au.reserve(1 << 20);
     const double start = now_ms();
     size_t sent = 0;
-    // Lockstep window: how many frames may be ahead of the detector. Grows when
-    // B-frame reordering holds decoded pictures back until more input arrives.
-    size_t lag = 0;
+    // VDEC holds even a no-B-frame picture until the next access unit arrives.
+    // Keep one picture ahead so lockstep does not incur a one-second timeout
+    // before every frame. Widen further for B-frame reordering if required.
+    size_t lag = 1;
     for (size_t i = 0; i < in.frame_count() && !g_stop; ++i)
     {
         uint64_t dts_us = 0;
@@ -2447,12 +2450,11 @@ void input_feed_loop(CameraContext *ctx)
         }
         if (ctx->input_speed <= 0.0 && i > lag)
         {
-            // Lockstep: send frame i once the detector has taken frame i-1-lag.
+            // Lockstep: send frame i once the detector has taken frame i-lag.
             // With B-frames a timeout means the decoder is holding that picture
             // for reordering, so widen the window instead of waiting every
-            // frame. Without them the window stays zero, so no frame can be
-            // superseded; the timeout only guards against a frame lost to a
-            // pairing mismatch.
+            // frame. Without them one picture remains in VDEC, so no decoded
+            // frame can be superseded; the timeout guards pairing failures.
             const bool reorders = in.reorders();
             std::unique_lock<std::mutex> lock(ctx->input_mutex);
             if (!ctx->input_taken_cv.wait_for(lock, std::chrono::milliseconds(reorders ? 200 : 1000),
@@ -2631,6 +2633,7 @@ int main(int argc, char *argv[])
     CVI_U32 max_exposure_us = 0;
     bool direct_compact_input = false;
     bool validate_compact_input = false;
+    bool adaptive_decode = false;
     int crop_align = 4;
     std::string ldc_calibration_path;
     std::string ldc_mode = "hw";
@@ -2672,6 +2675,8 @@ int main(int argc, char *argv[])
             direct_compact_input = std::atoi(argv[++i]) != 0;
         else if (flag == "--validate-compact-input" && has_value)
             validate_compact_input = std::atoi(argv[++i]) != 0;
+        else if (flag == "--adaptive-decode" && has_value)
+            adaptive_decode = std::atoi(argv[++i]) != 0;
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
@@ -2820,6 +2825,18 @@ int main(int argc, char *argv[])
                 point_ldc_fallback ? "on" : "off", model->fold_radius_px(), k(0, 0), k(1, 1),
                 k(0, 2), k(1, 2), decode ? "" : " (inactive: decoding is off)");
     }
+    if (adaptive_decode)
+    {
+        if (!decode || capture_only)
+        {
+            fprintf(stderr, "[adaptive] requires active tag decoding\n");
+            return 1;
+        }
+        detector.set_adaptive_decode(make_aruco_nano_decoder(decode_tolerant),
+                                     64.f, 40000, 20);
+        fprintf(stderr, "[adaptive] enabled: min known tag side 64 px, min ROI 40000 px, "
+                        "audit 20 frames; new blob first full check after 2-4 misses\n");
+    }
     if (ldc_mode == "sw")
     {
         const SoftwareLdc::Interp interp = ldc_sw_interp == "nearest"
@@ -2894,6 +2911,11 @@ int main(int argc, char *argv[])
     ctx.validate_compact_input = validate_compact_input && ctx.compact_direct_input;
     ctx.direct_model_input = !capture_only &&
                              (detector.uses_aligned_input() || ctx.compact_direct_input);
+    if (adaptive_decode && !ctx.direct_model_input)
+    {
+        fprintf(stderr, "[adaptive] requires direct VPSS 640x360 model input\n");
+        return 1;
+    }
     if (!save_ldc_pair_prefix.empty() && (!ctx.ldc.enabled || !ctx.compact_direct_input))
     {
         fprintf(stderr, "[ldc] --save-ldc-pair requires LDC and compact direct model input\n");
@@ -3007,6 +3029,8 @@ int main(int argc, char *argv[])
     {
         long frames = 0;
         double wait = 0, pair = 0, map = 0, ldc = 0, pre = 0, infer = 0, decode = 0, crop = 0;
+        double adaptive_copy = 0;
+        AdaptiveDecodeStats adaptive;
         double release = 0;
         double output = 0;
         double service_cpu = 0;
@@ -3063,6 +3087,7 @@ int main(int argc, char *argv[])
     bool compact_needs_validation = ctx.validate_compact_input;
     unsigned ldc_pair_model_frames = 0;
     bool ldc_pair_saved = false;
+    cv::Mat adaptive_small_frame;
     LumaRtspStats preview_prev;
     while (!g_stop)
     {
@@ -3159,6 +3184,8 @@ int main(int argc, char *argv[])
         }
 
         double pair_wait_ms = 0.0;
+        bool adaptive_small_valid = false;
+        double adaptive_copy_ms = 0.0;
         if (ctx.direct_model_input)
         {
             uint8_t *compact_validation_copy = nullptr;
@@ -3201,6 +3228,25 @@ int main(int argc, char *argv[])
             {
                 CVI_SYS_Munmap(compact_validation_copy, model_frame.stVFrame.u32Length[0]);
                 compact_needs_validation = false;
+            }
+            if (adaptive_decode && detector.wants_low_res_frame(proposals))
+            {
+                const VIDEO_FRAME_S &mf = model_frame.stVFrame;
+                const double copy_started = now_ms();
+                auto *pixels = static_cast<uint8_t *>(
+                    CVI_SYS_MmapCache(mf.u64PhyAddr[0], mf.u32Length[0]));
+                if (pixels != nullptr)
+                {
+                    const cv::Mat small(360, 640, CV_8UC1,
+                                        pixels + static_cast<size_t>(mf.s16OffsetTop) * mf.u32Stride[0],
+                                        mf.u32Stride[0]);
+                    small.copyTo(adaptive_small_frame);
+                    CVI_SYS_Munmap(pixels, mf.u32Length[0]);
+                    adaptive_small_valid = true;
+                }
+                else
+                    fprintf(stderr, "[adaptive] cannot map model frame; using full resolution\n");
+                adaptive_copy_ms = now_ms() - copy_started;
             }
             if (!save_ldc_pair_this_frame)
             {
@@ -3410,7 +3456,8 @@ int main(int argc, char *argv[])
             if (!ctx.direct_model_input)
                 detector.detect(gray, proposals);
             if (decode)
-                detector.post_process(gray, proposals, results);
+                detector.post_process(gray, proposals, results,
+                                      adaptive_small_valid ? adaptive_small_frame : cv::Mat());
         }
         catch (const std::exception &e)
         {
@@ -3485,6 +3532,21 @@ int main(int argc, char *argv[])
         win.infer += detector.last_inference_ms();
         win.decode += detector.last_decode_ms();
         win.crop += decode ? detector.last_crop_decode_ms() : 0.0;
+        win.adaptive_copy += adaptive_copy_ms;
+        if (adaptive_decode)
+        {
+            const AdaptiveDecodeStats &a = detector.last_adaptive_stats();
+            win.adaptive.low_attempts += a.low_attempts;
+            win.adaptive.low_hits += a.low_hits;
+            win.adaptive.full_fallbacks += a.full_fallbacks;
+            win.adaptive.full_audits += a.full_audits;
+            win.adaptive.deferred_full += a.deferred_full;
+            win.adaptive.low_pixels += a.low_pixels;
+            win.adaptive.full_pixels += a.full_pixels;
+            win.adaptive.low_ms += a.low_ms;
+            win.adaptive.full_ms += a.full_ms;
+            win.adaptive.full_refine_ms += a.full_refine_ms;
+        }
         if (decode)
         {
             const TagDecoderProfile &profile = detector.last_decoder_profile();
@@ -3583,7 +3645,7 @@ int main(int argc, char *argv[])
             }
             const double n = static_cast<double>(win.frames);
             const double busy = (win.pair + win.map + win.ldc + win.pre + win.infer + win.decode +
-                                 win.crop + win.release) / n;
+                                 win.crop + win.adaptive_copy + win.release) / n;
             const double loop = busy + win.output / n;
             const double process_cpu_now = process_cpu_ms();
             const double process_cpu_per_frame = (process_cpu_now - process_cpu_window_start) / n;
@@ -3655,6 +3717,17 @@ int main(int argc, char *argv[])
                             static_cast<double>(win.point_fallback_tried) / n,
                             static_cast<double>(win.point_fallback_decoded) / n);
             }
+            if (adaptive_decode)
+                fprintf(stderr,
+                        "[adaptive] per frame ms copy %.2f low %.2f full %.2f refine %.2f | "
+                        "low attempts %zu hits %zu fallback %zu audit %zu deferred %zu | "
+                        "pixels low %zu full %zu\n",
+                        win.adaptive_copy / n, win.adaptive.low_ms / n,
+                        win.adaptive.full_ms / n, win.adaptive.full_refine_ms / n,
+                        win.adaptive.low_attempts, win.adaptive.low_hits,
+                        win.adaptive.full_fallbacks, win.adaptive.full_audits,
+                        win.adaptive.deferred_full, win.adaptive.low_pixels,
+                        win.adaptive.full_pixels);
             if (ctx.direct_model_input)
             {
                 const size_t pair_mismatches =

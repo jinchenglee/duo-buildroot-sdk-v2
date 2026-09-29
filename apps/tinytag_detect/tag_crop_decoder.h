@@ -55,6 +55,11 @@ public:
     // than assuming packed rows.
     virtual std::vector<TagDetection> detect(const cv::Mat &crop) = 0;
     virtual const TagDecoderProfile &last_profile() const = 0;
+
+    // The ID and initial quad may come from a half-size image. Corners are
+    // supplied in full-frame coordinates; refine against the full-size image.
+    // Return false when a full-resolution decode should be attempted instead.
+    virtual bool refine_full_resolution(const cv::Mat &frame, TagDetection &tag) = 0;
 };
 
 // ArUco Nano reading AprilTag 36h11, the K230 production default.
