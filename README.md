@@ -86,7 +86,9 @@ link against yet.
 overlay layout.** Skipping step 2 is silent — the image builds successfully and
 simply has no detector in it.
 
-New to this work? Start with [docs/handover.md](docs/handover.md).
+New to this work? Start with the [app README](apps/tinytag_detect/README.md)
+and [OV9281 camera notes](docs/ov9281-camera-port.md). The detailed experiment
+record is in [the live camera workplan](docs/live-camera-workplan.md).
 
 See [apps/tinytag_detect/README.md](apps/tinytag_detect/README.md) for usage,
 [tools/tinytag_cvimodel/README.md](tools/tinytag_cvimodel/README.md) for the

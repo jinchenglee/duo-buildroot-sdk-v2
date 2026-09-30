@@ -1,9 +1,12 @@
 # TinyTag adaptive ROI decode rules
 
 This is the decision record for the experimental `--adaptive-decode 1` path.
-The baseline is `--adaptive-decode 0`. Both use the same 640×360 proposal
-network and 1280×720 camera frame; the switch changes only how proposed ROIs
-are decoded.
+It is **off by default**: `--adaptive-decode 0` sends accepted ROIs to the
+full-resolution crop decoder. Both modes use the same 640×360 proposal network
+and 1280×720 camera frame. The optional adaptive path can avoid a
+**full-resolution decode** for a large ROI by trying its half-size crop first
+and deferring some full-resolution scans. It does not avoid the network pass or
+all crop decoding.
 
 ## Why route by history
 
@@ -43,7 +46,10 @@ latency tradeoff to evaluate before making the feature the default.
 
 ## Choosing the ROI-size gate
 
-The current 40,000-pixel gate is a starting value, not a calibrated optimum.
+The current 40,000-full-resolution-pixel **area** gate is a convenient starting
+value, equivalent to a 200×200-pixel box but also met by other shapes such as
+400×100. It is not a calibrated optimum. Careful tests of recall, first-detection
+delay, corner quality, and processing time must determine the real threshold.
 Lowering it makes more ROIs eligible, including new blobs whose tags may be
 too small to decode at half size. The 64-pixel known-tag rule protects tracked
 small tags, but cannot protect a tag that has not been found yet. A tag found

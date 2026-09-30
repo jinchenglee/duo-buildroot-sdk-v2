@@ -1,9 +1,13 @@
 # Point-Level Lens Distortion Correction for AprilTag on Wide-FOV (Duo-S)
 
-Status: design note. Complements `docs/handover.md` and the `hardware-ldc` work.
-Scope: an AprilTag ROI->decode->pose pipeline on the SG2000 (Milk-V Duo S), where
-full-frame lens-distortion correction (hardware GDC or software remap) is measured
-to be too slow for real-time.
+Status: implemented and opt-in on `roi_on_mask` (also in `origin/loop-ldc`).
+Use `--ldc-mode point --ldc-calibration FILE.json` with tag decoding enabled.
+The calibration needs `camera_matrix` and `distortion_coefficients`. The live
+launcher does not enable point LDC by default. The implementation is in
+`apps/common/point_ldc.{h,cc}` and `apps/tinytag_detect/tag_crop_decoder.cc`;
+board and synthetic validation are recorded below. Hardware/software
+comparisons are in [the LDC findings](ldc-performance-findings.md). This note
+also records limits and possible future work.
 
 ## Why not full-frame LDC
 
@@ -35,69 +39,71 @@ requirements:
 2. Bit-grid sampling (the tag's bit cells project to a curved grid in the image).
 3. Corner/pose accuracy (corner positions).
 
-Only stage (1), if it fails, forces image-space correction (a corrected ROI).
-Stages (2) and (3) are exactly solvable by cheap point-level correction in the
-corrected (pinhole) domain. So we do not render any corrected region for the
-common path.
+The implemented path leaves the image uncorrected. It refines corner geometry
+after a raw-image quad has been found and decoded. It can retry a raw quad that
+failed bit decoding with a distortion-aware grid. It cannot recover a tag when
+raw-image contour tracing or quad fitting found no candidate. Corrected-ROI
+rescue for that case remains a proposal.
 
-Note on the "whole ROI first?" trap: iterating on the 4 detected *corner points*
-does NOT converge to the remap->fit->corners answer, because those 4 points are a
-lossy summary that already discarded the curvature that causes the sagitta bias.
-The correction must be applied to the *edge geometry* (contour/edge sample
-points) BEFORE the line fit. Then the fitted lines are true straight lines and the
-corners equal what remap->fit would give, up to shared residuals (calibration
-model residual, threshold/contour noise, pixel quantization).
+Iterating on only four detected corner points cannot recover edge curvature.
+The implementation uses those corners to locate the edges, samples edge pixels
+in the raw frame, undistorts the samples, and fits straight lines in the
+corrected domain. It does not undistort the candidate contour itself.
 
 ## Pipeline
 
-Overall flow (no full-frame correction):
+Implemented flow (no full-frame correction):
 
 ```
 raw frame
-  -> threshold
-  -> connected-component / candidate loops   [topological; no undistortion needed]
-  -> per candidate loop:
-        sample along the loop (arc-length; skip corner margins)
-        undistort samples with D^-1            [full distortion coefficients]
-        fit straight edges (least squares / robust) in corrected domain
-        intersect adjacent edges -> refined corners
-  -> corrected-domain homography H'  (refined corners -> tag bit grid)
-  -> for each bit center b: sample raw image at D(H'(b))     [forward-distort]
-  -> decode ID
-  -> refinement / solvePnP  (pose from refined corners)
+  -> ArUco Nano threshold, contour trace, raw-image quad fit, bit decode
+  -> for each decoded tag:
+        sample the four raw-image edges near the decoded quad
+        locate subpixel edge crossings and undistort those samples
+        fit corrected-domain straight lines and intersect them
+        return refined raw corners and ideal (pinhole) corners
+  -> for selected rejected quads (fallback enabled by default):
+        perform the same edge fit
+        build a corrected-domain bit-grid homography
+        forward-distort sample points into the raw image and retry ID decode
 ```
 
+No `solvePnP` call is part of this detector path. The reported `ideal` corners
+can be used by downstream pose estimation. Neither the TPU input nor the
+preview is undistorted in point mode.
+
 ### Decode path
-- Use the raw-frame corners only to LOCALISE the bit grid. Bit-cell tolerance is
-  large, and the quad-fit sagitta bias is small relative to a readable tag's cell
-  size (and largely common-mode across the four corners, so it mostly cancels in
-  the grid).
-- The wide-FOV decoding fix is to build the bit-grid homography in the corrected
-  domain (from refined corners) and forward-distort each bit-center with D.
-  Because the bit cells form a curved grid in the raw image, forward-distortion
-  makes the samples follow that curve — the same effect an ROI undistortion would
-  give, but with O(number of bits) point lookups, no region, no rectangle.
+
+The normal first attempt is ArUco Nano's raw-image decode. Point LDC refines
+its successful tag corners afterward. With `--point-ldc-fallback 1` (the
+default), up to eight raw quad candidates per crop whose normal decode failed
+are edge-refined and retried. Their bit samples follow a corrected-domain
+homography forward-distorted into the raw frame. The fallback does not run for
+a tag whose initial contour or quad was never produced.
 
 ### Pose path
-- Once a tag is decoded, the refined corners (from corrected edge fits) go to
-  solvePnP. They are geometrically accurate (equal to remap->fit->corners within
-  the shared residual floor), so pose is correct for edge tags under wide-FOV
-  distortion.
 
-### When a corrected ROI is unavoidable
-- Only if candidate generation / quad fitting outright fails in the far periphery
-  (no usable convex candidate). Then fall back to a corrected-domain ROI remap
-  sized from the undistorted corners + source margin, invoked as a rescue rather
-  than the default.
+The live app reports `ideal=(...)` corners in pinhole pixel coordinates when
+point correction succeeds. A consumer can use them with the calibration's
+camera matrix and zero distortion. Pose estimation is not implemented here.
 
-## Sampling along the loop (computation reduction)
+### Missing-quad limitation
 
-Instead of undistorting every contour pixel of a candidate loop, sample K points
-per edge (approximately arc-length spaced) and undistort only those.
+When contour tracing or raw-image quad fitting fails, point LDC has no seed
+quad to refine. A corrected-ROI rescue is a possible future extension, not an
+implemented fallback.
 
-Why it is safe: the physical edge is straight; undistortion maps it to a straight
-line regardless of apparent curvature. So dense sampling is not needed to capture
-curvature — only to average out noise. K points per edge is sufficient.
+## Sampling along the edges
+
+The current defaults are eight samples per edge, a 15% margin at both corners,
+and two fitting passes. The first pass searches for subpixel edge crossings
+near each raw quad side. The next pass projects the fitted corrected-domain
+edge back into the raw image and searches near that curved edge. The code fits
+each edge with Huber-reweighted least squares and intersects adjacent lines.
+
+The physical tag edge is straight in the ideal image, so samples on that edge
+can be fitted there without remapping the whole image. The initial raw quad
+still has to be close enough for the edge searches to find the edge.
 
 Error / balance:
 - Variance (noise) of the line fit falls like ~1/K. Systematic bias (model
@@ -106,31 +112,71 @@ Error / balance:
   model's own residual (the true accuracy floor on wide FOV). Beyond that, more
   samples buy nothing. Suggested K ~ 8-16 per edge; ~4-6 acceptable for clean
   edges.
-- Placement matters more than count:
-  * sample actual contour pixels at even arc-length intervals (on the border), and
-  * exclude a margin near each corner (skip ~15-20% of each edge at both ends) so
-    no sample sits in the bend region.
-- Use least-squares with light outlier rejection (or RANSAC) so a stray sample
-  cannot drag the line.
-- Anchor the samples with a cheap coarse quad fit on the raw loop first so edge /
-  corner regions are known.
+- Placement matters: the implementation samples image intensity near the
+  quad-guided edge and excludes the corner margins. It does not sample stored
+  contour pixels.
+- The robust line fit limits the influence of a stray edge sample.
 
-Cost: ~K*4 ~ 30-60 D^-1 calls per tag (each a few multiply/adds) — effectively
-free on one core vs. correcting the whole loop (hundreds of contour points) or any
-region remap.
+Measured Duo S cost and corner-error comparisons are recorded below.
+
+## Recorded validation and board cost
+
+Migrated from the handover. These synthetic and OV5647 board results were
+recorded on 2026-09-25; they do not establish accuracy or cost for a different
+lens, calibration, camera, or scene.
+
+Design and validation are in `tools/ldc_point_correction/`. The notebook
+compares this with full-frame and ROI remapping on synthetic frames with ground
+truth; `ldcpt.point_ldc_detect` is the Python reference for the C++.
+Synthetic results, mean corner error in ideal px:
+
+| Case | point LDC | ROI remap + stock | full remap (SW) | HW one-ratio sim |
+| --- | ---: | ---: | ---: | ---: |
+| 80 mm tags, 0.7-1.4 m | 0.135 | 0.30 | 0.27 | 3.2 |
+| 120 mm tags, 0.35-0.7 m | 0.075 | 0.37 | 0.29 | 3.2 |
+| lens distortion x1.5 | 0.103 | 0.45 | 0.25 | n/a |
+
+Recall in those synthetic tests is 96-99%, against 60-74% for full remap, which loses the outer band.
+C++ and Python agree to a median of 0.0001 px on the same frames. A few
+small-tag outliers (up to 0.8 px) start from stock corners that differ by about
+1 px between the two contour tracers; a third pass removes most of that.
+`apps/tinytag_detect/point_ldc_check` (built for host and board) reruns this
+check on a still frame and times it.
+
+Duo-S cost, measured 2026-09-25:
+
+| Measurement | Cost |
+| --- | ---: |
+| point stage per decoded tag, `point_ldc_check`, 80 mm synthetic tags | 0.34-0.36 ms |
+| same, `test_post_ldc.png` | 0.38 ms |
+| same, large tags | 0.53 ms |
+| each fallback candidate | about 0.12 ms |
+| live 720p60, one tag in view, `[point-ldc]` | 0.60 ms per frame |
+| full-frame SW remap, for comparison | 25-36 ms per frame |
+
+In the live run, the detector held 58-59 fps with capped AE, against 59-62 fps
+without LDC; crop time varied 1-2 ms with the scene.
+`cv::fitLine(DIST_HUBER)` cost 68 us per call on the A53, so the line fit is a
+closed-form reweighted fit of about 2 us. The model round trip is exact to
+1e-12 px on the board.
+
+Limits:
+
+- The specific 720p calibration used in these tests folds at a raw radius of 686 px. Three frame
+  corners have no inverse, and samples there are dropped.
+- Two passes do not fully converge from a stock quad that is off by about 1 px
+  on small tags.
+- The static-image `tinytag_detect` and ArUco Nano apps do not use this mode.
 
 ## Validation / next steps
 
-1. Implement: threshold -> loops -> sample -> undistort samples -> robust edge fit
-   -> refined corners -> corrected-domain homography -> forward-distort bit
-   sampling -> decode -> solvePnP.
-2. Sweep K (e.g. 3, 6, 9, 12, 16) and corner-margin fraction; measure corner
-   residual vs. the full-range... reference (dense correction and/or full ROI
-   remap) on a checkerboard / synthetic grid.
-3. Compare estimated corners to the remap->fit->corners reference to confirm the
-   point-level result matches within the shared residual floor.
-4. Measure per-tag added CPU time and confirm the decode/pose accuracy holds at
-   the frame edge with the wide-FOV lens.
+1. Sweep K (e.g. 3, 6, 9, 12, 16) and corner-margin fraction; measure corner
+   residual against a dense correction or full-ROI-remap reference on a
+   checkerboard or synthetic grid.
+2. Check per-frame recall and corrected corner accuracy at the frame edge on
+   real scenes, including cases with no raw-image quad candidate.
+3. Evaluate a corrected-ROI rescue if missing raw quads cause material misses.
+4. Validate a downstream pose consumer separately if pose is needed.
 
 ## Open questions
 
@@ -138,8 +184,8 @@ region remap.
   where quad fit starts failing vs distortion.
 - Whether forward-distorted bit sampling is as robust as an ROI remap for decode
   under strong radial terms; validate on the wide-FOV lens.
-- Positioning: this is a "correct only what detection consumes" design that
-  preserves frame rate and is exact at the sampling level for wide FOV.
+- Measure the speed and recall tradeoff of the optional fallback on the target
+  lens and scene before changing the launch default.
 
 ## Related work and novelty framing
 
@@ -188,20 +234,19 @@ corners" argument in prior literature.
 
 ### What is genuinely this work (claim this)
 
-- Point-level correction applied to the DECODE bit-grid: forward-distorting the
-  bit-sample grid under distortion so the samples follow the curved grid in the
-  raw frame - in a real-time, single-core, NPU-constrained embedded detector.
+- Point-level correction applied to the fallback decode bit grid:
+  forward-distorting bit sample positions so they follow the curved grid in
+  the raw frame on a single-core embedded detector.
 - Per-candidate-loop correction (undistort a candidate contour, then segment)
-  as a way to avoid pre-identifying the tag's edges under distortion.
+  remains an unimplemented extension for candidates the raw quad fitter misses.
 - The "correct only what detection consumes" framing under a hard real-time
   budget, where full-frame correction (hardware GDC or software remap) is
   measured to exceed the frame budget on the Milk-V Duo S (SG2000).
 
-Suggested paper framing: "on a single-core embedded platform, full-frame
-lens-distortion correction (HW GDC or SW remap) exceeds the real-time budget; we
-achieve distortion-robust detection and pose by correcting only the decoded
-corners and bit samples in the corrected domain, matching region-level accuracy
-at negligible cost." Lead with the constraint and decode-level bit sampling; cite
+Suggested paper framing, subject to real-scene validation: point LDC corrects
+decoded corners and retries selected failed quad decodes without full-frame
+remapping on a single-core embedded platform. Pose and recovery of missing raw
+quads are outside the current implementation. Cite
 TartanCalib, ORB-SLAM3, undistortPoints, and the inverse-mapping caveat.
 Subsection "References":
 - TartanCalib: "Iterative Wide-Angle Lens Calibration using Adaptive Subpixel

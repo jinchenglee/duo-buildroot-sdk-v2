@@ -18,7 +18,14 @@ ArUco Nano on full-resolution crops with `--decode`.
 The experimental adaptive ROI decode path and its A/B acceptance rules are in
 [`docs/tinytag-adaptive-roi-rules.md`](../../docs/tinytag-adaptive-roi-rules.md).
 Enable it with `--adaptive-decode 1`; the default remains the full-resolution
-decoder.
+decoder (`--adaptive-decode 0`). For large ROIs, adaptive mode tries a half-size
+crop first and can defer some full-resolution scans. Its 40,000-pixel ROI-area
+gate (the area of a 200×200 box) is provisional; recall and timing tests are
+needed to choose a threshold.
+
+The proposed training effort to reduce expensive false ROIs, including synthetic
+data, recoverable tag-size limits, and cost-weighted losses, is recorded in
+[`docs/tinytag-proposal-training.md`](../../docs/tinytag-proposal-training.md).
 
 ## Build and install
 
@@ -71,6 +78,26 @@ Then rebuild the image; the overlay is picked up automatically:
 ./build.sh <board>
 ```
 
+## Deploy app updates without reflashing
+
+Always build in the `duodocker` container. The app links against the TPU SDK
+created by a successful full SDK build:
+
+    docker exec duodocker /bin/bash -c \
+      'cd /home/work && ./apps/tinytag_detect/build.sh milkv-duos-glibc-arm64-sd'
+
+The generated overlay is under
+`device/milkv-duos-glibc-arm64-sd/overlay/app/tinytag_detect/`. Iterating on
+the app does not require reflashing. The reference Duo-S uses USB Ethernet
+at `root@192.168.42.1`; use SSH/SCP when reachable (password `milkv`):
+
+    scp -O device/milkv-duos-glibc-arm64-sd/overlay/app/tinytag_detect/tinytag_detect_live \
+      root@192.168.42.1:/app/tinytag_detect/
+
+Use binary hashes when deployment identity matters. The example build above
+is the full app build; [the LDC findings](../../docs/ldc-performance-findings.md)
+retain historical incremental CMake commands and dated deployment hashes.
+
 ## How the overlay reaches the image
 
 `build/Makefile`'s `br-rootfs-prepare` target already copies
@@ -109,6 +136,11 @@ None beyond what the image already ships. The binary needs
 `/etc/profile` puts on `LD_LIBRARY_PATH`. `run_tinytag.sh` sets that path
 itself as well, so it also works from a non-login shell (`ssh board 'cmd'`,
 init scripts, cron).
+
+The live app also needs the CVI camera/ISP/VPSS/codec stack and matching vendor
+kernel modules. The current ARM64 build uses glibc. See
+[Duo S Linux options](../../docs/duo-s-linux-options.md) for alternative root
+filesystems and the proposed minimal Buildroot profile.
 
 ## Live preview benchmark
 
@@ -280,6 +312,19 @@ Full-frame software correction is much slower than the hardware path on the
 fps with hardware direct input, and 36.2 ms at 49 fps with hardware
 copied input. Software linear LDC took 36 ms of CPU per frame and reached 63.6
 ms at 18 fps; software nearest took 21.5 ms and reached 47.6 ms at 25 fps.
+
+Point LDC is implemented but opt-in. Run it with tag decoding enabled:
+
+```sh
+./run_live.sh --ldc-mode point --ldc-calibration /root/ldc-calibration.json
+```
+
+It leaves the frame uncorrected, then samples and undistorts tag edge points to
+refine the corners of decoded raw-image quads. Its default-on fallback retries
+up to eight quads whose normal bit decode failed through a distortion-aware
+grid. It cannot recover a tag if the raw-image contour or quad search found no
+candidate. See [the point-LDC note](../../docs/ldc-point-correction.md) and
+the [recorded point-LDC measurements](../../docs/ldc-point-correction.md#recorded-validation-and-board-cost).
 
 The OV5647 720p60 mode uses a wider, binned sensor region than 1080p30. A
 calibration made from 1080p30 images is not valid for accurate 720p60 pose
