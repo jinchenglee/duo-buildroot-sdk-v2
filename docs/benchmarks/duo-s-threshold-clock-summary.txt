@@ -1,0 +1,20 @@
+CPU clock excerpt from user-provided output of:
+    cat /sys/kernel/debug/clk/clk_summary
+
+Recorded after the successful 100-iteration FreeRTOS threshold benchmark.
+This is a subsequent Linux clock-framework report, not a simultaneous
+frequency trace captured during the benchmark. Other clocks are omitted.
+
+clock          parent       reported_rate_hz
+osc            -            25000000
+clk_fpll       osc          1500000000
+clk_c906_0     clk_fpll     750000000
+clk_tpll       osc          850000000
+clk_c906_1     clk_tpll     425000000
+clk_mpll       osc          800000000
+clk_a53        clk_mpll     800000000
+
+clk_c906_1 is the FreeRTOS C906L worker clock in this experiment.
+clk_c906_0 is not the running Linux A53 clock.
+Milk-V specifies C906L at 700 MHz, but this ARM boot configuration reports
+425 MHz. No clock configuration was changed during the source audit.

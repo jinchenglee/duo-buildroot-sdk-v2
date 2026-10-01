@@ -19,6 +19,9 @@
 
 #include "comm.h"
 #include "cvi_spinlock.h"
+#include "roi_threshold_protocol.h"
+extern int roi_threshold_worker_init(void);
+extern int roi_threshold_worker_submit(uint32_t address);
 
 //#define __DEBUG__
 
@@ -154,6 +157,8 @@ void main_cvirtos(void)
 #endif
 
 	main_create_tasks();
+	if (roi_threshold_worker_init())
+		printf("roi threshold worker unavailable\n");
 
 	/* Start the tasks and timer running. */
 	vTaskStartScheduler();
@@ -204,6 +209,11 @@ void prvCmdQuRunTask(void *pvParameters)
 
 	for (;;) {
 		xQueueReceive(gTaskCtx[E_QUEUE_CMDQU].queHandle, &rtos_cmdq, portMAX_DELAY);
+		if (rtos_cmdq.ip_id == IP_SYSTEM && rtos_cmdq.cmd_id == TT_THRESHOLD_COMMAND) {
+			if (roi_threshold_worker_submit(rtos_cmdq.param_ptr))
+				printf("roi threshold queue unavailable/full\n");
+			continue;
+		}
 
 		switch (rtos_cmdq.cmd_id) {
 #if ( configUSE_TRACE_FACILITY == 1 )

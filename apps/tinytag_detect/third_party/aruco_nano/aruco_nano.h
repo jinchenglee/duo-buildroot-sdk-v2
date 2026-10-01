@@ -173,6 +173,8 @@ public:
     inline std::pair<cv::Mat,cv::Mat> estimatePose(cv::Mat cameraMatrix,cv::Mat distCoeffs,double markerSize=1.0f)const;
 };
 struct DetectorParameters {
+    // Optional experiment hook: false requests the unchanged OpenCV fallback.
+    bool (*roiThreshold)(const cv::Mat &, cv::Mat &, int, int)=nullptr;
     int boxFilterSize=15,thres=3; //values for adaptive thresholding
     int minSize=10;//minimum size of a contour side to be considered as a marker candidate
     int maxAttemptsPerCandidate=5;//number of attempts to identify a candidate by slightly altering the corners
@@ -342,9 +344,11 @@ std::vector<Marker>  MarkerDetector::detect(const cv::Mat &img, const DetectorPa
     /////////////////// Adaptive Threshold to detect border
     //    cv::adaptiveThreshold(bwimage, thresImage, 255.,cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, params.boxFilterSize, params.Thres);
     //this method is achieves a ~1.5 speed up
-    cv::boxFilter( bwimage, thresImage, bwimage.type(), cv::Size(params.boxFilterSize, params.boxFilterSize),cv::Point(-1,-1), true, cv::BORDER_REPLICATE|cv::BORDER_ISOLATED );
-    thresImage=thresImage-bwimage;
-    cv::threshold(thresImage, thresImage, params.thres, 255, cv::THRESH_BINARY);
+    if (!params.roiThreshold || !params.roiThreshold(bwimage, thresImage, params.boxFilterSize, params.thres)) {
+        cv::boxFilter( bwimage, thresImage, bwimage.type(), cv::Size(params.boxFilterSize, params.boxFilterSize),cv::Point(-1,-1), true, cv::BORDER_REPLICATE|cv::BORDER_ISOLATED );
+        thresImage=thresImage-bwimage;
+        cv::threshold(thresImage, thresImage, params.thres, 255, cv::THRESH_BINARY);
+    }
     const auto thresholdDone = profile ? ProfileClock::now() : ProfileClock::time_point{};
     /////////////////// compute marker candidates by detecting contours
     std::vector<std::vector<cv::Point>> contours;

@@ -62,6 +62,68 @@ first. The build outputs are root-owned, so the script runs inside the
 `duodocker` container (`DUO_CONTAINER` overrides the name). Then rebuild with
 the full sequence below, starting from step 1.
 
+## Duo S ARM64 SD power and performance profiles
+
+Future `milkv-duos-glibc-arm64-sd` image builds default to the SDK's
+**performance profile**, through `CONFIG_OD_CLK_SEL=y` in the board defconfig.
+The following rates were verified from the board's Linux clock report before
+and after installing the corresponding FIP:
+
+| Component | Normal profile | Performance profile (default) |
+| --- | ---: | ---: |
+| A53 running Linux | 800 MHz | 1000 MHz |
+| C906L running FreeRTOS | 425 MHz | 700 MHz |
+| TPU | 500 MHz | 700 MHz |
+| Video-codec AXI | 360 MHz | 450 MHz |
+| VIP AXI | 300 MHz | 300 MHz |
+| DDR3 configuration | 1866 MT/s | 1866 MT/s |
+| Core-voltage request | Existing boot setting; not measured | SDK PWM setting documented as 1.00 V |
+
+The performance profile uses the existing FSBL `sys_pll_od()` implementation.
+It changes shared PLLs, voltage and some audio/video clocks together. Higher
+clocks and voltage can increase power consumption and temperature; actual
+power and steady-state thermal behavior have not been measured. Clock-rate
+increases do not guarantee equal gains in whole-pipeline FPS or latency.
+These rates describe this ARM64 board setup; other SDK targets use different
+clock paths.
+
+To select a profile for an incremental FIP build, run **inside Docker**:
+
+```sh
+cd /home/work
+source build/envsetup_milkv.sh milkv-duos-glibc-arm64-sd
+setconfig OD_CLK_SEL=y                 # performance; use n for normal
+clean_fsbl
+build_fsbl
+```
+
+Install the resulting
+`install/soc_sg2000_milkv_duos_glibc_arm64_sd/fip.bin`, preserving the board's
+previous FIP, and reboot. Verify `clk_a53`, `clk_c906_1` and `clk_tpu` in
+`/sys/kernel/debug/clk/clk_summary`. The clock setup is in FSBL, so a
+firmware-only BLCP repack or a Linux governor change does not select a profile;
+the current kernel has CPU frequency scaling disabled.
+
+`setconfig` changes the current generated config. The next board selection or
+full `./build.sh milkv-duos-glibc-arm64-sd` restores the board defconfig's
+performance default. For a persistent normal-profile build, remove
+`CONFIG_OD_CLK_SEL=y` from that defconfig (or explicitly disable it there).
+Both normal-profile options, `OD_CLK_SEL` and `VC_CLK_OVERDRIVE`, should then
+be disabled. `VC_CLK_OVERDRIVE` is a separate video-oriented SDK profile,
+not the normal profile.
+
+DDR uses separate boot-time PHY initialization and training. Keep the selected
+`ddr3_1866_x16` profile; 1866 MT/s corresponds to approximately a 933 MHz
+memory clock. The Linux clock report above does not verify its actual rate;
+check the boot log's `Data rate=...` line. The generic 2133 MT/s option is not
+established as qualified for Duo S memory.
+
+For measurements, distinguish the 800/425 MHz baseline from the new
+1000/700 MHz profile, and compare actual TinyTag latency, throughput and
+correctness under sustained load. See the
+[clock and threshold experiment record](docs/duo-s-freertos-threshold-experiment.md)
+for benchmark results and the saved clock reports.
+
 ## TinyTag detector (this fork)
 
 This fork adds a TinyTag AprilTag detector that runs on the Duo S NPU. It is
@@ -94,4 +156,3 @@ See [apps/tinytag_detect/README.md](apps/tinytag_detect/README.md) for usage,
 [tools/tinytag_cvimodel/README.md](tools/tinytag_cvimodel/README.md) for the
 model conversion toolchain, and [docs/](docs/) for performance findings and the
 OV9281 camera porting notes.
-

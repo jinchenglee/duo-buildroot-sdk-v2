@@ -1,6 +1,10 @@
 CONFIG_CHIP_sg2000=y
 CONFIG_BOARD_milkv_duos_glibc_arm64_sd=y
 CONFIG_DDR_CFG_ddr3_1866_x16=y
+# Default to the SDK performance profile: A53 1 GHz, C906L/TPU 700 MHz.
+# FSBL requests the core-voltage setting documented as 1.00 V; DDR stays 1866 MT/s.
+# See README.md: Duo S ARM64 SD power and performance profiles.
+CONFIG_OD_CLK_SEL=y
 CONFIG_CC_OPTIMIZE_FOR_SIZE=y
 CONFIG_KERNEL_ENTRY_HACK=y
 CONFIG_KERNEL_ENTRY_HACK_ADDR="0x80108000"

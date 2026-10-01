@@ -5,6 +5,9 @@ add_compile_definitions(FAST_IMAGE_ENABLE)
 endif()
 
 include_directories(include)
+include_directories(${TOP_DIR}/../../apps/common)
+string(REPLACE "\"" "" THRESHOLD_BOARD "${CONFIG_CHIP}_${CONFIG_BOARD}")
+include_directories(${BUILD_ENV_PATH}/output/${THRESHOLD_BOARD})
 include_directories(${CMAKE_INSTALL_INC_PREFIX}/arch)
 include_directories(${CMAKE_INSTALL_INC_PREFIX}/common)
 include_directories(${CMAKE_INSTALL_INC_PREFIX}/kernel)
@@ -16,4 +19,3 @@ include_directories(${CMAKE_INSTALL_INC_PREFIX}/hal/config)
 
 add_library(comm STATIC ${_SOURCES})
 install(TARGETS comm DESTINATION lib)
-

@@ -1,0 +1,21 @@
+Clock excerpt from user-provided output after rebuilding/installing the
+SDK OD FIP and rebooting:
+    cat /sys/kernel/debug/clk/clk_summary
+
+clock                 parent           reported_rate_hz
+osc                   -                25000000
+clk_fpll              osc              1500000000
+clk_c906_0            clk_fpll          750000000
+clk_tpll              osc              1400000000
+clk_c906_1            clk_tpll          700000000
+clk_tpu               clk_tpll          700000000
+clk_mpll              osc              1000000000
+clk_a53               clk_mpll         1000000000
+clk_axi_video_codec   clk_mipimpll      450000000
+clk_axi_vip           clk_mipimpll      300000000
+clk_cam1              clk_cam0pll_d3     24000000
+
+A53 and C906L reach the documented 1 GHz / 700 MHz rates.
+This report confirms clock configuration only, not timing improvement,
+thermal stability, core voltage or actual DDR clock/data rate.
+The original benchmark TSV remains the 800 MHz / 425 MHz result.

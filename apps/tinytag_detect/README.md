@@ -161,6 +161,20 @@ start latency; `resultAge` is the software approximation `acqAge + loop`.
 not be optimized in isolation. `crop` is full-resolution AprilTag crop-decode
 time, which varies with scene content.
 
+## Experimental FreeRTOS ROI thresholding
+
+The initial ArUco Nano ROI box-filter/subtraction/binary-threshold stage can
+run on C906L; contours, quads, decoding and results stay on Linux. It is
+**off by default**, requires matching FreeRTOS firmware in FIP, and includes
+a byte-checked benchmark comparing OpenCV/A53, plain C/A53 and plain C/C906L.
+See [the experiment guide](../../docs/duo-s-freertos-threshold-experiment.md)
+for the recoverable test bundle, installation and timing interpretation.
+
+Select with `TINYTAG_THRESHOLD_BACKEND=opencv|scalar|freertos`. FreeRTOS live
+verification defaults on; use `TINYTAG_THRESHOLD_VERIFY=0` for timing only
+after correctness checks pass. Failures log a Linux fallback and must not be
+counted as successful offload measurements.
+
 ## Live camera usage
 
 `run_live.sh` defaults to detector-only operation with no RTSP preview. Pass

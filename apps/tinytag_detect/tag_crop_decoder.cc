@@ -1,4 +1,7 @@
 #include "tag_crop_decoder.h"
+#ifdef TINYTAG_THRESHOLD_OFFLOAD
+#include "roi_threshold_offload.h"
+#endif
 
 #include "../common/point_ldc.h"
 
@@ -23,6 +26,9 @@ namespace {
 aruco_nano::DetectorParameters nano_parameters(bool tolerant)
 {
     aruco_nano::DetectorParameters parameters;
+#ifdef TINYTAG_THRESHOLD_OFFLOAD
+    parameters.roiThreshold = roi_threshold_runtime_hook();
+#endif
     parameters.minSize = 10;
     parameters.dicts = {cv::aruco::getPredefinedDictionary(cv::aruco::DICT_APRILTAG_36h11)};
     parameters.detectInvertedMarker = false;

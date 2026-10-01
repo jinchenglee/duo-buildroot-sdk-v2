@@ -96,6 +96,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
 
   add_executable(tinytag_detect_live
       live_camera.cc
+      roi_threshold_offload.cc
       ../common/ldc_config.cc
       ../common/point_ldc.cc
       ../common/sw_ldc.cc
@@ -116,7 +117,7 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
   # its SAMPLE_COMM_SNS_GetSnsObj() switch behind #if defined(SENSOR_xxx).
   # Link both J2 sensor libraries so sensor_cfg.ini can select either module.
   target_compile_definitions(tinytag_detect_live PRIVATE
-      SENSOR_OV_OV5647 SENSOR_OV_OV9281)
+      SENSOR_OV_OV5647 SENSOR_OV_OV9281 TINYTAG_THRESHOLD_OFFLOAD)
 
   target_compile_options(tinytag_detect_live PRIVATE -ffunction-sections -fdata-sections)
   target_link_options(tinytag_detect_live PRIVATE -Wl,--gc-sections)
@@ -155,6 +156,12 @@ if(DEFINED MIDDLEWARE_SDK_ROOT)
       ${MIDDLEWARE_SDK_ROOT}/lib/libsys.so
       pthread m)
   install(TARGETS tinytag_ive_dma_bench DESTINATION app/tinytag_detect)
+
+  add_executable(tinytag_threshold_bench roi_threshold_bench.cc roi_threshold_offload.cc)
+  set_target_properties(tinytag_threshold_bench PROPERTIES SKIP_BUILD_RPATH TRUE)
+  target_link_libraries(tinytag_threshold_bench
+      ${OPENCV_LIBS} ${MIDDLEWARE_SDK_ROOT}/lib/libsys.so pthread m)
+  install(TARGETS tinytag_threshold_bench DESTINATION app/tinytag_detect)
 else()
   message(STATUS "MIDDLEWARE_SDK_ROOT not set -- skipping tinytag_detect_live (camera capture)")
 endif()
