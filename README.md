@@ -152,6 +152,12 @@ New to this work? Start with the [app README](apps/tinytag_detect/README.md)
 and [OV9281 camera notes](docs/ov9281-camera-port.md). The detailed experiment
 record is in [the live camera workplan](docs/live-camera-workplan.md).
 
+The default live/still model is now `tinytag_v7_synthetic_area_cost.int8.cvimodel`.
+The [progress and clean-image record](docs/duo-s-progress-seal.md) documents
+the bare-metal comparison, Ethernet PHY sleepable-wait fix, image packaging
+checks and post-flash verification. Temporary worker-debug tools were retired;
+their measurements are preserved in the [PHY diagnosis](docs/duo-s-ethernet-phy-diagnosis.md).
+
 See [apps/tinytag_detect/README.md](apps/tinytag_detect/README.md) for usage,
 [tools/tinytag_cvimodel/README.md](tools/tinytag_cvimodel/README.md) for the
 model conversion toolchain, and [docs/](docs/) for performance findings and the

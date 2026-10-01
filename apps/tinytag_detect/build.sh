@@ -75,6 +75,7 @@ cmake --install "${BUILD_DIR}"
 # symlink keeps `run_tinytag.sh` on PATH for the documented one-liner usage.
 install -Dm755 "${APP_DIR}/run.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_tinytag.sh"
 install -Dm755 "${APP_DIR}/run_live.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_live.sh"
+install -Dm755 "${APP_DIR}/run_adaptive_bench.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_adaptive_bench.sh"
 install -Dm755 "${APP_DIR}/run_dma_bench.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_dma_bench.sh"
 install -Dm755 "${APP_DIR}/run_threshold_bench.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_threshold_bench.sh"
 install -Dm755 "${APP_DIR}/run_preview_bench.sh" "${OVERLAY_DIR}/app/tinytag_detect/run_preview_bench.sh"
@@ -104,12 +105,12 @@ fi
 find "${OVERLAY_DIR}" -type d -exec chmod 0755 {} +
 chmod 0700 "${OVERLAY_DIR}/root/.ssh" 2>/dev/null || true
 
-# The current A+C models (INT8 default, BF16 alternative) are committed to the
-# overlay, so a fresh clone already has them (see overlay/.gitignore). Only stage
+# The v7 default and legacy models are committed to the overlay, so a fresh
+# clone already has them (see overlay/.gitignore). Only stage
 # over them when a freshly built model is present in the toolchain work directory
 # (or TINYTAG_CVIMODEL points somewhere).
 CVIMODEL_DST="${OVERLAY_DIR}/app/tinytag_detect/cvimodel"
-CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${TOP_DIR}/tools/tinytag_cvimodel/work/coverage_roi_context_aug03.int8.cvimodel}"
+CVIMODEL_SRC="${TINYTAG_CVIMODEL:-${TOP_DIR}/tools/tinytag_cvimodel/work/tinytag_v7_synthetic_area_cost.int8.cvimodel}"
 if [ -f "${CVIMODEL_SRC}" ]; then
     install -Dm644 "${CVIMODEL_SRC}" "${CVIMODEL_DST}/$(basename "${CVIMODEL_SRC}")"
     info "Staged model: $(basename "${CVIMODEL_SRC}")"
@@ -123,9 +124,14 @@ else
     printf "\e[1;33m  run_tinytag.sh will fail without it.\e[0m\n"
 fi
 
+# Both launchers name this model by default. Do not silently package only a
+# legacy model and produce an image whose default launch command fails.
+[ -s "${CVIMODEL_DST}/tinytag_v7_synthetic_area_cost.int8.cvimodel" ] || \
+    die "default v7 model missing from overlay; restore the tracked cvimodel"
+
 # The golden bundle is optional and deliberately not tracked (3.2 MB); it only
 # enables --selftest. Detection works without it.
-GOLDEN_SRC="${TINYTAG_GOLDEN:-${TOP_DIR}/tools/tinytag_cvimodel/work/coverage_roi_context_aug03.ttgold}"
+GOLDEN_SRC="${TINYTAG_GOLDEN:-${TOP_DIR}/tools/tinytag_cvimodel/work/tinytag_v7_synthetic_area_cost.ttgold}"
 if [ -f "${GOLDEN_SRC}" ]; then
     install -Dm644 "${GOLDEN_SRC}" "${CVIMODEL_DST}/$(basename "${GOLDEN_SRC}")"
     info "Staged golden bundle: $(basename "${GOLDEN_SRC}") ($(du -h "${GOLDEN_SRC}" | cut -f1))"

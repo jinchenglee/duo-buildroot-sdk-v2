@@ -65,6 +65,8 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -418,7 +420,7 @@ void usage(const char *argv0)
             "       [--capture-only] [--max-exposure-us N] [--quiet]\n"
             "       [--mirror 0|1] [--flip 0|1] [--crop-align N] [--tag-output 0|1]\n"
             "       [--direct-compact-input 0|1] [--validate-compact-input 0|1]\n"
-            "       [--adaptive-decode 0|1]\n"
+            "       [--adaptive-decode 0|1] [--adaptive-min-roi-area N]\n"
             "       [--retire-frames N]\n"
             "\n"
             "  --mirror 1  correct a horizontally mirrored sensor. Mirrored frames decode\n"
@@ -455,7 +457,21 @@ void usage(const char *argv0)
             "              bit-for-bit before continuing (default 0; diagnostic only).\n"
             "  --capture-only  measure VPSS frame delivery only: no model, decoding, RTSP,\n"
             "              capture queue, or image processing. Prints one rate per second.\n"
-            "  --adaptive-decode 1  try the 640x360 frame first for large ROIs; default 0.\n"
+            "\n"
+            "  Adaptive ROI decoding (experimental; off by default):\n"
+            "  --adaptive-decode 0|1  0: full-resolution decoding (default).\n"
+            "              1: try half-resolution crops from the 640x360 frame for\n"
+            "              eligible large ROIs. History may defer full scans; known\n"
+            "              small tags, fallbacks and periodic audits use full resolution.\n"
+            "              Successful tags still get full-resolution corner refinement.\n"
+            "  --adaptive-min-roi-area N  full-resolution proposal width * height\n"
+            "              needed to try adaptive decoding (default 40000 pixels).\n"
+            "              Area, not a minimum for each side: 200x200 or 400x100\n"
+            "              both meet 40000. Positive integer; requires --adaptive-decode 1.\n"
+            "              This is a provisional gate; tune with recall and timing tests.\n"
+            "              Example: run_live.sh --adaptive-decode 1 --adaptive-min-roi-area 3600\n"
+            "              Baseline: run_live.sh --adaptive-decode 0\n"
+            "\n"
             "  --max-exposure-us N  retain auto exposure but cap its shutter time. This\n"
             "              prevents AE slow-shutter from reducing capture cadence.\n"
             "  --quiet  suppress application diagnostics on stderr; detected tag IDs\n"
@@ -2634,6 +2650,7 @@ int main(int argc, char *argv[])
     bool direct_compact_input = false;
     bool validate_compact_input = false;
     bool adaptive_decode = false;
+    int adaptive_min_roi_area = 40000;
     int crop_align = 4;
     std::string ldc_calibration_path;
     std::string ldc_mode = "hw";
@@ -2677,6 +2694,19 @@ int main(int argc, char *argv[])
             validate_compact_input = std::atoi(argv[++i]) != 0;
         else if (flag == "--adaptive-decode" && has_value)
             adaptive_decode = std::atoi(argv[++i]) != 0;
+        else if (flag == "--adaptive-min-roi-area" && has_value)
+        {
+            const char *text = argv[++i];
+            char *end = nullptr;
+            errno = 0;
+            const long value = std::strtol(text, &end, 10);
+            if (errno == ERANGE || end == text || *end || value < 1 || value > INT_MAX)
+            {
+                fprintf(stderr, "--adaptive-min-roi-area must be an integer between 1 and %d (full-resolution pixels)\n", INT_MAX);
+                return 1;
+            }
+            adaptive_min_roi_area = static_cast<int>(value);
+        }
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
         else if (flag == "--no-rtsp") rtsp = rtsp_luma = false;
@@ -2833,9 +2863,10 @@ int main(int argc, char *argv[])
             return 1;
         }
         detector.set_adaptive_decode(make_aruco_nano_decoder(decode_tolerant),
-                                     64.f, 40000, 20);
-        fprintf(stderr, "[adaptive] enabled: min known tag side 64 px, min ROI 40000 px, "
-                        "audit 20 frames; new blob first full check after 2-4 misses\n");
+                                     64.f, adaptive_min_roi_area, 20);
+        fprintf(stderr, "[adaptive] enabled: min known tag side 64 px, min ROI %d px area, "
+                        "audit 20 frames; new blob first full check after 2-4 misses\n",
+                        adaptive_min_roi_area);
     }
     if (ldc_mode == "sw")
     {

@@ -6,6 +6,9 @@ app/tinytag_detect/tinytag_detect_live
 app/tinytag_detect/tinytag_ive_dma_bench
 app/tinytag_detect/run_tinytag.sh
 app/tinytag_detect/run_live.sh
+app/tinytag_detect/run_adaptive_bench.sh
+app/tinytag_detect/run_threshold_bench.sh
+app/tinytag_detect/tinytag_threshold_bench
 app/tinytag_detect/run_dma_bench.sh
 app/tinytag_detect/run_preview_bench.sh
 app/tinytag_detect/cvimodel/*.ttgold

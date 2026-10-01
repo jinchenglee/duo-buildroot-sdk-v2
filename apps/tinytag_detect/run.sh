@@ -19,7 +19,7 @@ set -eu
 # --- defaults -------------------------------------------------------------
 # Current coverage-mask decoder operating point: heat threshold 0.30 and a
 # 20-box cap. Seed/grow/margin defaults are implemented in TinyTagDet.
-TINYTAG_MODEL="${TINYTAG_MODEL:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel}"
+TINYTAG_MODEL="${TINYTAG_MODEL:-/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel}"
 TINYTAG_THRES="${TINYTAG_THRES:-0.30}"
 TINYTAG_MAX="${TINYTAG_MAX:-20}"
 TINYTAG_EXPAND="${TINYTAG_EXPAND:-1.0}"
@@ -27,7 +27,7 @@ TINYTAG_IOU="${TINYTAG_IOU:-0.5}"
 TINYTAG_OUT="${TINYTAG_OUT:-/tmp/tinytag_det.jpg}"
 TINYTAG_DEBUG="${TINYTAG_DEBUG:-1}"
 TINYTAG_BIN="${TINYTAG_BIN:-/app/tinytag_detect/tinytag_detect}"
-TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.ttgold}"
+TINYTAG_GOLDEN="${TINYTAG_GOLDEN:-/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.ttgold}"
 TINYTAG_REPEAT="${TINYTAG_REPEAT:-20}"
 TINYTAG_WARMUP="${TINYTAG_WARMUP:-2}"
 TINYTAG_MAX_MAE="${TINYTAG_MAX_MAE:-0.06}"

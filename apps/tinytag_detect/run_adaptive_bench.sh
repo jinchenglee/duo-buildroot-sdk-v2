@@ -4,7 +4,7 @@ set -eu
 
 APP_DIR="${TINYTAG_BENCH_APP_DIR:-/app/tinytag_detect}"
 RUN_LIVE="${TINYTAG_BENCH_RUN_LIVE:-${APP_DIR}/run_live.sh}"
-BIN="${TINYTAG_BENCH_BIN:-${APP_DIR}/tinytag_detect_live_adaptive_bench}"
+BIN="${TINYTAG_BENCH_BIN:-${APP_DIR}/tinytag_detect_live}"
 DURATION="${TINYTAG_BENCH_DURATION:-20}"
 REPEATS="${TINYTAG_BENCH_REPEATS:-2}"
 OUT_DIR="${TINYTAG_BENCH_OUT_DIR:-/tmp/tinytag-adaptive-bench-$(date +%Y%m%d-%H%M%S)}"

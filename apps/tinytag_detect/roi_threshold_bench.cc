@@ -1,5 +1,6 @@
 #include "roi_threshold_offload.h"
 #include "../common/roi_threshold.h"
+#include "../common/roi_threshold_protocol.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -130,15 +131,17 @@ int main(int argc, char **argv)
 {
     try {
         int iterations = 100, warmup = 5, kernel = 15, poll = 50;
-        bool local = false;
+        bool local = false, bare_metal = false;
         std::string input_path;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--local-only") local = true;
+            else if (arg == "--bare-metal") bare_metal = true;
             else if (arg == "--help") {
                 std::puts("Usage: tinytag_threshold_bench [--local-only] [--input grayscale-image]\n"
                           "       [--iterations 100] [--warmup 5] [--kernel 15] [--poll-us 50]\n"
-                          "Full mode needs matching FreeRTOS firmware. --poll-us 0 busy-polls.\n"
+                          "       [--bare-metal] verifies and labels bare-metal firmware.\n"
+                          "Full mode needs matching firmware. --poll-us 0 busy-polls.\n"
                           "Validation is outside timed regions; all remote outputs are checked.");
                 return 0;
             } else {
@@ -169,9 +172,14 @@ int main(int argc, char **argv)
                 RoiThresholdTiming t;
                 double cpu = cpu_us();
                 remote->nop(t);
+                if (bare_metal != (t.firmware_id == TT_THRESHOLD_BARE_METAL_MAGIC))
+                    throw std::runtime_error("firmware identity mismatch: use --bare-metal only with bare-metal FIP");
+                if (i == -warmup || (warmup == 0 && i == 0))
+                    std::fprintf(stderr, "Remote firmware=%s cache_control=0x%x prefetch_control=0x%x (zero: not reported by stock experiment)\n",
+                                 bare_metal ? "bare-metal" : "FreeRTOS", t.cache_control, t.prefetch_control);
                 if (i >= 0) s.add(t.total_us, cpu_us() - cpu, t);
             }
-            s.print("freertos-nop", 0, 0, 0);
+            s.print(bare_metal ? "bare-metal-nop" : "freertos-nop", 0, 0, 0);
         }
         const cv::Size sizes[] = {{32,32}, {64,64}, {128,128}, {200,200}, {320,240}, {640,360}, {1280,800}};
         for (const auto size : sizes) {
@@ -182,7 +190,7 @@ int main(int argc, char **argv)
             roi_threshold_opencv(in, expected, kernel, 3);
             for (int mode = 0; mode < (remote ? 3 : 2); ++mode) {
                 Samples s;
-                const char *name = mode == 0 ? "opencv" : mode == 1 ? "scalar-a53" : "freertos";
+                const char *name = mode == 0 ? "opencv" : mode == 1 ? "scalar-a53" : bare_metal ? "bare-metal" : "freertos";
                 for (int i = -warmup; i < iterations; ++i) {
                     RoiThresholdTiming t;
                     const double cpu = cpu_us(), begin = wall_us();

@@ -1,0 +1,5 @@
+pid=91 comm=kworker/0:2 interval_ms=10 duration_s=30 finished=1
+start_uptime_ms=3050258 samples=2999 target_cpu_samples=679 no_callback=0 overflow=0
+callback	cpu_samples
+phy_state_machine	679
+Counts sample CPU occupancy, not invocation counts or exact execution durations.

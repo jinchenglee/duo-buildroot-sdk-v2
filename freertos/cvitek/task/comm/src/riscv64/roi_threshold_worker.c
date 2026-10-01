@@ -1,14 +1,20 @@
 #include <stdint.h>
 #include <string.h>
+#ifndef TT_THRESHOLD_BARE_METAL
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+#endif
 #include "arch_helpers.h"
+#ifndef TT_THRESHOLD_BARE_METAL
 #include "arch_cpu.h"
+#endif
 #include "cvi_board_memmap.h"
 #include "roi_threshold_protocol.h"
 
+#ifndef TT_THRESHOLD_BARE_METAL
 static QueueHandle_t threshold_queue;
+#endif
 static uint32_t columns[TT_THRESHOLD_MAX_WIDTH];
 
 static uint64_t ticks(void)
@@ -48,6 +54,12 @@ static void process(uint32_t address)
     result->magic = TT_THRESHOLD_MAGIC;
     result->version = TT_THRESHOLD_VERSION;
     result->timer_hz = configSYS_CLOCK_HZ;
+#ifdef TT_THRESHOLD_BARE_METAL
+    result->reserved[0] = TT_THRESHOLD_BARE_METAL_MAGIC;
+    /* Read back cache/prefetch controls for diagnosis, outside kernel timing. */
+    __asm__ volatile("csrr %0, mhcr" : "=r"(result->reserved[1]));
+    __asm__ volatile("csrr %0, mhint" : "=r"(result->reserved[2]));
+#endif
     pixels = request.width * request.height;
     if (request.operation == TT_THRESHOLD_OP_NOP) {
         status = TT_THRESHOLD_OK;
@@ -79,6 +91,7 @@ static void process(uint32_t address)
     __atomic_store_n(&result->sequence, request.sequence, __ATOMIC_RELEASE);
     flush_dcache_range((uintptr_t)result, sizeof(*result));
 }
+#ifndef TT_THRESHOLD_BARE_METAL
 static void worker(void *unused)
 {
     uint32_t address;
@@ -106,3 +119,4 @@ int roi_threshold_worker_submit(uint32_t address)
 {
     return threshold_queue && xQueueSend(threshold_queue, &address, 0) == pdTRUE ? 0 : -1;
 }
+#endif

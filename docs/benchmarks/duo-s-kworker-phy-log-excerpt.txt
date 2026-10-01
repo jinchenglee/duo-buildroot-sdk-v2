@@ -1,0 +1,21 @@
+Excerpt of /var/log/messages copied from board; timestamps are board uptime.
+Probe starts at 3050.258s and samples for 30 seconds.
+
+Jan  1 00:50:50 milkv-duo user.notice kernel: [ 3050.883129] lp1=4d61
+Jan  1 00:50:50 milkv-duo user.notice kernel: [ 3050.883252] cap1=d61
+Jan  1 00:50:50 milkv-duo user.notice kernel: [ 3050.883382] get_random=e33ced98, ramdom_cap=da0, cap_val_temp=da1
+Jan  1 00:50:54 milkv-duo user.notice kernel: [ 3054.662096] i=150
+Jan  1 00:50:58 milkv-duo user.notice kernel: [ 3058.931365]  168, link status=79ed, lp2=4da1
+Jan  1 00:50:58 milkv-duo user.notice kernel: [ 3058.932039]  168, false link status=79c9, lp2=0
+Jan  1 00:51:06 milkv-duo user.notice kernel: [ 3066.084848] lp1=4d61
+Jan  1 00:51:06 milkv-duo user.notice kernel: [ 3066.084973] cap1=d61
+Jan  1 00:51:06 milkv-duo user.notice kernel: [ 3066.085100] get_random=67cda4f0, ramdom_cap=4e0, cap_val_temp=4e1
+Jan  1 00:51:09 milkv-duo user.notice kernel: [ 3069.880780] i=150
+Jan  1 00:51:14 milkv-duo user.notice kernel: [ 3074.128928]  167, link status=79ed, lp2=44e1
+Jan  1 00:51:14 milkv-duo user.notice kernel: [ 3074.129602]  167, false link status=79c9, lp2=0
+Jan  1 00:51:16 milkv-duo user.notice kernel: [ 3076.164861] lp1=4d61
+Jan  1 00:51:16 milkv-duo user.notice kernel: [ 3076.164985] cap1=d61
+Jan  1 00:51:16 milkv-duo user.notice kernel: [ 3076.165111] get_random=52aae97e, ramdom_cap=960, cap_val_temp=961
+Jan  1 00:51:19 milkv-duo user.notice kernel: [ 3079.963895] i=150
+Jan  1 00:51:21 milkv-duo user.notice kernel: [ 3081.731475]  68, link status=79ed, lp2=4961
+Jan  1 00:51:21 milkv-duo user.notice kernel: [ 3081.736779]  68, false link status=79c9, lp2=0

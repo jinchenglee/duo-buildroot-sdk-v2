@@ -8,12 +8,24 @@ A port of the K230 two-stage AprilTag detector (see
 network proposes tag ROIs on a downscaled frame, then a traditional-CV decoder
 reads the AprilTag 36h11 id out of each proposal at full resolution.
 
-The current `coverage_roi_context_aug03` checkpoint combines a coverage mask
-with TinyTag ROI predictions. Its default INT8 cvimodel is
-`cvimodel/coverage_roi_context_aug03.int8.cvimodel`; cviruntime exposes its
+The default checkpoint is `tinytag_v7_synthetic_area_cost`, combining a coverage
+mask with TinyTag ROI predictions. Its INT8 cvimodel is
+`cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel`; cviruntime exposes its
 six-channel output as FP32. Stage one decodes the mask into separate tag
 regions, using ROI peaks to split connected regions; stage two optionally runs
 ArUco Nano on full-resolution crops with `--decode`.
+
+Both `run_live.sh` and `run_tinytag.sh` select this model automatically. The
+model is checked into the Duo S overlay and has been tested live on the board.
+Use `TINYTAG_LIVE_MODEL` (live) or `TINYTAG_MODEL` (still images) to override it.
+The older coverage checkpoint remains available. The v7 golden self-test bundle
+is not provided; generate a matching bundle before using `--selftest`, or select
+both the older model and its matching golden bundle explicitly.
+
+The [progress and clean-image record](../../docs/duo-s-progress-seal.md)
+summarizes the bare-metal comparison, Ethernet PHY diagnosis/fix and image
+verification. The [worker diagnosis](../../docs/duo-s-ethernet-phy-diagnosis.md) preserves the
+before/after evidence and kernel installation/recovery steps.
 
 The experimental adaptive ROI decode path and its A/B acceptance rules are in
 [`docs/tinytag-adaptive-roi-rules.md`](../../docs/tinytag-adaptive-roi-rules.md).
@@ -21,7 +33,11 @@ Enable it with `--adaptive-decode 1`; the default remains the full-resolution
 decoder (`--adaptive-decode 0`). For large ROIs, adaptive mode tries a half-size
 crop first and can defer some full-resolution scans. Its 40,000-pixel ROI-area
 gate (the area of a 200×200 box) is provisional; recall and timing tests are
-needed to choose a threshold.
+needed to choose a threshold. Set `--adaptive-min-roi-area N` to try a different
+positive integer area in **full-resolution pixels**, for example
+`--adaptive-decode 1 --adaptive-min-roi-area 22500` for the area of a 150×150
+box. The gate is area, not minimum width and height; a 300×75 ROI also meets
+22500. The known-small-tag guard, fallbacks and audit rules still apply.
 
 The proposed training effort to reduce expensive false ROIs, including synthetic
 data, recoverable tag-size limits, and cost-weighted losses, is recorded in
@@ -61,7 +77,8 @@ app/tinytag_detect/tinytag_detect             static-image binary
 app/tinytag_detect/tinytag_detect_live        live-camera binary
 app/tinytag_detect/run_tinytag.sh             static launcher with defaults
 app/tinytag_detect/run_live.sh                live launcher with defaults
-app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel   default model (~42 KB)
+app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel default model (~42 KB)
+app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel older coverage model (~42 KB)
 app/tinytag_detect/cvimodel/coverage_roi_context_aug03.bf16.cvimodel  alternate BF16 model (143 KB)
 app/tinytag_detect/cvimodel/tinytag-v40c.int8.cvimodel                legacy model (43 KB)
 app/tinytag_detect/samples/                   sample frames from samples/
@@ -407,7 +424,7 @@ the environment:
 
 | variable | default | meaning |
 |---|---|---|
-| `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel` | cvimodel to load |
+| `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel` | cvimodel to load |
 | `TINYTAG_THRES` | `0.30` | ROI heat threshold |
 | `TINYTAG_MAX` | `20` | max proposals per frame |
 | `TINYTAG_EXPAND` | `1.0` | legacy model ROI expansion; unused by A+C |
@@ -416,7 +433,7 @@ the environment:
 | `TINYTAG_DEBUG` | `1` | 0 quiet, 1 timing, 2 verbose |
 | `TINYTAG_REPEAT` | `20` | timed inference runs |
 | `TINYTAG_WARMUP` | `2` | untimed runs before measuring |
-| `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.ttgold` | optional, model-matched self-test bundle |
+| `TINYTAG_GOLDEN` | `/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.ttgold` | optional, model-matched self-test bundle; regenerate for v7 |
 | `TINYTAG_MAX_MAE` | `0.06` | self-test error gate (accepted INT8 validation MAE is 0.0558) |
 | `TINYTAG_DECODE` | `strict` | `strict` or `tolerant`; empty disables stage two |
 

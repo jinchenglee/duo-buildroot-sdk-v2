@@ -1,0 +1,16 @@
+Active Ethernet cable connected to a powered link partner; USB networking retained.
+User reported that the periodic TinyTag slowdown disappeared.
+Cable experiment before installation of the staged sleepable-wait kernel;
+no intervening kernel installation or reboot was reported.
+
+[root@milkv-duo]~# /mnt/data/run_kworker_probe.sh 91 30
+Sampling worker PID 91 for 30s; keep TinyTag running.
+pid=91 comm=kworker/0:2 interval_ms=10 duration_s=30 finished=1
+start_uptime_ms=4039916 samples=2999 target_cpu_samples=0 no_callback=0 overflow=0
+callback	cpu_samples
+Counts sample CPU occupancy, not invocation counts or exact execution durations.
+Saved: /mnt/data/tinytag-kworker-probe.txt (module unloads on exit)
+
+Interpretation: no sampled CPU occupancy for this worker in this interval,
+versus 679/2999 samples in the earlier unplugged run. This does not mean
+the callback never executed, or rule out activity in other workers.

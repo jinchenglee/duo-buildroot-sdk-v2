@@ -7,6 +7,7 @@ struct RoiThresholdTiming {
     double prepare_us = 0, wait_us = 0, finish_us = 0, total_us = 0;
     double remote_compute_us = 0, remote_service_us = 0;
     uint64_t remote_cycles = 0;
+    uint32_t firmware_id = 0, cache_control = 0, prefetch_control = 0;
 };
 class RoiThresholdOffload {
 public:

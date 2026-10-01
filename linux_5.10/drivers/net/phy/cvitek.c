@@ -2,6 +2,7 @@
 /* Driver for CVITEK PHYs */
 
 #include <linux/kernel.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/mii.h>
 #include <linux/ethtool.h>
@@ -67,18 +68,21 @@ static int cv182xa_read_status(struct phy_device *phydev)
 			phy_write(phydev, 0x4, cap_val_temp);
 			pr_notice("get_random=%x, ramdom_cap=%x, cap_val_temp=%x\n",
 				 get_random, ramdom_cap, cap_val_temp);
+			/* PHY status runs in sleepable workqueue context. Release the
+			 * CPU while polling autonegotiation instead of spinning for ms.
+			 */
 			for (i = 0; i < 150; i++) {
 				if ((phy_read(phydev, 0x1) & 0x20) == 0)
 					break;
 
-				mdelay(10);
+				usleep_range(10000, 11000);
 				}
 			pr_notice("i=%d\n", i);
 			phy_modify(phydev, MII_BMCR, BMCR_ISOLATE, BMCR_ANENABLE | BMCR_ANRESTART);
 			for (i = 0; i < 1000; i++) {
 				if (phy_read(phydev, 0x1) & 0x20)
 					break;
-				mdelay(10);
+				usleep_range(10000, 11000);
 			}
 			lp_val = phy_read(phydev, 0x5);
 			lp_val_cap = lp_val & 0xde0;
@@ -92,7 +96,7 @@ static int cv182xa_read_status(struct phy_device *phydev)
 					if (phy_read(phydev, 0x1) & 0x20)
 						break;
 
-					mdelay(10);
+					usleep_range(10000, 11000);
 				}
 				//mdelay(8000);
 				//lp_val = phy_read(phydev, 0x5);

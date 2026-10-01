@@ -14,6 +14,7 @@
 #define TT_THRESHOLD_OP_NOP 2u
 #define TT_THRESHOLD_OK 0u
 #define TT_THRESHOLD_BAD_JOB 1u
+#define TT_THRESHOLD_BARE_METAL_MAGIC 0x424d5431u
 
 struct tt_threshold_request {
     uint32_t magic, version, sequence, operation;

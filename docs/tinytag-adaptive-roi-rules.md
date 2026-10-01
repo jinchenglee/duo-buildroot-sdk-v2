@@ -21,7 +21,8 @@ history when available. A proposal with no history remains uncertain.
 
 1. Keep the full-resolution decoder for small ROIs and for a tracked tag whose
    shortest observed side is below 64 full-resolution pixels.
-2. For an eligible large ROI (at least 40,000 full-resolution pixels), try
+2. For an eligible large ROI (at least `--adaptive-min-roi-area N`
+   full-resolution pixels, default 40,000), try
    ArUco on the corresponding 640×360 crop first. This includes **large new
    blobs with no decoded tag**. An empty low-resolution result does not
    immediately trigger an expensive full-resolution decode.
@@ -67,8 +68,22 @@ time to first detection, corner differences, and decode time. Sweep several
 gates on the same lockstep replay, including 20k, 40k, and 80k pixels. Choose
 the smallest gate that preserves per-frame recall and corner quality **and**
 improves mean and tail processing time. Do not infer recall from per-second
-marker averages alone. The current binary fixes the gate at 40k; a sweep
-requires exposing it as a runtime option.
+marker averages alone. The runtime option `--adaptive-min-roi-area N` accepts
+a positive integer area in full-resolution pixels. It takes effect only with
+`--adaptive-decode 1`; it does not enable adaptive decoding by itself.
+For equivalent square sizes, 100×100 = 10000, 150×150 = 22500, 200×200 = 40000,
+and 250×250 = 62500. Other rectangle shapes of the same area also qualify.
+The chosen gate is reported in the adaptive startup diagnostic.
+
+For example, compare a smaller gate live against the default on the same scene:
+
+```sh
+/app/tinytag_detect/run_live.sh --adaptive-decode 1 --adaptive-min-roi-area 22500
+/app/tinytag_detect/run_live.sh --adaptive-decode 1 --adaptive-min-roi-area 40000
+```
+
+Omit `--quiet` to inspect adaptive timing/counters. Use `--tag-output 1` when
+logging decoded IDs for recall comparison, accounting for stdout overhead.
 
 ## A/B decision
 

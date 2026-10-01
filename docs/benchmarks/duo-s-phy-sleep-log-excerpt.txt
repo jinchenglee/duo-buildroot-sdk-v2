@@ -1,0 +1,26 @@
+Post-reboot system log: repeated PHY negotiation checks remain active.
+Oct  1 18:38:08 milkv-duo user.notice kernel: [   82.056855] i=150
+Oct  1 18:38:20 milkv-duo user.notice kernel: [   94.141048]  1000, false link status=79c9, lp2=4ce1
+Oct  1 18:38:22 milkv-duo user.notice kernel: [   96.196886] lp1=4d61
+Oct  1 18:38:24 milkv-duo user.notice kernel: [   98.011272] i=150
+Oct  1 18:38:26 milkv-duo user.notice kernel: [   99.731727]  143, false link status=79c9, lp2=0
+Oct  1 18:38:36 milkv-duo user.notice kernel: [  109.957040] lp1=4d61
+Oct  1 18:38:38 milkv-duo user.notice kernel: [  111.780022] i=150
+Oct  1 18:38:39 milkv-duo user.notice kernel: [  113.491651]  140, false link status=79c9, lp2=0
+Oct  1 18:38:57 milkv-duo user.notice kernel: [  130.883219] lp1=4d61
+Oct  1 18:38:59 milkv-duo user.notice kernel: [  132.694369] i=150
+Oct  1 18:39:03 milkv-duo user.notice kernel: [  136.943710]  348, false link status=79c9, lp2=0
+Oct  1 18:39:13 milkv-duo user.notice kernel: [  147.171205] lp1=4d61
+Oct  1 18:39:15 milkv-duo user.notice kernel: [  148.994221] i=150
+Oct  1 18:39:22 milkv-duo user.notice kernel: [  155.817634]  563, false link status=79c9, lp2=0
+Oct  1 18:39:27 milkv-duo user.notice kernel: [  160.931240] lp1=4d61
+Oct  1 18:39:29 milkv-duo user.notice kernel: [  162.738152] i=150
+Oct  1 18:39:38 milkv-duo user.notice kernel: [  171.936461]  812, false link status=79c9, lp2=0
+Oct  1 18:39:40 milkv-duo user.notice kernel: [  173.987128] lp1=4d61
+Oct  1 18:39:41 milkv-duo user.notice kernel: [  175.654471] i=150
+Oct  1 18:39:53 milkv-duo user.notice kernel: [  186.767833]  1000, false link status=79c9, lp2=48e1
+Oct  1 18:40:03 milkv-duo user.notice kernel: [  196.995195] lp1=4d61
+Oct  1 18:40:04 milkv-duo user.notice kernel: [  198.682588] i=150
+Oct  1 18:40:17 milkv-duo user.notice kernel: [  210.830355]  1000, false link status=79c9, lp2=40a1
+Oct  1 18:40:24 milkv-duo user.notice kernel: [  217.987118] lp1=4d61
+Oct  1 18:40:25 milkv-duo user.notice kernel: [  219.653822] i=150

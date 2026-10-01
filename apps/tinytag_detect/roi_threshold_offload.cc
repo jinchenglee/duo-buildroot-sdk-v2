@@ -159,7 +159,7 @@ struct RoiThresholdOffload::Impl {
                 if (__atomic_load_n(&job->completion.sequence, __ATOMIC_ACQUIRE) == sequence)
                     break;
                 if (now_us() - prepared >= timeout_ms * 1000.0)
-                    throw std::runtime_error("threshold completion timed out: install matching FreeRTOS FIP and reboot");
+                    throw std::runtime_error("threshold completion timed out: install matching threshold FIP and reboot");
                 if (poll_us) usleep(poll_us);
             }
         } catch (...) {
@@ -184,6 +184,9 @@ struct RoiThresholdOffload::Impl {
         timing.remote_compute_us = result.compute_ticks * (1e6 / result.timer_hz);
         timing.remote_service_us = result.service_ticks * (1e6 / result.timer_hz);
         timing.remote_cycles = result.compute_cycles;
+        timing.firmware_id = result.reserved[0];
+        timing.cache_control = result.reserved[1];
+        timing.prefetch_control = result.reserved[2];
     }
 };
 

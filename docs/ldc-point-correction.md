@@ -26,8 +26,9 @@ Conclusions:
   with zero tags, and it is too slow for a 30-60 fps target.
 - SW is worse than HW, so "a faster SW kernel" cannot close the gap on the
   single-core CPU (A53 at 800 MHz).
-- Hardware GDC uses a single-ratio (k-only) radial model. The handover already
-  flags that this cannot represent the lens's higher-order (k2/k3) terms, so for
+- Hardware GDC uses a single-ratio (k-only) radial model. The
+  [LDC findings](ldc-performance-findings.md) explain that this cannot represent
+  the lens's higher-order (k2/k3) terms, so for
   a genuine wide-FOV lens the HW path is both slow AND the wrong model.
 
 ## Key insight: correct points, not regions

@@ -2,6 +2,18 @@
 
 ## Purpose and scope
 
+The follow-up [bare-metal diagnosis](../apps/tinytag_detect/bare_metal/README.md)
+keeps the same kernel, compiler optimization and shared-buffer handover while
+removing task dispatch, the scheduler and interrupts. Its separate FIP and
+benchmark firmware identity allow a controlled comparison with these results.
+The first board comparison is complete: at 700 MHz, bare-metal computation
+was 15.05961 ms versus FreeRTOS's 15.11100 ms for 640x360, and 67.83551 ms
+versus 67.78074 ms for 1280x800. Removing scheduling and interrupts did not
+materially improve this kernel. The large gap to A53 is not explained by
+FreeRTOS overhead in these measurements. See the linked diagnosis for the
+complete comparison and Linux timing interference, and
+[the recorded output](benchmarks/duo-s-threshold-bare-metal.tsv).
+
 This experiment measures how much work it takes to move a real decoder stage
 to the small core, its computation speed, and the cost of Linux/FreeRTOS
 communication. It precedes the proposed NOMMU Linux experiment.

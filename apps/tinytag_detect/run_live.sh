@@ -4,7 +4,7 @@
 # caller can override an option by supplying it later on the command line.
 set -eu
 
-MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/coverage_roi_context_aug03.int8.cvimodel}"
+MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel}"
 BIN="${TINYTAG_LIVE_BIN:-/app/tinytag_detect/tinytag_detect_live}"
 THRES="${TINYTAG_LIVE_THRES:-0.30}"
 MAX="${TINYTAG_LIVE_MAX:-20}"

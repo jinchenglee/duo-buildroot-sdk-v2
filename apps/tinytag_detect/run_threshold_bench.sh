@@ -6,11 +6,15 @@ APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${TINYTAG_THRESHOLD_OUT_DIR:-/tmp/tinytag-threshold-$(date +%Y%m%d-%H%M%S)}
 ITERATIONS=${TINYTAG_THRESHOLD_ITERATIONS:-100}
 WARMUP=${TINYTAG_THRESHOLD_WARMUP:-5}
+REMOTE=FreeRTOS
+for arg in "$@"; do
+    if [ "$arg" = --bare-metal ]; then REMOTE=bare-metal; fi
+done
 export LD_LIBRARY_PATH="/mnt/system/usr/lib:/mnt/system/lib:${LD_LIBRARY_PATH:-}"
 mkdir -p "${OUT_DIR}"
 echo "Threshold benchmark: ${OUT_DIR}"
 for poll in 50 0; do
-    echo "Running poll=${poll} us: OpenCV, scalar A53, FreeRTOS; every output checked"
+    echo "Running poll=${poll} us: OpenCV, scalar A53, ${REMOTE}; every output checked"
     if ! "${APP_DIR}/tinytag_threshold_bench" --iterations "${ITERATIONS}" --warmup "${WARMUP}" \
         --poll-us "${poll}" "$@" >"${OUT_DIR}/poll-${poll}.tsv" 2>"${OUT_DIR}/poll-${poll}.log"; then
         cat "${OUT_DIR}/poll-${poll}.log" >&2
