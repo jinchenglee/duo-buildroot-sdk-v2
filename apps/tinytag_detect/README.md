@@ -159,6 +159,81 @@ kernel modules. The current ARM64 build uses glibc. See
 [Duo S Linux options](../../docs/duo-s-linux-options.md) for alternative root
 filesystems and the proposed minimal Buildroot profile.
 
+## Preview cadence and resolution
+
+`--rtsp` and `--rtsp-luma` default to a **15 fps cap at 640×360**.
+The detector still uses its full-resolution frame and 640×360 model input.
+
+```sh
+./run_live.sh --rtsp-luma                         # 640×360, up to 15 fps
+./run_live.sh --rtsp-luma --preview-fps 10
+./run_live.sh --rtsp-luma --preview-size 1280x720 # optional 720p
+./run_live.sh --rtsp-luma --preview-fps 0         # uncapped comparison
+./run_live.sh --rtsp-luma --record --record-fps 30
+```
+
+Monotonic time gates select frames before overlay drawing and VENC submission.
+They enforce minimum spacing, never sleep the detector and never catch up with
+bursts after a delay. Actual rates can be lower than the cap. The luma worker
+retains a single pending latest-frame slot; old pending frames can be replaced.
+Both publication and worker gates prevent delayed jobs from accumulating bursts.
+
+Colour preview uses a 640×360 VPSS output unless recording also needs full
+resolution. With direct VPSS model input, **640×360 luma preview borrows the original
+model Y buffer after inference: zero Y copies and no CPU resize**. Only one model
+buffer may be held across producer, pending slot and worker. Preview opportunities
+are dropped while that borrow is busy; the detector never waits for preview.
+The frame is mapped for overlays, paired with private neutral chroma and submitted
+to VENC. Successful `GetStream` marks encoding completion: the model mapping and
+VPSS frame are released **before RTSP bitstream transmission**. Matching sequence
+and PTS checks still ensure that the overlay results belong to this image.
+Early exits, replacement, failed publication and worker shutdown also return the
+borrowed model buffer. `[preview-model]` reports current borrowing (limit 1) and
+cumulative dropped preview opportunities. There is no zero-copy A/B option.
+
+Adaptive decoding still makes its existing small-image copy when needed; that
+happens before the preview worker can draw on model Y. It is detector work, not a
+preview copy. At 720p, preview continues to borrow the detector Y frame.
+
+Software LDC and copied-input operation retain selected full-frame resizing,
+so software LDC still appears in the preview. A failed model mapping drops the
+preview instead of introducing a hidden copy. For 640×360, the full-resolution
+detector frame is returned after optional clean recording, before preview drawing
+and encoding; the model frame supplies preview Y. Overlays are scaled from
+detector coordinates. Zero-copy removes copy/resize CPU work but holds one pool
+buffer longer; board measurements must establish its effect on throughput and
+capture age.
+
+Recording has its own `--record-fps` cap (default 30, range 1–120) and always
+uses 1280×720 clean frames. Its encoder and cadence are independent of the
+preview cap; shared workers and latest-frame replacement still make recording
+best effort rather than a guaranteed rate. `--preview-fps` accepts 0–120.
+Lowering preview cadence reduces CPU drawing/submission/network work and encoder
+traffic; it does not eliminate Linux media driver work or all VPSS traffic.
+
+Validation: the ARM64 cross-build and deterministic cadence tests passed.
+Mocked MPI checks of the production model-buffer lease covered ownership
+transfer, release after DMA completion, cancellation and failed mapping. The
+zero-copy 640×360 binary was deployed to Duo S and the user confirmed it works
+well. No numerical performance improvement is claimed from that confirmation.
+
+### Small-core offload considerations
+
+The Duo S can use a RISC-V main core. Current ARM64 libraries cannot execute on
+RISC-V, but that alone does **not** rule out a RISC-V media stack or Linux NOMMU.
+A proposed stack needs checks for matching ABI/libc, MMU assumptions, DMA buffer
+allocation, encoder interrupts and device access. Existing small-core firmware
+provides region drawing/compression, not a ready H.264 encoder plus RTSP network
+service. Full offload requires those drivers and explicit ownership/cache
+handover for frames, results and the chosen network interface.
+
+DDR is shared in both designs: leaving preview on the main core also consumes
+DDR bandwidth. Offloading can free main-core CPU time without reducing that
+traffic; copies introduced by handover can increase it. Evaluate measured CPU
+cost, frame lifetime and end-to-end latency, rather than using shared DDR as a
+reason to reject offload. Preview cadence/resolution reduction is useful
+independently of which core hosts it.
+
 ## Live preview benchmark
 
 On a Duo S with the live camera application installed, run
@@ -259,9 +334,10 @@ On the host, watch with `ffplay rtsp://192.168.42.1/h264`.
   drawn into it.
 - `--rtsp-luma` records exactly the Y plane the detector saw, with neutral
   chroma. `--rtsp`, or `--record` with no preview, records colour.
-- VPSS device 1 has only three output channels, so the recording shares the
-  preview's. The preview worker encodes each frame for the file *before*
-  drawing the overlay on it, adding about 7 ms per frame to that worker.
+- VPSS device 1 has only three output channels, so recording shares the
+  colour preview channel, or the detector Y frame for luma preview. Clean
+  recording happens before overlay drawing, at its own rate cap. Recording
+  adds encoder work to the shared worker even when preview is capped lower.
 - Stop with Ctrl-C or SIGTERM. The MP4 index is written on a clean stop; a
   `kill -9`, crash or power cut leaves an unplayable file.
 - Default file names are relative to the directory you run from.

@@ -39,6 +39,7 @@
 #include "../common/sw_ldc.h"
 #include "tag_crop_decoder.h"
 #include "tinytag_det.h"
+#include "preview_deadline.h"
 
 extern "C" {
 #include <core/utils/vpss_helper.h>
@@ -76,6 +77,7 @@ extern "C" {
 #include <csignal>
 #include <mutex>
 #include <memory>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -215,6 +217,10 @@ enum class PreviewSurfaceState : uint8_t
 constexpr size_t kPreviewSurfaceCount = 2;
 struct PreviewSurface
 {
+    CVI_U64 y_phy = 0;
+    CVI_VOID *y_vir = nullptr;
+    CVI_U32 y_len = 0;
+    CVI_U32 y_stride = 0;
     CVI_U64 c_phy = 0;
     CVI_VOID *c_vir = nullptr;
     CVI_U32 c_len = 0;
@@ -244,8 +250,13 @@ struct CaptureSlot
     size_t dropped = 0; // superseded before the detector could take them
 };
 
+struct ModelPreviewLease;
+
 struct LumaRtspItem
 {
+    bool preview_due = false;
+    bool record_due = false;
+    std::shared_ptr<ModelPreviewLease> model_preview;
     // Ownership of both the VPSS frame and its existing cached Y mapping moves
     // to this item until encode completes or the item is superseded.
     VIDEO_FRAME_INFO_S source{};
@@ -478,6 +489,11 @@ void usage(const char *argv0)
             "              remain on stdout.\n"
 
             "       [--rtsp-luma]  (RTSP preview as detector grayscale/luma)\n"
+            "       [--preview-fps N]  preview cap, default 15; 0 uncapped (0..120).\n"
+            "       [--preview-size 640x360|1280x720]  default 640x360.\n"
+            "              Detector resolution is unchanged. Late preview frames are dropped.\n"
+            "       [--record-fps N]  separate recording cap, default 30 (1..120).\n"
+            "              Recording remains 1280x720, without overlays.\n"
             "       [--record [out.mp4]]  record the camera image without overlays as H.264 MP4\n"
             "              while --rtsp/--rtsp-luma still shows the annotated view.\n"
             "              --rtsp: colour, default rec.mp4. --rtsp-luma: monochrome (the\n"
@@ -697,6 +713,13 @@ void isp_control_loop()
 // Everything TeardownCamera() needs. Populated by SetupCamera().
 struct CameraContext
 {
+    unsigned preview_fps = 15;
+    unsigned record_fps = 30;
+    CVI_U32 preview_width = 640;
+    CVI_U32 preview_height = 360;
+    PreviewSurface record_chroma;
+    std::atomic<bool> model_preview_busy{false};
+    std::atomic<size_t> model_preview_dropped{0};
     SAMPLE_VI_CONFIG_S vi_config{};
     uint32_t width = 0;
     uint32_t height = 0;
@@ -775,6 +798,75 @@ struct CameraContext
     CVI_RTSP_CTX *rtsp = nullptr;
     CVI_RTSP_SESSION *session = nullptr;
 };
+
+// Exactly one model buffer can be reserved across producer, queue and worker.
+// The last owner releases both the mapping and VPSS frame before reopening the slot.
+struct ModelPreviewLease
+{
+    explicit ModelPreviewLease(CameraContext &context) : ctx(context) {}
+    ~ModelPreviewLease()
+    {
+        if (pixels) CVI_SYS_Munmap(pixels, map_len);
+        if (frame.stVFrame.u64PhyAddr[0])
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &frame);
+        ctx.model_preview_busy.store(false, std::memory_order_release);
+    }
+    CameraContext &ctx;
+    VIDEO_FRAME_INFO_S frame{};
+    uint8_t *pixels = nullptr;
+    CVI_U32 map_len = 0;
+};
+
+bool allocate_preview_surface(PreviewSurface &sfc, CVI_U32 width, CVI_U32 height, bool with_y)
+{
+    VB_CAL_CONFIG_S cfg{};
+    COMMON_GetPicBufferConfig(width, height, VI_PIXEL_FORMAT, DATA_BITWIDTH_8,
+                              COMPRESS_MODE_NONE, DEFAULT_ALIGN, &cfg);
+    sfc.c_len = cfg.u32MainCSize;
+    sfc.c_stride = cfg.u32CStride;
+    if (CVI_SYS_IonAlloc(&sfc.c_phy, &sfc.c_vir, "tinytag_preview_c", sfc.c_len) != CVI_SUCCESS)
+    {
+        fprintf(stderr, "[preview] cannot allocate chroma surface\n");
+        return false;
+    }
+    std::memset(sfc.c_vir, 128, sfc.c_len);
+    CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+    if (with_y)
+    {
+        sfc.y_stride = width; // both supported widths are 64-byte aligned
+        sfc.y_len = width * height;
+        if (CVI_SYS_IonAlloc(&sfc.y_phy, &sfc.y_vir, "tinytag_preview_y", sfc.y_len) != CVI_SUCCESS)
+        {
+            fprintf(stderr, "[preview] cannot allocate luma surface\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+void set_preview_surface(VIDEO_FRAME_INFO_S &frame, PreviewSurface &sfc,
+                         CVI_U32 width, CVI_U32 height, bool private_y = true)
+{
+    auto &vf = frame.stVFrame;
+    vf.u32Width = width;
+    vf.u32Height = height;
+    vf.s16OffsetTop = vf.s16OffsetBottom = vf.s16OffsetLeft = vf.s16OffsetRight = 0;
+    if (private_y && sfc.y_vir)
+    {
+        vf.u64PhyAddr[0] = sfc.y_phy;
+        vf.pu8VirAddr[0] = static_cast<CVI_U8 *>(sfc.y_vir);
+        vf.u32Stride[0] = sfc.y_stride;
+        vf.u32Length[0] = sfc.y_len;
+    }
+    vf.u64PhyAddr[1] = sfc.c_phy;
+    vf.pu8VirAddr[1] = static_cast<CVI_U8 *>(sfc.c_vir);
+    vf.u32Stride[1] = sfc.c_stride;
+    vf.u32Length[1] = sfc.c_len;
+    vf.u64PhyAddr[2] = 0;
+    vf.pu8VirAddr[2] = nullptr;
+    vf.u32Stride[2] = vf.u32Length[2] = 0;
+    vf.enPixelFormat = PIXEL_FORMAT_NV21;
+}
 
 uint8_t *map_luma_for_cpu(CameraContext &ctx, CVI_U64 phy, CVI_U32 len)
 {
@@ -945,6 +1037,7 @@ bool start_record_encoder(CameraContext &ctx)
 {
     chnInputCfg ic{};
     fill_h264_input_config(ic, ctx.preview_chn, kRecordBitrateKbps);
+    ic.srcFramerate = ic.framerate = ctx.record_fps;
     VENC_GOP_ATTR_S gop{};
     if (SAMPLE_COMM_VENC_GetGopAttr(VENC_GOPMODE_NORMALP, &gop) != CVI_SUCCESS ||
         SAMPLE_COMM_VENC_Start(&ic, kRecVencChn, PT_H264, PIC_720P, SAMPLE_RC_CBR, 0, CVI_FALSE, &gop) !=
@@ -962,10 +1055,14 @@ bool start_preview_stream(CameraContext &ctx)
 {
     chnInputCfg ic{};
     fill_h264_input_config(ic, ctx.preview_luma ? kVpssChn : ctx.preview_chn, kPreviewBitrateKbps);
+    ic.width = ctx.preview_width;
+    ic.height = ctx.preview_height;
+    ic.srcFramerate = ic.framerate = ctx.preview_fps ? ctx.preview_fps : 30;
+    ic.gop = ic.framerate;
 
     VENC_GOP_ATTR_S gop{};
     if (SAMPLE_COMM_VENC_GetGopAttr(VENC_GOPMODE_NORMALP, &gop) != CVI_SUCCESS ||
-        SAMPLE_COMM_VENC_Start(&ic, kVencChn, PT_H264, PIC_720P, SAMPLE_RC_CBR, 0, CVI_FALSE, &gop) !=
+        SAMPLE_COMM_VENC_Start(&ic, kVencChn, PT_H264, PIC_CUSTOMIZE, SAMPLE_RC_CBR, 0, CVI_FALSE, &gop) !=
             CVI_SUCCESS)
     {
         fprintf(stderr, "[rtsp] VENC start failed\n");
@@ -1271,7 +1368,9 @@ bool setup_camera(CameraContext &ctx)
     if ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn)
     {
         vb_config.astCommPool[ctx.preview_pool].u32BlkSize = COMMON_GetPicBufferSize(
-            kDetWidth, kDetHeight, VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
+            (ctx.record_path.empty() ? ctx.preview_width : kDetWidth),
+            (ctx.record_path.empty() ? ctx.preview_height : kDetHeight),
+            VI_PIXEL_FORMAT, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN);
         vb_config.astCommPool[ctx.preview_pool].u32BlkCnt = 5;
     }
 
@@ -1298,37 +1397,31 @@ bool setup_camera(CameraContext &ctx)
         ctx.sw_ldc_mappings.reserve(kSwLdcBlockCount);
     }
 
-    if (ctx.preview_luma)
+    if (ctx.preview_luma || (ctx.preview && !ctx.record_path.empty() && ctx.preview_width != kDetWidth))
     {
-        VB_CAL_CONFIG_S chroma_cfg{};
-        COMMON_GetPicBufferConfig(kDetWidth, kDetHeight, VI_PIXEL_FORMAT,
-                                  DATA_BITWIDTH_8, COMPRESS_MODE_NONE, DEFAULT_ALIGN,
-                                  &chroma_cfg);
-        // The Y plane is borrowed directly from the detector's VPSS frame.
-        // Only neutral NV21 chroma surfaces are allocated here; the worker
-        // colours overlay regions and reuses them via the ownership states.
-        for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+        const size_t count = ctx.preview_luma ? kPreviewSurfaceCount : 1;
+        for (size_t i = 0; i < count; ++i)
         {
             PreviewSurface &sfc = ctx.preview_surfaces[i];
             sfc.index = i;
-            sfc.c_len = chroma_cfg.u32MainCSize;
-            sfc.c_stride = chroma_cfg.u32CStride;
-            char name[32];
-            snprintf(name, sizeof(name), "tinytag_preview_c%zu", i);
-            if (CVI_SYS_IonAlloc(&sfc.c_phy, &sfc.c_vir, name, sfc.c_len) != CVI_SUCCESS)
-            {
-                fprintf(stderr, "[camera] preview chroma allocation failed\n");
+            if (!allocate_preview_surface(sfc, ctx.preview_width, ctx.preview_height,
+                                          ctx.preview_width != kDetWidth &&
+                                          !(ctx.preview_luma && ctx.direct_model_input && !ctx.sw_ldc_enabled)))
                 return false;
-            }
-            // 128/128 is neutral: the scene renders grey. The overlay writes
-            // real chroma only where it draws, and those rectangles are reset
-            // here on the next pass -- see PreviewSurface::dirty.
-            std::memset(sfc.c_vir, 128, sfc.c_len);
-            CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
             sfc.dirty.reserve(64);
         }
-        fprintf(stderr, "[camera] preview transport: borrowed VPSS Y (zero copy)\n");
+        if (ctx.preview_luma && !ctx.record_path.empty() &&
+            !allocate_preview_surface(ctx.record_chroma, kDetWidth, kDetHeight, false))
+            return false;
+        fprintf(stderr, "[camera] preview transport: %s\n",
+                ctx.preview_width == kDetWidth ? "borrowed VPSS Y (zero copy)" :
+                (ctx.direct_model_input && !ctx.sw_ldc_enabled
+                    ? "borrowed 640x360 model Y (zero copy, one buffer maximum)"
+                    : "selected frames downsized in preview worker"));
     }
+    if (ctx.preview)
+        fprintf(stderr, "[preview] %ux%u, cap %u fps (0 = uncapped); recording %u fps independently\n",
+                ctx.preview_width, ctx.preview_height, ctx.preview_fps, ctx.record_fps);
 
     if (ctx.input)
     {
@@ -1429,7 +1522,10 @@ bool setup_camera(CameraContext &ctx)
     if (vpss_ret == CVI_SUCCESS && ((ctx.preview && !ctx.preview_luma) || ctx.record_own_chn))
     {
         VPSS_CHN_ATTR_S preview_attr{};
-        VPSS_CHN_DEFAULT_HELPER(&preview_attr, kDetWidth, kDetHeight, VI_PIXEL_FORMAT, CVI_FALSE);
+        VPSS_CHN_DEFAULT_HELPER(&preview_attr,
+                                ctx.record_path.empty() ? ctx.preview_width : kDetWidth,
+                                ctx.record_path.empty() ? ctx.preview_height : kDetHeight,
+                                VI_PIXEL_FORMAT, CVI_FALSE);
         vpss_ret = CVI_VPSS_SetChnAttr(kVpssGrp, ctx.preview_chn, &preview_attr);
         if (vpss_ret == CVI_SUCCESS)
             vpss_ret = CVI_VPSS_EnableChn(kVpssGrp, ctx.preview_chn);
@@ -1809,7 +1905,8 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
 
 // Encode one NV21 frame and hand the bitstream to the RTSP server. Same
 // sequence as SAMPLE_TDL_Send_Frame_RTSP in tdl_sdk's middleware_utils.c.
-RtspSendResult send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
+RtspSendResult send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame,
+                            const std::function<void()> &input_consumed = {})
 {
     RtspSendResult result;
     const double venc_start = now_ms();
@@ -1843,6 +1940,10 @@ RtspSendResult send_to_rtsp(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
         result.failures |= RTSP_SEND_GET;
         return result;
     }
+
+    // GetStream succeeded: VENC has completed DMA from input Y. Release the
+    // model buffer now, before network transmission; bitstream storage is separate.
+    if (input_consumed) input_consumed();
 
     if (stream.u32PackCount == 0)
         result.failures |= RTSP_SEND_NO_PACKS;
@@ -1883,6 +1984,8 @@ void reserve_luma_item(LumaRtspItem &item, size_t capacity)
 
 void clear_luma_item(LumaRtspItem &item)
 {
+    item.preview_due = item.record_due = false;
+    item.model_preview.reset();
     item.source = VIDEO_FRAME_INFO_S{};
     item.source_y_vir = nullptr;
     item.source_map_len = 0;
@@ -1977,13 +2080,30 @@ PreviewSurface *acquire_luma_surface(CameraContext &ctx)
     return nullptr;
 }
 
+// Return an unpublished reservation on every early continue/break. The
+// producer alone writes FILLING surfaces; the worker only takes QUEUED ones.
+struct LumaSurfaceReservation
+{
+    explicit LumaSurfaceReservation(CameraContext &context) : ctx(context) {}
+    ~LumaSurfaceReservation()
+    {
+        if (!surface) return;
+        std::lock_guard<std::mutex> lock(ctx.luma_rtsp_queue.mutex);
+        if (surface->state == PreviewSurfaceState::FILLING)
+            surface->state = PreviewSurfaceState::FREE;
+    }
+    CameraContext &ctx;
+    PreviewSurface *surface = nullptr;
+};
+
 bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
                        PreviewSurface *surface, const std::vector<Proposal> &proposals,
                        const std::vector<Proposal> &maintained_rois,
                        const std::vector<TinyTagResult> &tags,
                        const std::vector<cv::Rect> &crops, double fps, double busy_ms,
                        const VIDEO_FRAME_INFO_S &source, uint8_t *source_y_vir,
-                       CVI_U32 source_map_len)
+                       CVI_U32 source_map_len, bool preview_due, bool record_due,
+                       std::shared_ptr<ModelPreviewLease> model_preview)
 {
     LumaRtspQueue &queue = ctx.luma_rtsp_queue;
     BorrowedYResources superseded;
@@ -2023,6 +2143,9 @@ bool enqueue_luma_rtsp(CameraContext &ctx, const VIDEO_FRAME_INFO_S &encoded,
 
     LumaRtspItem &item = queue.pending;
     item.encoded = encoded;
+    item.model_preview = std::move(model_preview);
+    item.preview_due = preview_due;
+    item.record_due = record_due;
     item.surface = surface;
     item.source = source;
     item.source_y_vir = source_y_vir;
@@ -2052,6 +2175,7 @@ bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame);
 void luma_rtsp_loop(CameraContext *ctx)
 {
     configure_preview_priority("luma");
+    PreviewDeadline preview_deadline(ctx->preview_fps), record_deadline(ctx->record_fps);
     LumaRtspQueue &queue = ctx->luma_rtsp_queue;
     LumaRtspItem item;
     reserve_luma_item(item, ctx->preview_item_capacity);
@@ -2101,46 +2225,72 @@ void luma_rtsp_loop(CameraContext *ctx)
             continue;
         }
 
-        if (item.surface != nullptr)
+        PreviewSurface &sfc = *item.surface;
+        const VIDEO_FRAME_S original = item.encoded.stVFrame;
+        cv::Mat original_y(original.u32Height, original.u32Width, CV_8UC1,
+                           item.source_y_vir, original.u32Stride[0]);
+        if (item.record_due && ctx->mp4 && record_deadline.due(now_ms()))
         {
-            PreviewSurface &sfc = *item.surface;
-            const VIDEO_FRAME_S &vf = item.encoded.stVFrame;
-            uint8_t *y_vir = item.source_y_vir;
-            cv::Mat y(vf.u32Height, vf.u32Width, CV_8UC1,
-                      y_vir, vf.u32Stride[0]);
-            cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
-                       static_cast<uint8_t *>(sfc.c_vir), sfc.c_stride);
+            VIDEO_FRAME_INFO_S clean = item.encoded;
+            set_preview_surface(clean, ctx->record_chroma, kDetWidth, kDetHeight);
+            if (ctx->sw_ldc_enabled)
+                CVI_SYS_IonFlushCache(original.u64PhyAddr[0], item.source_y_vir, item.source_map_len);
+            if (!record_frame(*ctx, clean))
+                ++ctx->record_failures;
+        }
 
-            // Reset only the chroma this surface coloured last time, so the
-            // scene returns to neutral grey without rewriting the whole plane.
+        RtspSendResult send;
+        item.preview_due = item.preview_due && preview_deadline.due(now_ms());
+        if (item.preview_due)
+        {
+            cv::Mat y = original_y;
+            if (item.model_preview)
+            {
+                const auto &lease = *item.model_preview;
+                const auto &mf = lease.frame.stVFrame;
+                const CVI_U32 offset = mf.s16OffsetTop * mf.u32Stride[0];
+                y = cv::Mat(360, 640, CV_8UC1, lease.pixels + offset, mf.u32Stride[0]);
+                item.encoded = lease.frame;
+                auto &vf = item.encoded.stVFrame;
+                vf.u64PhyAddr[0] += offset;
+                vf.pu8VirAddr[0] = y.data;
+                vf.u32Length[0] = mf.u32Stride[0] * 360;
+                set_preview_surface(item.encoded, sfc, 640, 360, false);
+            }
+            else if (sfc.y_vir)
+            {
+                y = cv::Mat(ctx->preview_height, ctx->preview_width, CV_8UC1,
+                            sfc.y_vir, sfc.y_stride);
+                cv::resize(original_y, y, y.size(), 0, 0, cv::INTER_AREA);
+                set_preview_surface(item.encoded, sfc, ctx->preview_width, ctx->preview_height);
+            }
+            if (item.model_preview || sfc.y_vir)
+            {
+                // Recording has consumed the clean full-resolution frame.
+                // Preview now reads model Y or private Y, so return detector Y.
+                BorrowedYResources copied = detach_borrowed_y(item);
+                const bool was_borrowed = copied.valid;
+                release_borrowed_y(copied);
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                if (was_borrowed) --queue.borrowed_frames;
+            }
+            cv::Mat vu(ctx->preview_height / 2, ctx->preview_width / 2, CV_8UC2,
+                       sfc.c_vir, sfc.c_stride);
             for (const auto &r : sfc.dirty)
                 vu(r & cv::Rect(0, 0, vu.cols, vu.rows)).setTo(cv::Scalar(128, 128));
             sfc.dirty.clear();
-
-            // Monochrome recording: the detector's Y plane with neutral chroma,
-            // encoded before any overlay is drawn. Flush the chroma we just reset.
-            if (ctx->mp4)
-            {
-                // Software-LDC Y was written by the CPU, unlike VPSS output.
-                if (ctx->sw_ldc_enabled)
-                    CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], y_vir, item.source_map_len);
-                CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
-                if (!record_frame(*ctx, item.encoded))
-                    ++ctx->record_failures;
-            }
-
             const auto mode = static_cast<RoiDisplayMode>(g_roi_display_mode.load());
             draw_overlay_nv21(y, vu, item.proposals, item.maintained_rois, item.tags,
                               item.crops, mode, item.fps, item.busy_ms, &sfc.dirty);
-
-            CVI_SYS_IonFlushCache(vf.u64PhyAddr[0], y_vir, item.source_map_len);
+            CVI_SYS_IonFlushCache(item.encoded.stVFrame.u64PhyAddr[0], y.data,
+                                  item.encoded.stVFrame.u32Length[0]);
             CVI_SYS_IonFlushCache(sfc.c_phy, sfc.c_vir, sfc.c_len);
+            if (ctx->preview_delay_ms != 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(ctx->preview_delay_ms));
+            send = send_to_rtsp(*ctx, item.encoded, [&item] {
+                item.model_preview.reset();
+            });
         }
-
-        if (ctx->preview_delay_ms != 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(ctx->preview_delay_ms));
-
-        const RtspSendResult send = send_to_rtsp(*ctx, item.encoded);
         BorrowedYResources completed = detach_borrowed_y(item);
         const bool completed_borrowed = completed.valid;
         release_borrowed_y(completed);
@@ -2158,9 +2308,9 @@ void luma_rtsp_loop(CameraContext *ctx)
             queue.rtsp_sum_ms += send.rtsp_ms;
             queue.rtsp_max_ms = std::max(queue.rtsp_max_ms, send.rtsp_ms);
             queue.get_timeouts += send.get_timeouts;
-            if (send.failures == RTSP_SEND_OK)
+            if (item.preview_due && send.failures == RTSP_SEND_OK)
                 ++queue.encoded;
-            else
+            else if (item.preview_due)
             {
                 ++queue.encode_failed;
                 if (send.failures & RTSP_SEND_SUBMIT) ++queue.submit_failed;
@@ -2240,6 +2390,8 @@ void stop_luma_rtsp(CameraContext &ctx)
     }
     ctx.luma_rtsp_queue.not_empty.notify_one();
     ctx.luma_rtsp_worker.join();
+    if (ctx.model_preview_busy.load())
+        fprintf(stderr, "[preview] model buffer remains borrowed at shutdown\n");
 
     std::lock_guard<std::mutex> lock(ctx.luma_rtsp_queue.mutex);
     if (ctx.luma_rtsp_queue.borrowed_frames != 0)
@@ -2265,12 +2417,13 @@ void stop_luma_rtsp(CameraContext &ctx)
 // When `dirty` is non-null every chroma rectangle touched is appended to it, so
 // the caller can reset exactly those regions next frame instead of clearing the
 // whole plane.
-void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+void draw_overlay_scaled(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
                        const std::vector<Proposal> &maintained_rois,
                        const std::vector<TinyTagResult> &tags,
                        const std::vector<cv::Rect> &crops, RoiDisplayMode mode,
                        double fps, double busy_ms, std::vector<cv::Rect> *dirty)
 {
+    const double font_scale = double(y.cols) / kDetWidth;
     const bool show_current = mode == RoiDisplayMode::Current || mode == RoiDisplayMode::Both;
     const bool show_maintained = mode == RoiDisplayMode::Maintained || mode == RoiDisplayMode::Both;
     // Aligned crop boxes belong to the current-ROI view.
@@ -2303,7 +2456,7 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
             snprintf(label, sizeof(label), "%.2f id %d", p.confidence, hit->id);
         else
             snprintf(label, sizeof(label), "%.2f", p.confidence);
-        draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), hit ? 0.9 : 0.65);
+        draw_label(y, label, cv::Point(label_x, std::max(20, label_y)), (hit ? 0.9 : 0.65) * font_scale);
     }
 
     if (show_maintained)
@@ -2313,13 +2466,43 @@ void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &pro
     // Only decoder-confirmed tags receive the green geometry fitted to their
     // real corners. These detections remain visible in every ROI display mode.
     for (const auto &tag : tags)
-        draw_tag_quad(y, vu, tag, kTagColor, 4, dirty);
+        draw_tag_quad(y, vu, tag, kTagColor, std::max(1, int(4 * font_scale)), dirty);
 
     char status[96];
     snprintf(status, sizeof(status), "tinytag %.1f fps  %.1f ms  %zu prop %zu tags  ROI:%s", fps, busy_ms,
              proposals.size(), tags.size(), roi_display_mode_name(mode));
-    draw_label(y, status, cv::Point(16, 40), 0.9);
+    draw_label(y, status, cv::Point(8, std::max(20, int(40 * font_scale))), 0.9 * font_scale);
 }
+
+void draw_overlay_nv21(cv::Mat &y, cv::Mat &vu, const std::vector<Proposal> &proposals,
+                       const std::vector<Proposal> &maintained_rois,
+                       const std::vector<TinyTagResult> &tags,
+                       const std::vector<cv::Rect> &crops, RoiDisplayMode mode,
+                       double fps, double busy_ms, std::vector<cv::Rect> *dirty)
+{
+    if (y.cols != static_cast<int>(kDetWidth) || y.rows != static_cast<int>(kDetHeight))
+    {
+        const float sx = float(y.cols) / kDetWidth, sy = float(y.rows) / kDetHeight;
+        auto box = [=](const cv::Rect2f &r) { return cv::Rect2f(r.x*sx, r.y*sy, r.width*sx, r.height*sy); };
+        auto ps = proposals, ms = maintained_rois;
+        auto ts = tags;
+        std::vector<cv::Rect> cs;
+        for (auto &p : ps) p.roi = box(p.roi);
+        for (auto &p : ms) p.roi = box(p.roi);
+        for (auto &t : ts)
+        {
+            t.roi = box(t.roi);
+            t.center.x *= sx; t.center.y *= sy;
+            for (auto &c : t.corners) { c.x *= sx; c.y *= sy; }
+        }
+        for (const auto &r : crops) cs.emplace_back(box(r));
+        // Draw with coordinates already scaled; a separate helper below avoids recursion.
+        draw_overlay_scaled(y, vu, ps, ms, ts, cs, mode, fps, busy_ms, dirty);
+        return;
+    }
+    draw_overlay_scaled(y, vu, proposals, maintained_rois, tags, crops, mode, fps, busy_ms, dirty);
+}
+
 
 bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame);
 
@@ -2327,6 +2510,7 @@ bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame);
 void preview_loop(CameraContext *ctx)
 {
     configure_preview_priority("colour");
+    PreviewDeadline preview_deadline(ctx->preview_fps), record_deadline(ctx->record_fps);
     std::vector<Proposal> proposals;
     std::vector<Proposal> maintained_rois;
     std::vector<TinyTagResult> tags;
@@ -2337,6 +2521,15 @@ void preview_loop(CameraContext *ctx)
         if (CVI_VPSS_GetChnFrame(kVpssGrp, ctx->preview_chn, &frame, 1000) != CVI_SUCCESS)
             continue;
 
+        const double time = now_ms();
+        const bool preview_due = preview_deadline.due(time);
+        const bool record_due = ctx->mp4 && record_deadline.due(time);
+        if (record_due && !record_frame(*ctx, frame)) ++ctx->record_failures;
+        if (!preview_due)
+        {
+            CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+            continue;
+        }
         // Map both NV21 planes in one span (they are contiguous, but compute
         // the plane-1 offset from the physical addresses rather than assume).
         const VIDEO_FRAME_S &vf = frame.stVFrame;
@@ -2352,9 +2545,18 @@ void preview_loop(CameraContext *ctx)
         cv::Mat vu(vf.u32Height / 2, vf.u32Width / 2, CV_8UC2,
                    mem + (vf.u64PhyAddr[1] - base), vf.u32Stride[1]);
 
-        // Recording takes the frame before any overlay is drawn on it.
-        if (ctx->mp4 && !record_frame(*ctx, frame))
-            ++ctx->record_failures;
+        VIDEO_FRAME_INFO_S output = frame;
+        const bool resized = vf.u32Width != ctx->preview_width;
+        if (resized)
+        {
+            auto &surface = ctx->preview_surfaces[0];
+            cv::Mat small_y(ctx->preview_height, ctx->preview_width, CV_8UC1, surface.y_vir, surface.y_stride);
+            cv::Mat small_vu(ctx->preview_height/2, ctx->preview_width/2, CV_8UC2, surface.c_vir, surface.c_stride);
+            cv::resize(y, small_y, small_y.size(), 0, 0, cv::INTER_AREA);
+            cv::resize(vu, small_vu, small_vu.size(), 0, 0, cv::INTER_AREA);
+            y = small_y; vu = small_vu;
+            set_preview_surface(output, surface, ctx->preview_width, ctx->preview_height);
+        }
 
         double fps, busy_ms;
         {
@@ -2371,11 +2573,17 @@ void preview_loop(CameraContext *ctx)
 
         // We wrote through a cached mapping; flush so VENC, which reads the
         // physical buffer via DMA, sees the boxes.
-        CVI_SYS_IonFlushCache(base, mem, span);
+        if (resized)
+        {
+            auto &surface = ctx->preview_surfaces[0];
+            CVI_SYS_IonFlushCache(surface.y_phy, surface.y_vir, surface.y_len);
+            CVI_SYS_IonFlushCache(surface.c_phy, surface.c_vir, surface.c_len);
+        }
+        else CVI_SYS_IonFlushCache(base, mem, span);
         CVI_SYS_Munmap(mem, span);
-
-        (void)send_to_rtsp(*ctx, frame);
-        CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+        if (resized) CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
+        (void)send_to_rtsp(*ctx, output);
+        if (!resized) CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
     }
 }
 
@@ -2416,13 +2624,14 @@ bool record_frame(CameraContext &ctx, VIDEO_FRAME_INFO_S &frame)
 void record_loop(CameraContext *ctx)
 {
     configure_preview_priority("record");
+    PreviewDeadline record_deadline(ctx->record_fps);
     size_t failures = 0;
     while (!g_stop)
     {
         VIDEO_FRAME_INFO_S frame{};
         if (CVI_VPSS_GetChnFrame(kVpssGrp, ctx->preview_chn, &frame, 1000) != CVI_SUCCESS)
             continue;
-        if (!record_frame(*ctx, frame))
+        if (record_deadline.due(now_ms()) && !record_frame(*ctx, frame))
             ++failures;
         CVI_VPSS_ReleaseChnFrame(kVpssGrp, ctx->preview_chn, &frame);
     }
@@ -2585,9 +2794,15 @@ void teardown_camera(CameraContext &ctx)
         ctx.vi_initialized = false;
     }
 
-    for (size_t i = 0; i < kPreviewSurfaceCount; ++i)
+    for (size_t i = 0; i <= kPreviewSurfaceCount; ++i)
     {
-        PreviewSurface &sfc = ctx.preview_surfaces[i];
+        PreviewSurface &sfc = i == kPreviewSurfaceCount ? ctx.record_chroma : ctx.preview_surfaces[i];
+        if (sfc.y_vir)
+        {
+            CVI_SYS_IonFree(sfc.y_phy, sfc.y_vir);
+            sfc.y_phy = 0;
+            sfc.y_vir = nullptr;
+        }
         if (sfc.c_vir)
         {
             CVI_SYS_IonFree(sfc.c_phy, sfc.c_vir);
@@ -2638,6 +2853,8 @@ int main(int argc, char *argv[])
     std::string save_ldc_pair_prefix;
     std::string save_native_frame_path;
     bool rtsp = false, rtsp_luma = false;
+    unsigned preview_fps = 15, record_fps = 30;
+    unsigned preview_width = 640, preview_height = 360;
     std::string record_path;
     bool record = false;
     std::string input_path;
@@ -2706,6 +2923,27 @@ int main(int argc, char *argv[])
                 return 1;
             }
             adaptive_min_roi_area = static_cast<int>(value);
+        }
+        else if ((flag == "--preview-fps" || flag == "--record-fps") && has_value)
+        {
+            const char *text = argv[++i];
+            char *end = nullptr;
+            errno = 0;
+            const long value = std::strtol(text, &end, 10);
+            if (errno || end == text || *end || value < (flag == "--record-fps" ? 1 : 0) || value > 120)
+            {
+                fprintf(stderr, "%s requires an integer %s..120\n", flag.c_str(),
+                        flag == "--record-fps" ? "1" : "0");
+                return 1;
+            }
+            (flag == "--preview-fps" ? preview_fps : record_fps) = value;
+        }
+        else if (flag == "--preview-size" && has_value)
+        {
+            const std::string size = argv[++i];
+            if (size == "640x360") { preview_width = 640; preview_height = 360; }
+            else if (size == "1280x720") { preview_width = 1280; preview_height = 720; }
+            else { fprintf(stderr, "--preview-size requires 640x360 or 1280x720\n"); return 1; }
         }
         else if (flag == "--rtsp") rtsp = true;
         else if (flag == "--rtsp-luma") rtsp = rtsp_luma = true;
@@ -2790,6 +3028,10 @@ int main(int argc, char *argv[])
 
     CameraContext ctx;
     ctx.preview = rtsp;
+    ctx.preview_fps = preview_fps;
+    ctx.record_fps = record_fps;
+    ctx.preview_width = preview_width;
+    ctx.preview_height = preview_height;
     ctx.preview_luma = rtsp_luma;
     if (record && record_path.empty())
         record_path = rtsp_luma ? "rec_mono.mp4" : "rec.mp4";
@@ -3093,6 +3335,8 @@ int main(int argc, char *argv[])
     double process_cpu_window_start = process_cpu_ms();
     double overlay_fps = 0.0;
     double overlay_busy_ms = 0.0;
+    PreviewDeadline luma_preview_deadline(ctx.preview_fps);
+    PreviewDeadline luma_record_deadline(ctx.record_fps);
     std::vector<double> tail_service, tail_cpu, tail_crop, tail_acquisition_age, tail_result_age;
     for (auto *samples : {&tail_service, &tail_cpu, &tail_crop,
                           &tail_acquisition_age, &tail_result_age})
@@ -3127,6 +3371,10 @@ int main(int argc, char *argv[])
         double model_ready_ms = 0.0;
         double full_ready_ms = 0.0;
         bool save_ldc_pair_this_frame = false;
+        LumaSurfaceReservation preview_reservation(ctx);
+        std::shared_ptr<ModelPreviewLease> model_preview;
+        bool preview_selected = false;
+        bool preview_selection_done = false;
         const double t_wait = now_ms();
         // Direct mode is driven by the newest small model frame. The larger
         // full-resolution channel is deliberately not awaited here: its
@@ -3170,7 +3418,7 @@ int main(int argc, char *argv[])
                         "expected %dx%d tightly packed YUV400\n",
                         mf.u32Width, mf.u32Height, mf.u32Stride[0], mf.u32Length[0],
                         mf.enPixelFormat, expected.width, expected.height);
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 break;
             }
             if (has_ldc_tail && !logged_ldc_model_tail)
@@ -3227,7 +3475,7 @@ int main(int argc, char *argv[])
                 if (compact_validation_copy == nullptr)
                 {
                     fprintf(stderr, "[model-input] cannot map first compact frame for validation\n");
-                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                    if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                     g_stop = 1;
                     break;
                 }
@@ -3251,7 +3499,7 @@ int main(int argc, char *argv[])
                 if (compact_validation_copy != nullptr)
                     CVI_SYS_Munmap(compact_validation_copy, model_frame.stVFrame.u32Length[0]);
                 fprintf(stderr, "[camera] direct inference failed: %s\n", e.what());
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 g_stop = 1;
                 break;
             }
@@ -3279,9 +3527,51 @@ int main(int argc, char *argv[])
                     fprintf(stderr, "[adaptive] cannot map model frame; using full resolution\n");
                 adaptive_copy_ms = now_ms() - copy_started;
             }
+            // Retain only preview-selected model buffers, after inference.
+            // The adaptive image has already been copied before overlays can modify Y.
+            if (ctx.preview_luma && ctx.preview_width == 640 && !ctx.sw_ldc_enabled)
+            {
+                preview_selection_done = true;
+                preview_selected = luma_preview_deadline.due(now_ms());
+                if (preview_selected)
+                {
+                    bool expected = false;
+                    if (!ctx.model_preview_busy.compare_exchange_strong(expected, true))
+                    {
+                        ++ctx.model_preview_dropped;
+                        preview_selected = false;
+                    }
+                    else
+                    {
+                        model_preview = std::make_shared<ModelPreviewLease>(ctx);
+                        const VIDEO_FRAME_S &mf = model_frame.stVFrame;
+                        model_preview->map_len = mf.u32Length[0];
+                        model_preview->pixels = static_cast<uint8_t *>(
+                            CVI_SYS_MmapCache(mf.u64PhyAddr[0], mf.u32Length[0]));
+                        if (!model_preview->pixels)
+                        {
+                            model_preview.reset();
+                            preview_selected = false;
+                            ++ctx.model_preview_dropped;
+                            fprintf(stderr, "[preview] model map failed; dropping preview\n");
+                        }
+                        else
+                        {
+                            model_preview->frame = model_frame;
+                            preview_reservation.surface = acquire_luma_surface(ctx);
+                            if (!preview_reservation.surface)
+                            {
+                                // Lease owns this frame even if there is no preview surface.
+                                preview_selected = false;
+                            }
+                        }
+                    }
+                }
+            }
+
             if (!save_ldc_pair_this_frame)
             {
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 model_frame = VIDEO_FRAME_INFO_S{};
             }
 
@@ -3290,7 +3580,7 @@ int main(int argc, char *argv[])
             {
                 if (save_ldc_pair_this_frame)
                 {
-                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                    if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                     model_frame = VIDEO_FRAME_INFO_S{};
                 }
                 continue;
@@ -3303,7 +3593,7 @@ int main(int argc, char *argv[])
                         (unsigned long long)frame.stVFrame.u64PTS);
                 CVI_VPSS_ReleaseChnFrame(kVpssGrp, kVpssChn, &frame);
                 if (save_ldc_pair_this_frame)
-                    CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                    if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 ctx.pair_mismatches.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -3329,7 +3619,7 @@ int main(int argc, char *argv[])
                         mf.s16OffsetTop, mf.s16OffsetBottom, mf.s16OffsetLeft,
                         mf.s16OffsetRight, model_saved ? "saved" : "SAVE FAILED",
                         model_path.c_str());
-                CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
+                if (!model_preview) CVI_VPSS_ReleaseChnFrame(kVpssGrp, kModelChn, &model_frame);
                 model_frame = VIDEO_FRAME_INFO_S{};
                 ldc_pair_saved = model_saved;
             }
@@ -3501,11 +3791,17 @@ int main(int argc, char *argv[])
 
         VIDEO_FRAME_INFO_S rtsp_frame{};
         PreviewSurface *surface = nullptr;
-        if (ctx.preview_luma)
+        const double publication_ms = now_ms();
+        const bool preview_due = ctx.preview_luma && (preview_selection_done
+            ? preview_selected : luma_preview_deadline.due(publication_ms));
+        const bool record_due = ctx.preview_luma && ctx.mp4 && luma_record_deadline.due(publication_ms);
+        if (preview_due || record_due)
         {
             // Reserve a neutral-chroma/overlay surface. The exact detector Y
             // mapping and VPSS frame transfer to the worker below.
-            surface = acquire_luma_surface(ctx);
+            surface = preview_reservation.surface;
+            if (!surface)
+                surface = preview_reservation.surface = acquire_luma_surface(ctx);
 
             if (surface != nullptr)
             {
@@ -3542,7 +3838,8 @@ int main(int argc, char *argv[])
                 ctx, rtsp_frame, surface, proposals, detector.maintained_rois(), results,
                 detector.last_crop_rects(),
                 overlay_fps, overlay_busy_ms, frame, visible_luma,
-                vf.u32Stride[0] * static_cast<CVI_U32>(visible_height));
+                vf.u32Stride[0] * static_cast<CVI_U32>(visible_height), preview_due, record_due, std::move(model_preview));
+            preview_reservation.surface = nullptr; // enqueue handles accepted/rejected ownership
             if (!preview_queued)
             {
                 release_detector_frame(&frame);
@@ -3810,6 +4107,9 @@ int main(int argc, char *argv[])
                         current.pending ? 1 : 0,
                         current.borrowed_frames, current.borrowed_frames_max,
                         current.ownership_errors);
+                if (ctx.preview_width == 640 && ctx.direct_model_input && !ctx.sw_ldc_enabled)
+                    fprintf(stderr, "[preview-model] zero-copy | held %d (limit 1) | dropped %zu total\n",
+                            ctx.model_preview_busy.load() ? 1 : 0, ctx.model_preview_dropped.load());
                 preview_prev = current;
             }
             if (ctx.preview && !ctx.preview_luma)
