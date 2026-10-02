@@ -424,7 +424,7 @@ TailSummary summarize_tail(std::vector<double> samples)
 void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s <cvimodel> [--thres f] [--max n] [--expand f] [--iou f]\n"
+            "Usage: %s <cvimodel> [--thres_heat f] [--thres_mask f] [--max n] [--expand f] [--iou f]\n"
             "       [--decode strict|tolerant] [--debug n] [--save-frame frame.png]\n"
             "       [--save-ldc-pair prefix]\n"
             "       [--save-native-frame frame.png] [--rtsp|--no-rtsp]\n"
@@ -434,6 +434,11 @@ void usage(const char *argv0)
             "       [--adaptive-decode 0|1] [--adaptive-min-roi-area N]\n"
             "       [--retire-frames N]\n"
             "\n"
+            "  --thres_heat f  center-heat probability gate, 0..1 (default 0.30).\n"
+            "  --thres_mask f  final maximum assigned mask-score gate, 0..1 (default 0, disabled).\n"
+            "              Six-channel model only; applied before --max, including mask-only ROIs.\n"
+            "              Does not change mask seed/grow rules or filter historical tracks.\n"
+            "  --max N  ceiling on current proposals; does not fill slots or cap history/retries.\n"
             "  --mirror 1  correct a horizontally mirrored sensor. Mirrored frames decode\n"
             "              ZERO tags (AprilTag markers are chiral) while proposals still\n"
             "              look correct. Applied in VI hardware: no per-frame cost.\n"
@@ -469,16 +474,20 @@ void usage(const char *argv0)
             "  --capture-only  measure VPSS frame delivery only: no model, decoding, RTSP,\n"
             "              capture queue, or image processing. Prints one rate per second.\n"
             "\n"
-            "  Adaptive ROI decoding (experimental; off by default):\n"
-            "  --adaptive-decode 0|1  0: full-resolution decoding (default).\n"
-            "              1: try half-resolution crops from the 640x360 frame for\n"
+            "  Adaptive ROI decoding (enabled by default):\n"
+            "  --merge-crops 0|1  share one decode scan for strongly overlapping crops\n"
+            "              when their bounding union saves at least 10% of pixels (default 1).\n"
+            "              Tracks stay separate. Full and half-size scans are never merged.\n"
+            "              Set 0 to compare with independent crop decoding.\n"
+            "  --adaptive-decode 0|1  0: full-resolution decoding.\n"
+            "              1 (default): try half-resolution crops from the 640x360 frame for\n"
             "              eligible large ROIs. History may defer full scans; known\n"
             "              small tags, fallbacks and periodic audits use full resolution.\n"
             "              Successful tags still get full-resolution corner refinement.\n"
             "  --adaptive-min-roi-area N  full-resolution proposal width * height\n"
-            "              needed to try adaptive decoding (default 40000 pixels).\n"
-            "              Area, not a minimum for each side: 200x200 or 400x100\n"
-            "              both meet 40000. Positive integer; requires --adaptive-decode 1.\n"
+            "              needed to try adaptive decoding (default 10000 pixels).\n"
+            "              Area, not a minimum for each side: 100x100 or 200x50\n"
+            "              both meet 10000. Positive integer; requires --adaptive-decode 1.\n"
             "              This is a provisional gate; tune with recall and timing tests.\n"
             "              Example: run_live.sh --adaptive-decode 1 --adaptive-min-roi-area 3600\n"
             "              Baseline: run_live.sh --adaptive-decode 0\n"
@@ -2845,6 +2854,7 @@ int main(int argc, char *argv[])
     }
 
     const std::string cvimodel_path = argv[1];
+    float mask_thres = 0.f;
     float heatmap_thres = 0.30f, roi_expand = 1.0f, roi_iou_thres = 0.5f;
     int max_proposals = 20, debug_mode = 1;
     unsigned retire_frames = 5;
@@ -2866,8 +2876,9 @@ int main(int argc, char *argv[])
     CVI_U32 max_exposure_us = 0;
     bool direct_compact_input = false;
     bool validate_compact_input = false;
-    bool adaptive_decode = false;
-    int adaptive_min_roi_area = 40000;
+    bool adaptive_decode = true;
+    bool merge_crops = true;
+    int adaptive_min_roi_area = 10000;
     int crop_align = 4;
     std::string ldc_calibration_path;
     std::string ldc_mode = "hw";
@@ -2878,7 +2889,18 @@ int main(int argc, char *argv[])
     {
         std::string flag = argv[i];
         bool has_value = i + 1 < argc;
-        if (flag == "--thres" && has_value) heatmap_thres = std::atof(argv[++i]);
+        if ((flag == "--thres_heat" || flag == "--thres_mask") && has_value)
+        {
+            char *end = nullptr;
+            const char *text = argv[++i];
+            const float value = std::strtof(text, &end);
+            if (end == text || *end || !std::isfinite(value) || value < 0.f || value > 1.f) {
+                fprintf(stderr, "%s must be a number between 0 and 1\n", flag.c_str());
+                return 1;
+            }
+            if (flag == "--thres_heat") heatmap_thres = value;
+            else mask_thres = value;
+        }
         else if (flag == "--max" && has_value) max_proposals = std::atoi(argv[++i]);
         else if (flag == "--expand" && has_value) roi_expand = std::atof(argv[++i]);
         else if (flag == "--iou" && has_value) roi_iou_thres = std::atof(argv[++i]);
@@ -2909,6 +2931,14 @@ int main(int argc, char *argv[])
             direct_compact_input = std::atoi(argv[++i]) != 0;
         else if (flag == "--validate-compact-input" && has_value)
             validate_compact_input = std::atoi(argv[++i]) != 0;
+        else if (flag == "--merge-crops" && has_value)
+        {
+            const std::string value = argv[++i];
+            if (value != "0" && value != "1") {
+                fprintf(stderr, "--merge-crops must be 0 or 1\n"); return 1;
+            }
+            merge_crops = value == "1";
+        }
         else if (flag == "--adaptive-decode" && has_value)
             adaptive_decode = std::atoi(argv[++i]) != 0;
         else if (flag == "--adaptive-min-roi-area" && has_value)
@@ -3002,11 +3032,17 @@ int main(int argc, char *argv[])
 
     // Validate and construct the model before acquiring camera resources. An
     // aligned model selects the optional independent 640x360 VPSS input path.
+    if (!std::isfinite(heatmap_thres) || heatmap_thres < 0.f || heatmap_thres > 1.f ||
+        !std::isfinite(mask_thres) || mask_thres < 0.f || mask_thres > 1.f) {
+        fprintf(stderr, "--thres_heat and --thres_mask must be between 0 and 1\n");
+        return 1;
+    }
     std::unique_ptr<TinyTagDet> detector_storage;
     try
     {
         detector_storage.reset(new TinyTagDet(cvimodel_path, heatmap_thres, max_proposals,
                                               roi_expand, roi_iou_thres, debug_mode));
+        detector_storage->set_mask_threshold(mask_thres);
     }
     catch (const std::exception &e)
     {
@@ -3014,7 +3050,10 @@ int main(int argc, char *argv[])
         return 1;
     }
     TinyTagDet &detector = *detector_storage;
+    fprintf(stderr, "[camera] proposal gates: heat %.3f mask %.3f (0 disables mask gate); current max %d\n",
+            heatmap_thres, mask_thres, max_proposals);
     detector.set_crop_align(crop_align);
+    detector.set_merge_crops(merge_crops);
     detector.set_track_retire_frames(retire_frames);
     fprintf(stderr, "[camera] ROI/tag retirement: %u missed frames\n", detector.track_retire_frames());
     if (detector.crop_align() > 1)
@@ -3304,6 +3343,7 @@ int main(int argc, char *argv[])
         double wait = 0, pair = 0, map = 0, ldc = 0, pre = 0, infer = 0, decode = 0, crop = 0;
         double adaptive_copy = 0;
         AdaptiveDecodeStats adaptive;
+        CropMergeStats merge;
         double release = 0;
         double output = 0;
         double service_cpu = 0;
@@ -3877,6 +3917,13 @@ int main(int argc, char *argv[])
         }
         if (decode)
         {
+            const auto &merge = detector.last_crop_merge_stats();
+            win.merge.input_crops += merge.input_crops;
+            win.merge.output_crops += merge.output_crops;
+            win.merge.input_pixels += merge.input_pixels;
+            win.merge.output_pixels += merge.output_pixels;
+            win.merge.recovery_crops += merge.recovery_crops;
+            win.merge.recovery_pixels += merge.recovery_pixels;
             const TagDecoderProfile &profile = detector.last_decoder_profile();
             win.crop_threshold += profile.threshold_ms;
             win.crop_contour += profile.contour_ms;
@@ -4023,6 +4070,10 @@ int main(int argc, char *argv[])
             }
             if (decode)
             {
+                fprintf(stderr, "[crop-merge] per frame crops %.2f -> %.2f | native pixels %.0f -> %.0f | recovery scans %.2f pixels %.0f\n",
+                        win.merge.input_crops / n, win.merge.output_crops / n,
+                        win.merge.input_pixels / n, win.merge.output_pixels / n,
+                        win.merge.recovery_crops / n, win.merge.recovery_pixels / n);
                 const double profiled = (win.crop_threshold + win.crop_contour + win.crop_quad +
                                          win.crop_marker_decode + win.crop_refine) / n;
                 fprintf(stderr,

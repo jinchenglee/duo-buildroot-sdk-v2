@@ -31,10 +31,12 @@ void usage(const char *argv0)
     printf("  %s <cvimodel> <image> [options]        detect on one image\n", argv0);
     printf("  %s <cvimodel> --selftest <bundle>      verify against golden references\n\n", argv0);
     printf("Options:\n");
-    printf("  --thres <f>       heatmap threshold        (default 0.35)\n");
+    printf("  --thres_heat <f>  center heat threshold    (default 0.30)\n");
+    printf("  --thres_mask <f>  final A+C mask-score gate (default 0, disabled)\n");
     printf("  --max <n>         max proposals            (default 8)\n");
     printf("  --expand <f>      ROI expansion factor     (default 1.5)\n");
     printf("  --iou <f>         ROI IoU suppression      (default 0.5, <=0 disables)\n");
+    printf("  --merge-crops <0|1> merge overlapping decode crops (default 1); 0 for comparison\n");
     printf("  --out <path>      write annotated image    (default tinytag_det.jpg)\n");
     printf("  --bench-json <path> write decoded IDs, centers, scores, and exact corners as JSONL\n");
     printf("  --repeat <n>      inference runs, for timing (default 1)\n");
@@ -240,6 +242,7 @@ int main(int argc, char **argv)
         image_path = argv[2];
     }
 
+    float mask_thres = 0.f;
     float heatmap_thres = 0.30f;
     int max_proposals = 20;
     float roi_expand = 1.5f;
@@ -247,6 +250,7 @@ int main(int argc, char **argv)
     std::string output_path = "tinytag_det.jpg";
     std::string bench_json_path;
     bool decode = false;
+    bool merge_crops = true;
     bool decode_tolerant = false;
     int repeat = 1;
     int warmup = 2;
@@ -257,10 +261,26 @@ int main(int argc, char **argv)
     {
         const std::string flag = argv[i];
         const bool has_value = (i + 1 < argc);
-        if (flag == "--thres" && has_value)       heatmap_thres = std::atof(argv[++i]);
+        if ((flag == "--thres_heat" || flag == "--thres_mask") && has_value)
+        {
+            char *end = nullptr;
+            const char *text = argv[++i];
+            const float value = std::strtof(text, &end);
+            if (end == text || *end || !std::isfinite(value) || value < 0.f || value > 1.f) {
+                fprintf(stderr, "%s must be a number between 0 and 1\n", flag.c_str());
+                return 1;
+            }
+            if (flag == "--thres_heat") heatmap_thres = value;
+            else mask_thres = value;
+        }
         else if (flag == "--max" && has_value)    max_proposals = std::atoi(argv[++i]);
         else if (flag == "--expand" && has_value) roi_expand = std::atof(argv[++i]);
         else if (flag == "--iou" && has_value)    roi_iou_thres = std::atof(argv[++i]);
+        else if (flag == "--merge-crops" && has_value) {
+            const std::string value = argv[++i];
+            if (value != "0" && value != "1") { printf("--merge-crops must be 0 or 1\n"); return 1; }
+            merge_crops = value == "1";
+        }
         else if (flag == "--out" && has_value)    output_path = argv[++i];
         else if (flag == "--bench-json" && has_value) bench_json_path = argv[++i];
         else if (flag == "--repeat" && has_value) repeat = std::atoi(argv[++i]);
@@ -286,6 +306,11 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (!std::isfinite(heatmap_thres) || heatmap_thres < 0.f || heatmap_thres > 1.f ||
+        !std::isfinite(mask_thres) || mask_thres < 0.f || mask_thres > 1.f) {
+        fprintf(stderr, "--thres_heat and --thres_mask must be between 0 and 1\n");
+        return 1;
+    }
     if (repeat < 1)
         repeat = 1;
     if (warmup < 0)
@@ -297,6 +322,8 @@ int main(int argc, char **argv)
         {
             TinyTagDet detector(cvimodel_path, heatmap_thres, max_proposals, roi_expand,
                                 roi_iou_thres, debug_mode);
+            detector.set_merge_crops(merge_crops);
+            detector.set_mask_threshold(mask_thres);
             return run_selftest(detector, selftest_path, repeat, warmup, max_mae);
         }
 
@@ -311,6 +338,8 @@ int main(int argc, char **argv)
 
         TinyTagDet detector(cvimodel_path, heatmap_thres, max_proposals, roi_expand,
                             roi_iou_thres, debug_mode);
+        detector.set_merge_crops(merge_crops);
+        detector.set_mask_threshold(mask_thres);
 
         if (decode)
         {
@@ -349,7 +378,7 @@ int main(int argc, char **argv)
                                     (decode ? detector.last_crop_decode_ms() : 0.0));
         }
 
-        printf("\n%zu proposal(s) at threshold %.2f\n", proposals.size(), heatmap_thres);
+        printf("\n%zu proposal(s) at heat threshold %.2f, mask threshold %.2f\n", proposals.size(), heatmap_thres, mask_thres);
         for (size_t i = 0; i < proposals.size(); ++i)
         {
             const Proposal &p = proposals[i];

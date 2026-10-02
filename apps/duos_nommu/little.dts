@@ -1,0 +1,37 @@
+/dts-v1/;
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    model = "Milk-V Duo S C906L NOMMU scheduler probe";
+    compatible = "milkv,duos-little-probe", "sophgo,sg2000";
+    chosen {
+        bootargs = "earlycon=duos_shmlog keep_bootcon loglevel=8 ignore_loglevel";
+    };
+    memory@9e200000 {
+        device_type = "memory";
+        /* Last 64 KiB is the shared log, outside allocator-owned RAM. */
+        reg = <0 0x9e200000 0 0x01df0000>;
+    };
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        timebase-frequency = <25000000>;
+        cpu0: cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            status = "okay";
+            compatible = "thead,c906", "riscv";
+            riscv,isa = "rv64imac_zicsr_zifencei_zicntr";
+            cpu0_intc: interrupt-controller {
+                #interrupt-cells = <1>;
+                interrupt-controller;
+                compatible = "riscv,cpu-intc";
+            };
+        };
+    };
+    timer@74000000 {
+        compatible = "thead,c900-clint";
+        reg = <0 0x74000000 0 0x10000>;
+        interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+    };
+};

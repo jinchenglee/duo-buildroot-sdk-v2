@@ -44,9 +44,11 @@ and [bare-metal TSV](benchmarks/duo-s-threshold-bare-metal.tsv).
 
 The live binary includes adaptive decoding and exposes
 `--adaptive-min-roi-area N`: a positive full-resolution proposal area in pixels.
-The default remains 40000 (200x200 area); it is a provisional heuristic rather
+At this progress seal, the default was 40000 (200x200 area); it is a provisional heuristic rather
 than a validated recall boundary. The user tested 3600 with two tags present.
-Adaptive decoding itself remains **off by default**. History guards, periodic
+Adaptive decoding itself was **off by default** at this seal. On 2026-10-02,
+the user selected adaptive decoding on by default and an area gate of 10000
+(100x100 area); see the current adaptive ROI rules. History guards, periodic
 full scans, fallbacks and full-resolution corner refinement remain in effect.
 See [adaptive rules and caveats](tinytag-adaptive-roi-rules.md).
 `run_live.sh --help` explicitly describes both switches, their defaults,

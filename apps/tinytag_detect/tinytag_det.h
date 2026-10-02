@@ -53,6 +53,12 @@ struct AdaptiveDecodeStats
     double full_refine_ms = 0.0;
 };
 
+struct CropMergeStats {
+    size_t input_crops = 0, output_crops = 0;
+    size_t input_pixels = 0, output_pixels = 0; // native-area planning, before half-size scaling
+    size_t recovery_crops = 0, recovery_pixels = 0;
+};
+
 // TinyTag proposal detector on the cv181x/SG2000 TPU.
 //
 // The cvimodel is expected to have been built by
@@ -122,6 +128,7 @@ public:
     // -> roi_expand -> clamp -> optional IoU suppression. Proposals come back
     // in the coordinate space of the image passed to pre_process().
     void decode_proposals(cv::Size frame_size, std::vector<Proposal> &proposals);
+    void set_mask_threshold(float threshold);
 
     // Convenience: pre_process + inference + decode_proposals.
     void detect(const cv::Mat &ori_img_gray, std::vector<Proposal> &proposals);
@@ -140,6 +147,8 @@ public:
                              float min_tag_side_px, int min_roi_area_px, unsigned audit_frames);
     bool wants_low_res_frame(const std::vector<Proposal> &proposals) const;
     const AdaptiveDecodeStats &last_adaptive_stats() const { return adaptive_stats_; }
+    void set_merge_crops(bool enabled) { merge_crops_ = enabled; }
+    const CropMergeStats &last_crop_merge_stats() const { return crop_merge_stats_; }
 
     void set_decoder(std::shared_ptr<TagCropDecoder> decoder) { decoder_ = std::move(decoder); }
 
@@ -227,6 +236,7 @@ private:
     int max_proposals_;
     float roi_expand_;
     float roi_iou_thres_;
+    float mask_score_thres_ = 0.f; // optional final A+C score gate, before the top-K cap
     int debug_mode_;
 
     // Scratch reused across frames so a steady-state loop does no allocation.
@@ -247,9 +257,11 @@ private:
     std::shared_ptr<TagCropDecoder> decoder_;
     std::shared_ptr<TagCropDecoder> low_decoder_;
     float adaptive_min_tag_side_px_ = 64.f;
-    int adaptive_min_roi_area_px_ = 40000;
+    int adaptive_min_roi_area_px_ = 10000;
     unsigned adaptive_audit_frames_ = 20;
     AdaptiveDecodeStats adaptive_stats_;
+    bool merge_crops_ = true;
+    CropMergeStats crop_merge_stats_;
 
     // Head geometry. Keep in sync with tools/tinytag_cvimodel/prepare_calibration.py.
     static constexpr int kStride = 8;

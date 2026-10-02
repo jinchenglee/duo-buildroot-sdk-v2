@@ -84,7 +84,7 @@ regardless of scene content. Worst-case frame time is therefore deterministic:
 
 The 11.25 ms measured above was 7 crops, one under the cap.
 
-**`--max` is the latency knob; `--thres` is the recall knob**, and they
+**`--max` is the latency knob; `--thres_heat` is the recall knob**, and they
 interact in only one direction. Once enough peaks clear the threshold to fill
 the cap, lowering the threshold further costs nothing -- it only changes which
 candidates win the top-N slots. On K230, threshold 0.20 yielded ~14

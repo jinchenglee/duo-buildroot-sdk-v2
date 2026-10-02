@@ -446,6 +446,95 @@ No worker extraction, cross-build, OS replacement or benchmark was performed
 for this comparison. The existing 2 MiB FreeRTOS reservation is a current
 layout choice, not evidence that the decoder or another OS will fit.
 
+### Follow-up source audit: 2026-10-01
+
+The completed bare-metal threshold experiment establishes a working C906L
+BLCP2ND/FIP entry path alongside A53 Linux. It also provides a boot-transfer
+structure and mailbox handshake implementation. This reduces the startup work
+for a NOMMU experiment; it does not establish Linux kernel or userspace support.
+
+**Candidate baseline: a separate Linux v6.18 tree with explicit T-Head timer
+fixes.** The opt-in implementation is now cross-built under
+[`apps/duos_nommu`](../apps/duos_nommu/README.md). Hardware boot and userspace
+are not yet verified.
+
+- Audited upstream v6.12 still hardcodes the NOMMU RAM base and uses ordinary
+  memory-mapped CLINT time reads plus RV64 compare writes. Do not assume the
+  April 2024 bring-up series was merged merely because the kernel is newer.
+- Audited v6.18 offers `PHYS_RAM_BASE_FIXED` / `PHYS_RAM_BASE`, NOMMU
+  relocation support and a physical RAM based `PAGE_OFFSET`. That removes the
+  old hardcoded-base obstacle to placing the small kernel in high DDR.
+- Audited v6.18 `timer-clint.c` still has no `thead,c900-clint` initialization,
+  reads MMIO time and uses `writeq_relaxed` for compare. The T-Head binding
+  alone is not evidence of driver support. Adapt the timer patch to the chosen
+  revision, including both the driver clocksource and architecture time-read
+  paths: use the time CSR and safe 32-bit compare accesses. The 2025 v5
+  submission supersedes parts of the original 2024 proposal.
+- Local `freertos/cvitek/arch/riscv64/include/irq.h` already uses the time CSR,
+  with compare low/high at `0x74004000` / `0x74004004`. It defines little-core
+  PLIC at `0x70000000`. Vendor startup expects hart 0; verify this at entry.
+  The 25 MHz timebase used by the successful firmware experiment is distinct
+  from the 700 MHz CPU clock.
+
+First build only the small kernel, a boot shim, minimal DT and a built-in
+scheduler/allocator test. Disable MMU, SMP, vector/FPU use initially, storage,
+networking and media. Use a polled dedicated console or a bounded reserved-DDR
+log; a log backend avoids competing with the A53 console. A scheduled heartbeat
+that sleeps and wakes demonstrates timer/scheduler progress; an early banner
+alone does not. PLIC/UART interrupt support can follow this milestone.
+
+The production map currently reserves only 2 MiB at `0x9fe00000` for FreeRTOS.
+Start with an **experimental 32 MiB reservation**, adjusted after measuring
+kernel image, BSS, allocator and log requirements. This is a planning budget,
+not a measured minimum. One possible layout is a 2 MiB shim/loading region at
+`0x9e000000` and 30 MiB small-kernel RAM at `0x9e200000`; an M-mode Linux Image
+has zero image offset relative to its own RAM base. Final addresses must be
+checked against the actual ELF and all boot reservations before deployment.
+
+The implementation takes the extra 30 MiB from the **upper end of ION**:
+ION shrinks from 170 to 140 MiB at the unchanged base `0x95400000`. A53 Linux
+and U-Boot both see 480 MiB. This preserves existing ISP, bitstream and
+framebuffer addresses and retains the original FSBL/DDR/ATF payloads. The FIP
+tool supplies the new BLCP2ND run address `0x9e000000`. The last 64 KiB at
+`0x9fff0000` holds the shared log, outside the small allocator's RAM.
+
+The separate build includes a rebuilt U-Boot with the new RAM limit and a
+matched main DT/FIT; the compressed main kernel and rootfs are retained.
+A FIP-only replacement against the normal map would be unsafe: old U-Boot
+relocation or main Linux/ION could overwrite the small kernel. Packaging checks
+ELF entries, Image/BSS fit, FIP payload preservation and the main kernel's
+byte identity. Install and restore the matched boot pair together. These
+checks do not replace actual boot verification.
+
+The existing bare-metal handshake responder is a persistent polling service.
+Jumping from that shim into Linux stops the service, so its mere inclusion
+in the shim does not preserve later A53 mailbox requests. Provide the minimal
+responder in the small kernel or disable the dependent main-core services in
+the experimental configuration. Full vendor multimedia services are a later
+port; neither camera continuity nor VENC/RTSP offload follows from kernel boot.
+
+For userspace, local Buildroot can select RISC-V without MMU and a FLAT binary
+format. Its musl support requires MMU; uClibc-ng plus elf2flt is a candidate
+that needs its own build and execution test. The existing RISC-V musl shared
+libraries are not a proven NOMMU userspace. Start with a static compatible
+`/init` testing write, allocation, sleep and syscalls. Test pthreads, TLS and
+floating-point state separately before trying a decoder or RTSP library.
+
+The read-only K230 reference remains useful for shared-memory ownership,
+cache maintenance and message transport. Its core launch command, interrupt
+controllers and addresses are board-specific and cannot be used as the Duo S
+Linux boot port. RPMsg is unnecessary for the first scheduler milestone; use
+it after kernel/userland feasibility is established.
+
+Sources inspected:
+
+- [Original little-core Linux bring-up report](https://lists.openwall.net/linux-kernel/2024/04/10/1021).
+- [Linux v6.18 RISC-V configuration](https://github.com/torvalds/linux/blob/v6.18/arch/riscv/Kconfig),
+  [memory setup](https://github.com/torvalds/linux/blob/v6.18/arch/riscv/mm/init.c),
+  [kernel entry](https://github.com/torvalds/linux/blob/v6.18/arch/riscv/kernel/head.S).
+- [Linux v6.18 CLINT driver](https://github.com/torvalds/linux/blob/v6.18/drivers/clocksource/timer-clint.c)
+  and [T-Head CLINT v5 patch](https://lists.openwall.net/linux-kernel/2025/01/17/912).
+
 ### Proposed minimal C906L NOMMU boot experiment
 
 The prior CV1800B bring-up justifies testing kernel feasibility before
@@ -488,7 +577,19 @@ Acceptance: main Linux remains responsive; repeated cold boots reach the
 chosen milestone; timer/scheduling works; no unexpected traps or memory
 overlap occurs. Record actual image/BSS/reserved/used RAM and console logs.
 Keep the original matched FIP/main-kernel/DT boot set available for recovery.
-No experimental firmware has been built, installed or booted yet.
+The isolated kernel-only probe is built and packaged; its hardware boot has
+not yet been verified. The separate bare-metal threshold diagnostic has been
+built and tested. Build, installation, log retrieval and recovery instructions
+are in [`apps/duos_nommu/README.md`](../apps/duos_nommu/README.md).
+
+The intended later interface ownership is wired Ethernet on the small core,
+with Wi-Fi and USB Ethernet retained on the main core. The experimental main
+DT disables wired Ethernet; the small kernel has no network driver yet.
+After scheduler verification, audit little-core PLIC routing, MAC/DMA/PHY
+drivers, cache maintenance, dedicated buffers and clock/reset/pin ownership.
+Carry over the PHY sleepable-wait fix where applicable. Neither OS may
+independently manage the same MAC or PHY. This is a later milestone, not a
+network capability of the initial probe.
 
 Therefore ordinary dual Linux and an ordinary MMU Linux SMP kernel spanning
 C906B+C906L are not viable solutions on this documented hardware. A53+C906L

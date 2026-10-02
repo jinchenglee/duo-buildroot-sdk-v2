@@ -6,7 +6,8 @@ set -eu
 
 MODEL="${TINYTAG_LIVE_MODEL:-/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel}"
 BIN="${TINYTAG_LIVE_BIN:-/app/tinytag_detect/tinytag_detect_live}"
-THRES="${TINYTAG_LIVE_THRES:-0.30}"
+THRES_HEAT="${TINYTAG_LIVE_THRES_HEAT:-0.30}"
+THRES_MASK="${TINYTAG_LIVE_THRES_MASK:-0}"
 MAX="${TINYTAG_LIVE_MAX:-20}"
 EXPAND="${TINYTAG_LIVE_EXPAND:-1.0}"
 IOU="${TINYTAG_LIVE_IOU:-0.5}"
@@ -62,7 +63,8 @@ case ":${LD_LIBRARY_PATH:-}:" in
 esac
 
 exec "${BIN}" "${MODEL}" \
-    --thres "${THRES}" \
+    --thres_heat "${THRES_HEAT}" \
+    --thres_mask "${THRES_MASK}" \
     --max "${MAX}" \
     --expand "${EXPAND}" \
     --iou "${IOU}" \

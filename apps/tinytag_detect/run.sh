@@ -11,7 +11,7 @@
 # Any of the defaults can be overridden from the environment, and any extra
 # arguments are passed straight through to the binary:
 #
-#   TINYTAG_THRES=0.20 run_tinytag.sh frame.jpg
+#   TINYTAG_THRES_HEAT=0.20 run_tinytag.sh frame.jpg
 #   TINYTAG_DECODE= run_tinytag.sh frame.jpg          # disable stage two
 #   run_tinytag.sh frame.jpg --repeat 20
 set -eu
@@ -20,7 +20,8 @@ set -eu
 # Current coverage-mask decoder operating point: heat threshold 0.30 and a
 # 20-box cap. Seed/grow/margin defaults are implemented in TinyTagDet.
 TINYTAG_MODEL="${TINYTAG_MODEL:-/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel}"
-TINYTAG_THRES="${TINYTAG_THRES:-0.30}"
+TINYTAG_THRES_HEAT="${TINYTAG_THRES_HEAT:-0.30}"
+TINYTAG_THRES_MASK="${TINYTAG_THRES_MASK:-0}"
 TINYTAG_MAX="${TINYTAG_MAX:-20}"
 TINYTAG_EXPAND="${TINYTAG_EXPAND:-1.0}"
 TINYTAG_IOU="${TINYTAG_IOU:-0.5}"
@@ -55,7 +56,8 @@ plus inference timing. Exits non-zero if any gate fails.
 Environment overrides (current values shown):
   TINYTAG_IMAGE   ${TINYTAG_IMAGE}
   TINYTAG_MODEL   ${TINYTAG_MODEL}
-  TINYTAG_THRES   ${TINYTAG_THRES}
+  TINYTAG_THRES_HEAT   ${TINYTAG_THRES_HEAT}
+  TINYTAG_THRES_MASK   ${TINYTAG_THRES_MASK}
   TINYTAG_MAX     ${TINYTAG_MAX}
   TINYTAG_EXPAND  ${TINYTAG_EXPAND}
   TINYTAG_IOU     ${TINYTAG_IOU}
@@ -119,7 +121,8 @@ fi
 exec "${TINYTAG_BIN}" \
     "${TINYTAG_MODEL}" \
     "${image}" \
-    --thres "${TINYTAG_THRES}" \
+    --thres_heat "${TINYTAG_THRES_HEAT}" \
+    --thres_mask "${TINYTAG_THRES_MASK}" \
     --max "${TINYTAG_MAX}" \
     --expand "${TINYTAG_EXPAND}" \
     --iou "${TINYTAG_IOU}" \

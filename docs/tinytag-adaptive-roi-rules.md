@@ -1,12 +1,45 @@
 # TinyTag adaptive ROI decode rules
 
-This is the decision record for the experimental `--adaptive-decode 1` path.
-It is **off by default**: `--adaptive-decode 0` sends accepted ROIs to the
+This is the decision record for the `--adaptive-decode 1` path.
+It is **on by default**, with `--adaptive-min-roi-area 10000` (100×100 area),
+as requested on 2026-10-02. `--adaptive-decode 0` sends accepted ROIs to the
 full-resolution crop decoder. Both modes use the same 640×360 proposal network
 and 1280×720 camera frame. The optional adaptive path can avoid a
 **full-resolution decode** for a large ROI by trying its half-size crop first
 and deferring some full-resolution scans. It does not avoid the network pass or
 all crop decoding.
+
+## Sharing overlapping execution crops
+
+`--merge-crops 1` is enabled by default and is independent of whether adaptive
+decoding is enabled. After history matching, alignment and resolution selection,
+the execution planner combines strongly overlapping crops of the **same
+resolution policy**. It requires overlap of at least 50% of the smaller crop
+and a bounding union at least 10% cheaper in planned pixels than separate scans.
+These are initial heuristics, not empirically tuned latency thresholds.
+Repeated merges must continue to meet the area-saving condition. No original
+crop coverage is discarded; separate blob IDs and blue debug boxes remain.
+
+One shared scan can return several tags. Results retain an original member ROI
+and are associated by tag coverage, previous ownership and proposal confidence.
+Each member's audit clock is updated separately; known-tag checks inspect all
+group members. Full/audit crops are not merged with half-size crops. A missing
+recently tracked tag (at most one missed frame) after a merged full scan triggers
+an original-crop recovery scan. This avoids an unconditional second scan; it
+does not prove unchanged recall for new tags because crop-border thresholding
+can change. Existing full-resolution corner refinement and point LDC remain.
+
+`[crop-merge]` reports planned input/output scan counts and native pixel areas
+plus extra recovery scans/pixels. Native areas precede half-size scaling and
+exclude recovery work; use actual decoder pixels and timings for net savings.
+`--merge-crops 0` restores independent execution crops for comparison. Pink
+debug boxes represent executed windows; blue boxes remain individual tracks.
+
+Validation so far: deterministic overlap/containment/area-inflation cases and
+10,000 randomized crop-coverage/policy cases passed; still-image and live ARM64
+binaries cross-built. Board was removed, so no hardware throughput, latency
+or tag-recall improvement is claimed. Future tests should include nearby cube
+faces, partial occlusion, entering/new tags, small tags and audit transitions.
 
 ## Why route by history
 
@@ -22,7 +55,7 @@ history when available. A proposal with no history remains uncertain.
 1. Keep the full-resolution decoder for small ROIs and for a tracked tag whose
    shortest observed side is below 64 full-resolution pixels.
 2. For an eligible large ROI (at least `--adaptive-min-roi-area N`
-   full-resolution pixels, default 40,000), try
+   full-resolution pixels, default 10,000), try
    ArUco on the corresponding 640×360 crop first. This includes **large new
    blobs with no decoded tag**. An empty low-resolution result does not
    immediately trigger an expensive full-resolution decode.
@@ -47,9 +80,9 @@ latency tradeoff to evaluate before making the feature the default.
 
 ## Choosing the ROI-size gate
 
-The current 40,000-full-resolution-pixel **area** gate is a convenient starting
-value, equivalent to a 200×200-pixel box but also met by other shapes such as
-400×100. It is not a calibrated optimum. Careful tests of recall, first-detection
+The current 10,000-full-resolution-pixel **area** gate is a convenient starting
+value, equivalent to a 100×100-pixel box but also met by other shapes such as
+200×50. It is not a calibrated optimum. Careful tests of recall, first-detection
 delay, corner quality, and processing time must determine the real threshold.
 Lowering it makes more ROIs eligible, including new blobs whose tags may be
 too small to decode at half size. The 64-pixel known-tag rule protects tracked
@@ -94,8 +127,8 @@ record `[adaptive]` low attempts/hits, same-frame fallbacks, full audits,
 deferred passes, and low/full pixels and time. Include scenes with empty large
 blobs, a large tag, a small tag inside a large blob, multiple tags sharing a
 blob, and tags entering or leaving. Favor recall and corner quality over a
-small mean-time gain. Keep the switch off by default until board data supports
-the change.
+small mean-time gain. The current default is enabled by user choice; this
+does not establish a measured recall guarantee for the 10,000-pixel gate.
 
 On the board, `/app/tinytag_detect/run_adaptive_bench.sh` performs the
 alternating runs and writes `windows.tsv` plus full logs under `/tmp`.
@@ -161,3 +194,15 @@ were about 1.31–1.32. These aggregates cannot establish per-frame recall;
 the application currently has no per-frame tag-result export. The adaptive
 route mostly deferred empty large blobs. A full-rate replay and a per-frame
 tag comparison are needed before enabling this by default.
+
+## Heat and mask threshold controls (2026-10-02)
+
+`--thres_heat` (default 0.30) replaces the removed `--thres` option.
+`--thres_mask` (default 0, disabled) optionally rejects current six-channel
+proposals whose reported maximum assigned mask score is below the gate, before
+`--max`. Fixed mask seed/grow thresholds and mask-only fallback generation stay
+in place. History is not filtered by the current-frame mask gate; unmatched
+known tracks may receive full-resolution recovery even when their neural ROI
+was filtered. This can offset the saving from fewer new proposals. Measure
+new-tag recall and first-detection delay as well as total scanned pixels and
+crop latency. The default disabled mask gate preserves prior proposal behavior.

@@ -27,12 +27,66 @@ summarizes the bare-metal comparison, Ethernet PHY diagnosis/fix and image
 verification. The [worker diagnosis](../../docs/duo-s-ethernet-phy-diagnosis.md) preserves the
 before/after evidence and kernel installation/recovery steps.
 
-The experimental adaptive ROI decode path and its A/B acceptance rules are in
+Threshold controls are separate:
+
+- `--thres_heat f`: center-heat probability gate (default 0.30).
+- `--thres_mask f`: optional final proposal mask-score gate (default 0,
+  disabled), supported by six-channel coverage+ROI models. It filters the
+  maximum assigned mask score before sorting and applying `--max`, including
+  mask-only fallback proposals. It does not alter seed/grow thresholds (0.4/0.3).
+- `--max N` caps current proposals and never fills unused slots. Historical
+  blue boxes and recovery scans can exceed that count; the new mask gate does
+  not remove maintained tracks. Their recoveries can use full resolution.
+
+`--thres` has been removed; use the explicit names above. Live environment
+variables are `TINYTAG_LIVE_THRES_HEAT` and `TINYTAG_LIVE_THRES_MASK`; still-image
+variables are `TINYTAG_THRES_HEAT` and `TINYTAG_THRES_MASK`. The old environment
+names are not used. Extra command-line arguments override launcher defaults.
+A higher mask gate may suppress real tags or cause more history recovery;
+compare recall, first-detection delay and total decode time when tuning it.
+
+```sh
+./run_live.sh --rtsp-luma --thres_heat 0.5 --thres_mask 0.5 --max 6
+```
+
+Overlapping decode crops now share a scan by default (`--merge-crops 1`).
+This applies to both ordinary and adaptive decoding, independently of legacy
+proposal IoU suppression (which the A+C model bypasses). Blue maintained blob
+boxes keep their individual tracking state; pink boxes show the actual decoder
+windows, including any recovery scans.
+
+The execution planner merges same-resolution crops when at least half of the
+smaller crop overlaps and the bounding union saves at least 10% of their summed
+pixel area. It retains all original crop coverage, decodes multiple tags in
+one invocation, and assigns results back to original member ROIs. Full scans
+and half-size scans remain separate so audits are preserved. If a merged full
+scan misses a recently tracked tag, its original crop is retried. Merging can
+change thresholding at crop boundaries; new-tag recall still needs board tests.
+
+`[crop-merge]` reports per-frame input/output scan counts and native pixel areas
+before half-size scaling, plus additional recovery scans/pixels. Use actual
+`[crop-profile]` pixels and crop/service timing to judge the net benefit:
+
+```sh
+./run_live.sh --rtsp-luma --merge-crops 1
+./run_live.sh --rtsp-luma --merge-crops 0  # independent-crop comparison
+```
+
+Host coverage/policy tests and both ARM64 binaries are built successfully;
+hardware latency, throughput and recall measurements are pending. The host
+test can be run without the TPU/OpenCV SDK:
+
+```sh
+g++ -std=c++11 -O2 apps/tinytag_detect/tests/crop_merge_test.cc -o /tmp/crop_merge_test
+/tmp/crop_merge_test
+```
+
+The adaptive ROI decode path and its A/B acceptance rules are in
 [`docs/tinytag-adaptive-roi-rules.md`](../../docs/tinytag-adaptive-roi-rules.md).
-Enable it with `--adaptive-decode 1`; the default remains the full-resolution
-decoder (`--adaptive-decode 0`). For large ROIs, adaptive mode tries a half-size
-crop first and can defer some full-resolution scans. Its 40,000-pixel ROI-area
-gate (the area of a 200×200 box) is provisional; recall and timing tests are
+It is enabled by default (`--adaptive-decode 1`); use `--adaptive-decode 0`
+for full-resolution decoding. For large ROIs, adaptive mode tries a half-size
+crop first and can defer some full-resolution scans. Its 10,000-pixel ROI-area
+gate (the area of a 100×100 box) is provisional; recall and timing tests are
 needed to choose a threshold. Set `--adaptive-min-roi-area N` to try a different
 positive integer area in **full-resolution pixels**, for example
 `--adaptive-decode 1 --adaptive-min-roi-area 22500` for the area of a 150×150
@@ -501,7 +555,8 @@ the environment:
 | variable | default | meaning |
 |---|---|---|
 | `TINYTAG_MODEL` | `/app/tinytag_detect/cvimodel/tinytag_v7_synthetic_area_cost.int8.cvimodel` | cvimodel to load |
-| `TINYTAG_THRES` | `0.30` | ROI heat threshold |
+| `TINYTAG_THRES_HEAT` | `0.30` | ROI center heat threshold |
+| `TINYTAG_THRES_MASK` | `0` | Optional final A+C mask-score gate; 0 disables |
 | `TINYTAG_MAX` | `20` | max proposals per frame |
 | `TINYTAG_EXPAND` | `1.0` | legacy model ROI expansion; unused by A+C |
 | `TINYTAG_IOU` | `0.5` | legacy model ROI IoU suppression; unused by A+C |
@@ -514,7 +569,7 @@ the environment:
 | `TINYTAG_DECODE` | `strict` | `strict` or `tolerant`; empty disables stage two |
 
 ```sh
-TINYTAG_THRES=0.20 run_tinytag.sh frame.jpg      # higher recall, ~2x proposals
+TINYTAG_THRES_HEAT=0.20 run_tinytag.sh frame.jpg      # higher recall, ~2x proposals
 run_tinytag.sh frame.jpg --repeat 20             # extra args pass through
 ```
 
@@ -522,7 +577,7 @@ run_tinytag.sh frame.jpg --repeat 20             # extra args pass through
 `0.20`, for only a slight drop in recall.
 
 With `--decode` on, note that `TINYTAG_MAX` is the **latency** knob and
-`TINYTAG_THRES` the **recall** knob. `decode_proposals` truncates to
+`TINYTAG_THRES_HEAT` the **recall** knob. `decode_proposals` truncates to
 `max_proposals` before IoU suppression, so the number of crops the decoder sees
 is capped regardless of scene, and worst-case frame time is
 `4.74 ms + N x 0.93 ms`. Once enough peaks clear the threshold to fill the cap,
@@ -532,7 +587,7 @@ the top-N slots. See `docs/duo-s-performance-findings.md` for the table.
 Or call the binary directly:
 
 ```
-tinytag_detect <cvimodel> <image_file> [--thres f] [--max n] [--expand f] [--iou f]
+tinytag_detect <cvimodel> <image_file> [--thres_heat f] [--thres_mask f] [--max n] [--expand f] [--iou f]
                                   [--decode [strict|tolerant]]
                                   [--out path] [--repeat n] [--warmup n] [--debug 0|1|2]
 tinytag_detect <cvimodel> --selftest <bundle> [--repeat n] [--warmup n] [--max-mae f]
@@ -568,7 +623,7 @@ box decode) and `crop_decode` (the per-ROI CV tag decode).
 
 `per-ROI decode` divides `crop_decode` by the number of crops, which is the
 figure that scales with proposal count — so it is what a higher or lower
-`--thres` trades against. See "Measured on hardware" below.
+`--thres_heat` trades against. See "Measured on hardware" below.
 
 ## Self-test against golden references
 

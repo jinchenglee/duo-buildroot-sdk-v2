@@ -1,4 +1,5 @@
 #include "tinytag_det.h"
+#include "crop_merge.h"
 
 #include <opencv2/imgproc.hpp>
 
@@ -256,6 +257,15 @@ void TinyTagDet::inference()
     inference_ms_ = now_ms() - started;
 }
 
+void TinyTagDet::set_mask_threshold(float threshold)
+{
+    if (!std::isfinite(threshold) || threshold < 0.f || threshold > 1.f)
+        throw std::invalid_argument("--thres_mask must be between 0 and 1");
+    if (threshold > 0.f && output_c_ != 6)
+        throw std::invalid_argument("--thres_mask requires a six-channel coverage+ROI model");
+    mask_score_thres_ = threshold;
+}
+
 void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &proposals)
 {
     const double started = now_ms();
@@ -453,6 +463,12 @@ void TinyTagDet::decode_proposals(cv::Size frame_size, std::vector<Proposal> &pr
                 decoded.push_back({score,cv::Rect2f(x0,y0,x1-x0,y1-y0)});
             }
         }
+        // This gate uses the reported maximum assigned mask score. It does
+        // not change mask segmentation thresholds or discard historical tracks.
+        if (mask_score_thres_ > 0.f)
+            decoded.erase(std::remove_if(decoded.begin(), decoded.end(), [this](const Proposal &p) {
+                return p.confidence < mask_score_thres_;
+            }), decoded.end());
         std::sort(decoded.begin(), decoded.end(), [](const Proposal &a,const Proposal &b){return a.confidence>b.confidence;});
         if (max_proposals_ > 0 && decoded.size() > static_cast<size_t>(max_proposals_)) decoded.resize(max_proposals_);
 
@@ -770,6 +786,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     crop_count_ = 0;
     decoder_profile_ = TagDecoderProfile{};
     adaptive_stats_ = AdaptiveDecodeStats{};
+    crop_merge_stats_ = CropMergeStats{};
 
     crop_rects_.clear();
 
@@ -853,6 +870,8 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
     }
     for (auto &track : blob_tracks_) track.tag_ids.clear();
 
+    std::vector<DecodeCrop> planned_crops;
+    std::vector<cv::Rect> member_rects(active_proposals.size());
     for (size_t proposal_index = 0; proposal_index < active_proposals.size(); ++proposal_index)
     {
         const auto &proposal = active_proposals[proposal_index];
@@ -893,7 +912,24 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
 
         // Zero-copy view; the decoder respects .step so no clone is needed.
         const cv::Rect crop_rect(ax0, y0, ax1 - ax0, y1 - y0);
+        member_rects[proposal_index] = crop_rect;
+        planned_crops.push_back(DecodeCrop{ax0, y0, ax1-ax0, y1-y0,
+                                           low_ready[proposal_index], {proposal_index}});
+        ++crop_merge_stats_.input_crops;
+        crop_merge_stats_.input_pixels += crop_rect.area();
+    }
+    const auto execution_crops = merge_decode_crops(std::move(planned_crops), merge_crops_);
+    for (const auto &job : execution_crops)
+    {
+        const cv::Rect crop_rect(job.x, job.y, job.width, job.height);
         const cv::Mat crop = full_res_gray(crop_rect);
+        ++crop_merge_stats_.output_crops;
+        crop_merge_stats_.output_pixels += crop_rect.area();
+        const auto owns_blob = [&](uint32_t id) {
+            return std::any_of(job.members.begin(), job.members.end(), [&](size_t i) {
+                return active_blob_ids[i] == id;
+            });
+        };
         crop_rects_.push_back(crop_rect);
         ++crop_count_;
 
@@ -916,9 +952,9 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             decoder_profile_.point_samples += profile.point_samples;
         };
         std::vector<TagDetection> tags;
-        bool full_decoded = !low_ready[proposal_index];
+        bool full_decoded = !job.low;
         bool low_success = false;
-        if (low_ready[proposal_index])
+        if (job.low)
         {
             const cv::Rect low_rect(crop_rect.x / 2, crop_rect.y / 2,
                                     (crop_rect.x + crop_rect.width + 1) / 2 - crop_rect.x / 2,
@@ -958,7 +994,7 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             for (const auto &entry : tag_tracks_)
             {
                 const TagTrack &known = entry.second;
-                if (known.blob_id != active_blob_ids[proposal_index] || known.missed > 1)
+                if (!owns_blob(known.blob_id) || known.missed > 1)
                     continue;
                 if (std::none_of(tags.begin(), tags.end(), [&entry](const TagDetection &tag) {
                         return tag.id == entry.first;
@@ -979,8 +1015,8 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         }
         if (full_decoded)
         {
-            if (!low_ready[proposal_index] && low_decoder_ &&
-                proposal.roi.width * proposal.roi.height >= adaptive_min_roi_area_px_)
+            if (!job.low && low_decoder_ && std::any_of(job.members.begin(), job.members.end(),
+                [&](size_t i) { return active_proposals[i].roi.area() >= adaptive_min_roi_area_px_; }))
                 ++adaptive_stats_.full_audits;
             const auto full_started = now_ms();
             tags = decoder_->detect(crop);
@@ -988,31 +1024,93 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
             adaptive_stats_.full_pixels += crop.total();
             add_profile(decoder_->last_profile());
         }
+        if (full_decoded && job.members.size() > 1)
+        {
+            // A changed crop border can change adaptive thresholding. Recover
+            // a recently tracked tag from its original crop if the union scan
+            // misses it. New/untracked tags still require recall comparison.
+            for (size_t i : job.members)
+            {
+                bool missing = false;
+                for (const auto &entry : tag_tracks_)
+                    if (entry.second.blob_id == active_blob_ids[i] && entry.second.missed <= 1 &&
+                        std::none_of(tags.begin(), tags.end(), [&](const TagDetection &tag) {
+                            return tag.id == entry.first;
+                        })) missing = true;
+                if (!missing) continue;
+                const cv::Rect &original = member_rects[i];
+                const auto recovery_started = now_ms();
+                auto recovered = decoder_->detect(full_res_gray(original));
+                adaptive_stats_.full_ms += now_ms() - recovery_started;
+                adaptive_stats_.full_pixels += original.area();
+                add_profile(decoder_->last_profile());
+                ++crop_merge_stats_.recovery_crops;
+                crop_merge_stats_.recovery_pixels += original.area();
+                ++crop_count_;
+                crop_rects_.push_back(original);
+                const cv::Point2f offset(original.x-crop_rect.x, original.y-crop_rect.y);
+                for (auto &tag : recovered) {
+                    tag.center += offset;
+                    for (auto &point : tag.corners) point += offset;
+                    tags.push_back(tag); // final deduplication removes repeated detections
+                }
+            }
+        }
         for (auto &blob : blob_tracks_)
         {
-            if (blob.id != active_blob_ids[proposal_index]) continue;
+            if (!owns_blob(blob.id)) continue;
+            const auto member = std::find_if(job.members.begin(), job.members.end(),
+                [&](size_t i) { return active_blob_ids[i] == blob.id; });
+            const cv::Rect &member_rect = member_rects[*member];
+            const bool member_hit = std::any_of(tags.begin(), tags.end(), [&](const TagDetection &tag) {
+                return member_rect.contains(cv::Point(static_cast<int>(tag.center.x + crop_rect.x),
+                                                      static_cast<int>(tag.center.y + crop_rect.y)));
+            });
             if (full_decoded)
             {
                 blob.frames_since_full_decode = 0;
-                blob.next_full_after = tags.empty()
+                blob.next_full_after = !member_hit
                     ? std::min(32u, std::max(4u, blob.next_full_after * 2u))
                     : adaptive_audit_frames_;
             }
             else
             {
                 ++blob.frames_since_full_decode;
-                if (low_success)
+                if (low_success && member_hit)
                     blob.next_full_after = adaptive_audit_frames_;
             }
-            break;
         }
 
         for (const auto &tag : tags)
         {
             TinyTagResult result{};
             result.id = tag.id;
-            result.proposal_confidence = proposal.confidence;
-            result.roi = proposal.roi;
+            // Report an original member ROI, never the execution union. Prefer
+            // the best tag coverage, then its previous owner, then confidence.
+            size_t owner = job.members.front();
+            float best_coverage = -1.f;
+            bool best_previous = false;
+            const auto previous = tag_tracks_.find(tag.id);
+            float left = tag.corners[0].x + crop_rect.x, right = left;
+            float top = tag.corners[0].y + crop_rect.y, bottom = top;
+            for (const auto &point : tag.corners) {
+                left = std::min(left, point.x + crop_rect.x); right = std::max(right, point.x + crop_rect.x);
+                top = std::min(top, point.y + crop_rect.y); bottom = std::max(bottom, point.y + crop_rect.y);
+            }
+            const cv::Rect2f tag_box(left, top, right-left, bottom-top);
+            for (size_t i : job.members) {
+                const cv::Rect2f &roi = active_proposals[i].roi;
+                const float coverage = (roi & tag_box).area() / std::max(1.f, tag_box.area());
+                const bool was_owner = previous != tag_tracks_.end() && coverage > 0.f &&
+                                       previous->second.blob_id == active_blob_ids[i];
+                if (coverage > best_coverage || (coverage == best_coverage &&
+                    (was_owner > best_previous || (was_owner == best_previous &&
+                     active_proposals[i].confidence > active_proposals[owner].confidence)))) {
+                    owner = i; best_coverage = coverage; best_previous = was_owner;
+                }
+            }
+            result.proposal_confidence = active_proposals[owner].confidence;
+            result.roi = active_proposals[owner].roi;
             const cv::Point2f origin(static_cast<float>(crop_rect.x),
                                      static_cast<float>(crop_rect.y));
             result.center = tag.center + origin;
@@ -1025,9 +1123,12 @@ void TinyTagDet::post_process(const cv::Mat &full_res_gray,
         }
     }
 
-    // Two proposals can overlap the same physical tag, so the same id decodes
-    // twice. Proposals arrive in descending confidence order, so keeping the
-    // first occurrence keeps the one backed by the stronger proposal.
+    // Separate execution groups may still find the same physical tag. Union
+    // scans can return tags belonging to differently scored proposals, so
+    // restore confidence order before retaining the strongest duplicate.
+    std::stable_sort(results.begin(), results.end(), [](const TinyTagResult &a, const TinyTagResult &b) {
+        return a.proposal_confidence > b.proposal_confidence;
+    });
     std::vector<TinyTagResult> deduped;
     deduped.reserve(results.size());
     for (const auto &candidate : results)
