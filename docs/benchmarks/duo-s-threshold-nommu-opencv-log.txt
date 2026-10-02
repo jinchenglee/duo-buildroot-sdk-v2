@@ -1,0 +1,499 @@
+stage=3 hart=0 heartbeat=382 ticks=10017272775 trap=0 pc=0 value=0
+duos-nommu shim: M-mode entry, preserving ARM64 boot transfer
+duos-nommu shim: entering Linux Image at 0x9e200000
+[    0.000000] Linux version 6.18.0 (root@c885aa27d686) (riscv64-unknown-linux-gnu-gcc (Xuantie-900 linux-5.10.4 glibc gcc Toolchain V2.6.1 B-20220906) 10.2.0, GNU ld (GNU Binutils) 2.35) #16 Sat Oct  3 06:20:04 CST 2026
+[    0.000000] Machine model: Milk-V Duo S C906L NOMMU scheduler probe
+[    0.000000] earlycon: duos_shmlog0 at I/O port 0x0 (options '')
+[    0.000000] printk: legacy bootconsole [duos_shmlog0] enabled
+[    0.000000] printk: debug: skip boot console de-registration.
+[    0.000000] printk: debug: ignoring loglevel setting.
+[    0.000000] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+[    0.000000] Zone ranges:
+[    0.000000]   DMA32    [mem 0x000000009e200000-0x000000009ffdffff]
+[    0.000000]   Normal   empty
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x000000009e200000-0x000000009ffdffff]
+[    0.000000] Initmem setup node 0 [mem 0x000000009e200000-0x000000009ffdffff]
+[    0.000000] On node 0, zone DMA32: 32 pages in unavailable ranges
+[    0.000000] riscv: base ISA extensions 
+[    0.000000] riscv: ELF capabilities 
+[    0.000000] Ticket spinlock: enabled
+[    0.000000] pcpu-alloc: s0 r0 d32768 u32768 alloc=1*32768
+[    0.000000] pcpu-alloc: [0] 0 
+[    0.000000] Kernel command line: earlycon=duos_shmlog keep_bootcon loglevel=8 ignore_loglevel printk.devkmsg=on
+[    0.000000] printk: log buffer data + meta data: 65536 + 229376 = 294912 bytes
+[    0.000000] Dentry cache hash table entries: 4096 (order: 3, 32768 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 7648
+[    0.000000] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] riscv-intc: 64 local interrupts mapped
+[    0.000000] clint: timer@74000000: timer running at 25000000 Hz
+[    0.000000] clocksource: clint_clocksource: mask: 0xffffffffffffffff max_cycles: 0x5c40939b5, max_idle_ns: 440795202646 ns
+[    0.000003] sched_clock: 64 bits at 25MHz, resolution 40ns, wraps every 4398046511100ns
+[    0.000149] Calibrating delay loop (skipped), value calculated using timer frequency.. 50.00 BogoMIPS (lpj=250000)
+[    0.000239] pid_max: default: 32768 minimum: 301
+[    0.000516] Mount-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000593] Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.003237] Memory: 26256K/30592K available (743K kernel code, 322K rwdata, 147K rodata, 2069K init, 102K bss, 3992K reserved, 0K cma-reserved)
+[    0.003731] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+[    0.060268] cpu0: Ratio of byte access time to unaligned word access is 4.32, unaligned accesses are fast
+[    0.061213] clocksource: Switched to clocksource clint_clocksource
+[    0.070354] workingset: timestamp_bits=62 max_order=13 bucket_order=0
+[    0.070850] duos-nommu: kernel-only scheduler probe; no userspace or devices
+[    0.071635] duos-nommu: heartbeat=1 allocation=OK time=111031831
+[    0.071876] clk: Disabling unused clocks
+[    0.073737] Warning: unable to open an initial console.
+[    0.076075] Freeing unused kernel image (initmem) memory: 2068K
+[    0.076135] This architecture does not have kernel memory protection.
+[    0.076181] Run /init as init process
+[    0.076223]   with arguments:
+[    0.076258]     /init
+[    0.076295]   with environment:
+[    0.076331]     HOME=/
+[    0.076369]     TERM=linux
+[    0.080338] duos-opencv: begin OpenCV=4.12.0 RV64IMAC LP64 local buffers
+[    0.080419] duos-opencv: scalar fixed-point shift=23 (OpenCV 4.12)
+[    0.128852] duos-opencv: validation progress cases=210 size=1x1
+[    0.198562] duos-opencv: validation progress cases=420 size=1x19
+[    0.252112] duos-opencv: validation progress cases=630 size=19x1
+[    0.319294] duos-opencv: validation progress cases=840 size=2x3
+[    0.397073] duos-opencv: validation progress cases=1050 size=7x9
+[    0.519367] duos-opencv: validation progress cases=1260 size=31x17
+[    1.121297] duos-nommu: heartbeat=2 allocation=OK time=137273377
+[    2.161296] duos-nommu: heartbeat=3 allocation=OK time=163273344
+[    2.761368] duos-opencv: validation progress cases=1470 size=201x99
+[    3.201290] duos-nommu: heartbeat=4 allocation=OK time=189273193
+[    4.241316] duos-nommu: heartbeat=5 allocation=OK time=215273861
+[    5.281316] duos-nommu: heartbeat=6 allocation=OK time=241273852
+[    6.321329] duos-nommu: heartbeat=7 allocation=OK time=267274161
+[    7.361316] duos-nommu: heartbeat=8 allocation=OK time=293273839
+[    8.401309] duos-nommu: heartbeat=9 allocation=OK time=319273678
+[    9.441324] duos-nommu: heartbeat=10 allocation=OK time=345274060
+[   10.481308] duos-nommu: heartbeat=11 allocation=OK time=371273648
+[   11.521307] duos-nommu: heartbeat=12 allocation=OK time=397273613
+[   12.561302] duos-nommu: heartbeat=13 allocation=OK time=423273505
+[   13.601292] duos-nommu: heartbeat=14 allocation=OK time=449273235
+[   14.641296] duos-nommu: heartbeat=15 allocation=OK time=475273347
+[   15.681291] duos-nommu: heartbeat=16 allocation=OK time=501273216
+[   16.721290] duos-nommu: heartbeat=17 allocation=OK time=527273207
+[   17.761291] duos-nommu: heartbeat=18 allocation=OK time=553273228
+[   18.801291] duos-nommu: heartbeat=19 allocation=OK time=579273209
+[   19.841296] duos-nommu: heartbeat=20 allocation=OK time=605273338
+[   20.881326] duos-nommu: heartbeat=21 allocation=OK time=631274105
+[   21.921319] duos-nommu: heartbeat=22 allocation=OK time=657273926
+[   22.961332] duos-nommu: heartbeat=23 allocation=OK time=683274235
+[   24.001321] duos-nommu: heartbeat=24 allocation=OK time=709273977
+[   25.041320] duos-nommu: heartbeat=25 allocation=OK time=735273938
+[   26.081321] duos-nommu: heartbeat=26 allocation=OK time=761273961
+[   27.121303] duos-nommu: heartbeat=27 allocation=OK time=787273517
+[   27.401693] duos-opencv: validation progress cases=1680 size=640x360
+[   28.171303] duos-nommu: heartbeat=28 allocation=OK time=813523524
+[   29.201291] duos-nommu: heartbeat=29 allocation=OK time=839273233
+[   30.241296] duos-nommu: heartbeat=30 allocation=OK time=865273351
+[   31.281293] duos-nommu: heartbeat=31 allocation=OK time=891273284
+[   32.321289] duos-nommu: heartbeat=32 allocation=OK time=917273178
+[   33.361289] duos-nommu: heartbeat=33 allocation=OK time=943273170
+[   34.401311] duos-nommu: heartbeat=34 allocation=OK time=969273724
+[   35.441314] duos-nommu: heartbeat=35 allocation=OK time=995273807
+[   36.481318] duos-nommu: heartbeat=36 allocation=OK time=1021273888
+[   37.521306] duos-nommu: heartbeat=37 allocation=OK time=1047273610
+[   38.561315] duos-nommu: heartbeat=38 allocation=OK time=1073273829
+[   39.601314] duos-nommu: heartbeat=39 allocation=OK time=1099273796
+[   40.641314] duos-nommu: heartbeat=40 allocation=OK time=1125273798
+[   41.681302] duos-nommu: heartbeat=41 allocation=OK time=1151273495
+[   42.721315] duos-nommu: heartbeat=42 allocation=OK time=1177273831
+[   43.761297] duos-nommu: heartbeat=43 allocation=OK time=1203273385
+[   44.801310] duos-nommu: heartbeat=44 allocation=OK time=1229273685
+[   45.841300] duos-nommu: heartbeat=45 allocation=OK time=1255273437
+[   46.881298] duos-nommu: heartbeat=46 allocation=OK time=1281273383
+[   47.921304] duos-nommu: heartbeat=47 allocation=OK time=1307273545
+[   48.961365] duos-nommu: heartbeat=48 allocation=OK time=1333275064
+[   50.001290] duos-nommu: heartbeat=49 allocation=OK time=1359273206
+[   51.041287] duos-nommu: heartbeat=50 allocation=OK time=1385273134
+[   52.081290] duos-nommu: heartbeat=51 allocation=OK time=1411273200
+[   53.121293] duos-nommu: heartbeat=52 allocation=OK time=1437273282
+[   54.161290] duos-nommu: heartbeat=53 allocation=OK time=1463273197
+[   55.201290] duos-nommu: heartbeat=54 allocation=OK time=1489273198
+[   56.241315] duos-nommu: heartbeat=55 allocation=OK time=1515273819
+[   57.281315] duos-nommu: heartbeat=56 allocation=OK time=1541273826
+[   58.321311] duos-nommu: heartbeat=57 allocation=OK time=1567273711
+[   59.361315] duos-nommu: heartbeat=58 allocation=OK time=1593273824
+[   60.401313] duos-nommu: heartbeat=59 allocation=OK time=1619273780
+[   61.441310] duos-nommu: heartbeat=60 allocation=OK time=1645273706
+[   62.481317] duos-nommu: heartbeat=61 allocation=OK time=1671273869
+[   63.531310] duos-nommu: heartbeat=62 allocation=OK time=1697523692
+[   64.561290] duos-nommu: heartbeat=63 allocation=OK time=1723273191
+[   65.601289] duos-nommu: heartbeat=64 allocation=OK time=1749273167
+[   66.641286] duos-nommu: heartbeat=65 allocation=OK time=1775273102
+[   67.681285] duos-nommu: heartbeat=66 allocation=OK time=1801273074
+[   68.721296] duos-nommu: heartbeat=67 allocation=OK time=1827273345
+[   69.761289] duos-nommu: heartbeat=68 allocation=OK time=1853273172
+[   70.801311] duos-nommu: heartbeat=69 allocation=OK time=1879273710
+[   71.841319] duos-nommu: heartbeat=70 allocation=OK time=1905273933
+[   72.881302] duos-nommu: heartbeat=71 allocation=OK time=1931273488
+[   73.921319] duos-nommu: heartbeat=72 allocation=OK time=1957273927
+[   74.961319] duos-nommu: heartbeat=73 allocation=OK time=1983273917
+[   76.001320] duos-nommu: heartbeat=74 allocation=OK time=2009273954
+[   77.041302] duos-nommu: heartbeat=75 allocation=OK time=2035273500
+[   78.081319] duos-nommu: heartbeat=76 allocation=OK time=2061273917
+[   79.121302] duos-nommu: heartbeat=77 allocation=OK time=2087273501
+[   80.161319] duos-nommu: heartbeat=78 allocation=OK time=2113273931
+[   81.201303] duos-nommu: heartbeat=79 allocation=OK time=2139273508
+[   82.241302] duos-nommu: heartbeat=80 allocation=OK time=2165273497
+[   83.281297] duos-nommu: heartbeat=81 allocation=OK time=2191273386
+[   84.321300] duos-nommu: heartbeat=82 allocation=OK time=2217273452
+[   85.361290] duos-nommu: heartbeat=83 allocation=OK time=2243273197
+[   86.401290] duos-nommu: heartbeat=84 allocation=OK time=2269273194
+[   87.441289] duos-nommu: heartbeat=85 allocation=OK time=2295273185
+[   88.481291] duos-nommu: heartbeat=86 allocation=OK time=2321273227
+[   89.521291] duos-nommu: heartbeat=87 allocation=OK time=2347273219
+[   90.561290] duos-nommu: heartbeat=88 allocation=OK time=2373273207
+[   91.601291] duos-nommu: heartbeat=89 allocation=OK time=2399273219
+[   92.641318] duos-nommu: heartbeat=90 allocation=OK time=2425273899
+[   93.681320] duos-nommu: heartbeat=91 allocation=OK time=2451273933
+[   94.721320] duos-nommu: heartbeat=92 allocation=OK time=2477273937
+[   95.761319] duos-nommu: heartbeat=93 allocation=OK time=2503273926
+[   96.801319] duos-nommu: heartbeat=94 allocation=OK time=2529273914
+[   97.841319] duos-nommu: heartbeat=95 allocation=OK time=2555273923
+[   98.881299] duos-nommu: heartbeat=96 allocation=OK time=2581273435
+[   99.921290] duos-nommu: heartbeat=97 allocation=OK time=2607273188
+[  100.961289] duos-nommu: heartbeat=98 allocation=OK time=2633273177
+[  102.001292] duos-nommu: heartbeat=99 allocation=OK time=2659273254
+[  103.051310] duos-nommu: heartbeat=100 allocation=OK time=2685523694
+[  104.081291] duos-nommu: heartbeat=101 allocation=OK time=2711273222
+[  105.121291] duos-nommu: heartbeat=102 allocation=OK time=2737273233
+[  106.161290] duos-nommu: heartbeat=103 allocation=OK time=2763273212
+[  107.201296] duos-nommu: heartbeat=104 allocation=OK time=2789273347
+[  108.241287] duos-nommu: heartbeat=105 allocation=OK time=2815273119
+[  109.281323] duos-nommu: heartbeat=106 allocation=OK time=2841274026
+[  110.321314] duos-nommu: heartbeat=107 allocation=OK time=2867273807
+[  111.361297] duos-nommu: heartbeat=108 allocation=OK time=2893273384
+[  112.401319] duos-nommu: heartbeat=109 allocation=OK time=2919273917
+[  113.441321] duos-nommu: heartbeat=110 allocation=OK time=2945273963
+[  114.481319] duos-nommu: heartbeat=111 allocation=OK time=2971273913
+[  115.521302] duos-nommu: heartbeat=112 allocation=OK time=2997273503
+[  116.561319] duos-nommu: heartbeat=113 allocation=OK time=3023273928
+[  117.601302] duos-nommu: heartbeat=114 allocation=OK time=3049273495
+[  118.641319] duos-nommu: heartbeat=115 allocation=OK time=3075273924
+[  119.681302] duos-nommu: heartbeat=116 allocation=OK time=3101273503
+[  120.721303] duos-nommu: heartbeat=117 allocation=OK time=3127273505
+[  121.761302] duos-nommu: heartbeat=118 allocation=OK time=3153273498
+[  122.801291] duos-nommu: heartbeat=119 allocation=OK time=3179273220
+[  123.841291] duos-nommu: heartbeat=120 allocation=OK time=3205273216
+[  124.881291] duos-nommu: heartbeat=121 allocation=OK time=3231273213
+[  125.921291] duos-nommu: heartbeat=122 allocation=OK time=3257273227
+[  126.961288] duos-nommu: heartbeat=123 allocation=OK time=3283273150
+[  128.001289] duos-nommu: heartbeat=124 allocation=OK time=3309273174
+[  129.041294] duos-nommu: heartbeat=125 allocation=OK time=3335273312
+[  130.081314] duos-nommu: heartbeat=126 allocation=OK time=3361273799
+[  131.121314] duos-nommu: heartbeat=127 allocation=OK time=3387273803
+[  132.161319] duos-nommu: heartbeat=128 allocation=OK time=3413273923
+[  133.201319] duos-nommu: heartbeat=129 allocation=OK time=3439273923
+[  134.241319] duos-nommu: heartbeat=130 allocation=OK time=3465273929
+[  135.281319] duos-nommu: heartbeat=131 allocation=OK time=3491273931
+[  135.716490] duos-opencv: validation progress cases=1890 size=1280x800
+[  135.716572] duos-opencv: validation PASS cases=1890; timing 100 samples, 5 warmup, k=15 t=3
+[  135.753073] duos-opencv: timing mode=opencv w=32 h=32 n=100 mean_ns=234992 p50_ns=230880 p95_ns=
+[  135.753120] 280800
+[  135.772774] duos-opencv: timing mode=scalar-c906l w=32 h=32 n=100 mean_ns=83013 p50_ns=81960
+[  135.772819]  p95_ns=82200
+[  135.879860] duos-opencv: timing mode=opencv w=64 h=64 n=100 mean_ns=601426 p50_ns=598840 p95_ns=
+[  135.879907] 654080
+[  135.954063] duos-opencv: timing mode=scalar-c906l w=64 h=64 n=100 mean_ns=298679 p50_ns=296720
+[  135.954109]  p95_ns=303200
+[  136.284946] duos-opencv: timing mode=opencv w=128 h=128 n=100 mean_ns=1500518 p50_ns=1491360
+[  136.284991]  p95_ns=1563960
+[  136.321316] duos-nommu: heartbeat=132 allocation=OK time=3517273840
+[  136.576984] duos-opencv: timing mode=scalar-c906l w=128 h=128 n=100 mean_ns=1166173 p50_ns=
+[  136.577030] 1156560 p95_ns=1241360
+[  137.344692] duos-opencv: timing mode=opencv w=200 h=200 n=100 mean_ns=3308456 p50_ns=3317320
+[  137.344738]  p95_ns=3426920
+[  137.361289] duos-nommu: heartbeat=133 allocation=OK time=3543273167
+[  138.051357] duos-opencv: timing mode=scalar-c906l w=200 h=200 n=100 mean_ns=2795900 p50_ns=
+[  138.051404] 2776680 p95_ns=2867280
+[  138.401295] duos-nommu: heartbeat=134 allocation=OK time=3569273325
+[  139.441291] duos-nommu: heartbeat=135 allocation=OK time=3595273234
+[  139.476897] duos-opencv: timing mode=opencv w=320 h=240 n=100 mean_ns=5915259 p50_ns=5915760
+[  139.476942]  p95_ns=5985720
+[  140.481289] duos-nommu: heartbeat=136 allocation=OK time=3621273172
+[  140.835638] duos-opencv: timing mode=scalar-c906l w=320 h=240 n=100 mean_ns=5398118 p50_ns=
+[  140.835684] 5397320 p95_ns=5452760
+[  141.531291] duos-nommu: heartbeat=137 allocation=OK time=3647523230
+[  142.561290] duos-nommu: heartbeat=138 allocation=OK time=3673273188
+[  143.601290] duos-nommu: heartbeat=139 allocation=OK time=3699273189
+[  144.641291] duos-nommu: heartbeat=140 allocation=OK time=3725273223
+[  145.035815] duos-opencv: timing mode=opencv w=640 h=360 n=100 mean_ns=17073760 p50_ns=17081440
+[  145.035861]  p95_ns=17185440
+[  145.681289] duos-nommu: heartbeat=141 allocation=OK time=3751273182
+[  146.721288] duos-nommu: heartbeat=142 allocation=OK time=3777273161
+[  147.761288] duos-nommu: heartbeat=143 allocation=OK time=3803273149
+[  148.801315] duos-nommu: heartbeat=144 allocation=OK time=3829273827
+[  149.094220] duos-opencv: timing mode=scalar-c906l w=640 h=360 n=100 mean_ns=16052402 p50_ns=
+[  149.094267] 16069440 p95_ns=16082280
+[  149.841317] duos-nommu: heartbeat=145 allocation=OK time=3855273862
+[  150.881318] duos-nommu: heartbeat=146 allocation=OK time=3881273904
+[  151.921322] duos-nommu: heartbeat=147 allocation=OK time=3907273988
+[  152.961305] duos-nommu: heartbeat=148 allocation=OK time=3933273573
+[  154.001320] duos-nommu: heartbeat=149 allocation=OK time=3959273959
+[  155.041323] duos-nommu: heartbeat=150 allocation=OK time=3985274025
+[  156.081307] duos-nommu: heartbeat=151 allocation=OK time=4011273635
+[  157.121308] duos-nommu: heartbeat=152 allocation=OK time=4037273634
+[  158.161300] duos-nommu: heartbeat=153 allocation=OK time=4063273455
+[  159.201300] duos-nommu: heartbeat=154 allocation=OK time=4089273454
+[  160.241291] duos-nommu: heartbeat=155 allocation=OK time=4115273210
+[  161.281290] duos-nommu: heartbeat=156 allocation=OK time=4141273209
+[  162.321291] duos-nommu: heartbeat=157 allocation=OK time=4167273213
+[  163.361290] duos-nommu: heartbeat=158 allocation=OK time=4193273198
+[  164.401290] duos-nommu: heartbeat=159 allocation=OK time=4219273211
+[  165.441291] duos-nommu: heartbeat=160 allocation=OK time=4245273223
+[  166.481291] duos-nommu: heartbeat=161 allocation=OK time=4271273223
+[  167.498782] duos-opencv: timing mode=opencv w=1280 h=800 n=100 mean_ns=73565864 p50_ns=73548120
+[  167.498828]  p95_ns=73826160
+[  167.521316] duos-nommu: heartbeat=162 allocation=OK time=4297273840
+[  168.561315] duos-nommu: heartbeat=163 allocation=OK time=4323273839
+[  169.601316] duos-nommu: heartbeat=164 allocation=OK time=4349273845
+[  170.641316] duos-nommu: heartbeat=165 allocation=OK time=4375273848
+[  171.681318] duos-nommu: heartbeat=166 allocation=OK time=4401273888
+[  172.721316] duos-nommu: heartbeat=167 allocation=OK time=4427273850
+[  173.761315] duos-nommu: heartbeat=168 allocation=OK time=4453273824
+[  174.801289] duos-nommu: heartbeat=169 allocation=OK time=4479273180
+[  175.841289] duos-nommu: heartbeat=170 allocation=OK time=4505273183
+[  176.891291] duos-nommu: heartbeat=171 allocation=OK time=4531523227
+[  177.921289] duos-nommu: heartbeat=172 allocation=OK time=4557273188
+[  178.961289] duos-nommu: heartbeat=173 allocation=OK time=4583273178
+[  180.001291] duos-nommu: heartbeat=174 allocation=OK time=4609273212
+[  181.041289] duos-nommu: heartbeat=175 allocation=OK time=4635273174
+[  182.081289] duos-nommu: heartbeat=176 allocation=OK time=4661273171
+[  183.121289] duos-nommu: heartbeat=177 allocation=OK time=4687273170
+[  184.161316] duos-nommu: heartbeat=178 allocation=OK time=4713273848
+[  185.201314] duos-nommu: heartbeat=179 allocation=OK time=4739273814
+[  185.526700] duos-opencv: timing mode=scalar-c906l w=1280 h=800 n=100 mean_ns=71360476 p50_ns=
+[  185.526747] 71358560 p95_ns=71433360
+[  185.528411] duos-opencv: DONE PASS; local compute only, no handover timing
+[  186.241274] duos-nommu: heartbeat=180 allocation=OK time=4765272802
+[  187.281271] duos-nommu: heartbeat=181 allocation=OK time=4791272718
+[  188.321271] duos-nommu: heartbeat=182 allocation=OK time=4817272722
+[  189.361270] duos-nommu: heartbeat=183 allocation=OK time=4843272713
+[  190.401271] duos-nommu: heartbeat=184 allocation=OK time=4869272722
+[  191.441270] duos-nommu: heartbeat=185 allocation=OK time=4895272717
+[  192.481274] duos-nommu: heartbeat=186 allocation=OK time=4921272798
+[  193.521271] duos-nommu: heartbeat=187 allocation=OK time=4947272731
+[  194.561270] duos-nommu: heartbeat=188 allocation=OK time=4973272704
+[  195.531279] duos-opencv: alive result=PASS
+[  195.601273] duos-nommu: heartbeat=189 allocation=OK time=4999272773
+[  196.641271] duos-nommu: heartbeat=190 allocation=OK time=5025272745
+[  197.681270] duos-nommu: heartbeat=191 allocation=OK time=5051272703
+[  198.721271] duos-nommu: heartbeat=192 allocation=OK time=5077272730
+[  199.761270] duos-nommu: heartbeat=193 allocation=OK time=5103272707
+[  200.801270] duos-nommu: heartbeat=194 allocation=OK time=5129272699
+[  201.841270] duos-nommu: heartbeat=195 allocation=OK time=5155272715
+[  202.881270] duos-nommu: heartbeat=196 allocation=OK time=5181272704
+[  203.921270] duos-nommu: heartbeat=197 allocation=OK time=5207272709
+[  204.961271] duos-nommu: heartbeat=198 allocation=OK time=5233272724
+[  205.541287] duos-opencv: alive result=PASS
+[  206.001273] duos-nommu: heartbeat=199 allocation=OK time=5259272789
+[  207.041270] duos-nommu: heartbeat=200 allocation=OK time=5285272711
+[  208.081271] duos-nommu: heartbeat=201 allocation=OK time=5311272721
+[  209.121271] duos-nommu: heartbeat=202 allocation=OK time=5337272727
+[  210.161270] duos-nommu: heartbeat=203 allocation=OK time=5363272701
+[  211.201270] duos-nommu: heartbeat=204 allocation=OK time=5389272699
+[  212.241270] duos-nommu: heartbeat=205 allocation=OK time=5415272703
+[  213.281271] duos-nommu: heartbeat=206 allocation=OK time=5441272727
+[  214.321271] duos-nommu: heartbeat=207 allocation=OK time=5467272728
+[  215.361270] duos-nommu: heartbeat=208 allocation=OK time=5493272713
+[  215.551278] duos-opencv: alive result=PASS
+[  216.401276] duos-nommu: heartbeat=209 allocation=OK time=5519272835
+[  217.441270] duos-nommu: heartbeat=210 allocation=OK time=5545272713
+[  218.481271] duos-nommu: heartbeat=211 allocation=OK time=5571272728
+[  219.521270] duos-nommu: heartbeat=212 allocation=OK time=5597272717
+[  220.561270] duos-nommu: heartbeat=213 allocation=OK time=5623272710
+[  221.601270] duos-nommu: heartbeat=214 allocation=OK time=5649272721
+[  222.641270] duos-nommu: heartbeat=215 allocation=OK time=5675272713
+[  223.681270] duos-nommu: heartbeat=216 allocation=OK time=5701272710
+[  224.721271] duos-nommu: heartbeat=217 allocation=OK time=5727272735
+[  225.561286] duos-opencv: alive result=PASS
+[  225.761272] duos-nommu: heartbeat=218 allocation=OK time=5753272761
+[  226.801271] duos-nommu: heartbeat=219 allocation=OK time=5779272737
+[  227.841270] duos-nommu: heartbeat=220 allocation=OK time=5805272725
+[  228.881270] duos-nommu: heartbeat=221 allocation=OK time=5831272695
+[  229.921271] duos-nommu: heartbeat=222 allocation=OK time=5857272729
+[  230.961270] duos-nommu: heartbeat=223 allocation=OK time=5883272712
+[  232.001271] duos-nommu: heartbeat=224 allocation=OK time=5909272731
+[  233.041270] duos-nommu: heartbeat=225 allocation=OK time=5935272721
+[  234.081270] duos-nommu: heartbeat=226 allocation=OK time=5961272710
+[  235.121271] duos-nommu: heartbeat=227 allocation=OK time=5987272728
+[  235.571278] duos-opencv: alive result=PASS
+[  236.161272] duos-nommu: heartbeat=228 allocation=OK time=6013272760
+[  237.201271] duos-nommu: heartbeat=229 allocation=OK time=6039272722
+[  238.241271] duos-nommu: heartbeat=230 allocation=OK time=6065272731
+[  239.281270] duos-nommu: heartbeat=231 allocation=OK time=6091272701
+[  240.321273] duos-nommu: heartbeat=232 allocation=OK time=6117272775
+[  241.361270] duos-nommu: heartbeat=233 allocation=OK time=6143272717
+[  242.401271] duos-nommu: heartbeat=234 allocation=OK time=6169272730
+[  243.441271] duos-nommu: heartbeat=235 allocation=OK time=6195272728
+[  244.481270] duos-nommu: heartbeat=236 allocation=OK time=6221272701
+[  245.521270] duos-nommu: heartbeat=237 allocation=OK time=6247272702
+[  245.581285] duos-opencv: alive result=PASS
+[  246.561273] duos-nommu: heartbeat=238 allocation=OK time=6273272793
+[  247.601270] duos-nommu: heartbeat=239 allocation=OK time=6299272715
+[  248.641271] duos-nommu: heartbeat=240 allocation=OK time=6325272731
+[  249.681271] duos-nommu: heartbeat=241 allocation=OK time=6351272729
+[  250.721270] duos-nommu: heartbeat=242 allocation=OK time=6377272708
+[  251.761271] duos-nommu: heartbeat=243 allocation=OK time=6403272728
+[  252.801271] duos-nommu: heartbeat=244 allocation=OK time=6429272727
+[  253.841271] duos-nommu: heartbeat=245 allocation=OK time=6455272720
+[  254.881271] duos-nommu: heartbeat=246 allocation=OK time=6481272738
+[  255.591278] duos-opencv: alive result=PASS
+[  255.921271] duos-nommu: heartbeat=247 allocation=OK time=6507272737
+[  256.961270] duos-nommu: heartbeat=248 allocation=OK time=6533272704
+[  258.001271] duos-nommu: heartbeat=249 allocation=OK time=6559272731
+[  259.041271] duos-nommu: heartbeat=250 allocation=OK time=6585272720
+[  260.081271] duos-nommu: heartbeat=251 allocation=OK time=6611272722
+[  261.121271] duos-nommu: heartbeat=252 allocation=OK time=6637272724
+[  262.161271] duos-nommu: heartbeat=253 allocation=OK time=6663272720
+[  263.201271] duos-nommu: heartbeat=254 allocation=OK time=6689272724
+[  264.241273] duos-nommu: heartbeat=255 allocation=OK time=6715272773
+[  265.281270] duos-nommu: heartbeat=256 allocation=OK time=6741272700
+[  265.601287] duos-opencv: alive result=PASS
+[  266.321272] duos-nommu: heartbeat=257 allocation=OK time=6767272751
+[  267.361270] duos-nommu: heartbeat=258 allocation=OK time=6793272708
+[  268.401271] duos-nommu: heartbeat=259 allocation=OK time=6819272721
+[  269.441270] duos-nommu: heartbeat=260 allocation=OK time=6845272705
+[  270.481273] duos-nommu: heartbeat=261 allocation=OK time=6871272783
+[  271.521271] duos-nommu: heartbeat=262 allocation=OK time=6897272728
+[  272.561270] duos-nommu: heartbeat=263 allocation=OK time=6923272709
+[  273.601270] duos-nommu: heartbeat=264 allocation=OK time=6949272718
+[  274.641270] duos-nommu: heartbeat=265 allocation=OK time=6975272715
+[  275.611278] duos-opencv: alive result=PASS
+[  275.681272] duos-nommu: heartbeat=266 allocation=OK time=7001272761
+[  276.721271] duos-nommu: heartbeat=267 allocation=OK time=7027272732
+[  277.761270] duos-nommu: heartbeat=268 allocation=OK time=7053272716
+[  278.801270] duos-nommu: heartbeat=269 allocation=OK time=7079272711
+[  279.841271] duos-nommu: heartbeat=270 allocation=OK time=7105272738
+[  280.881271] duos-nommu: heartbeat=271 allocation=OK time=7131272733
+[  281.921270] duos-nommu: heartbeat=272 allocation=OK time=7157272716
+[  282.961271] duos-nommu: heartbeat=273 allocation=OK time=7183272720
+[  284.001271] duos-nommu: heartbeat=274 allocation=OK time=7209272737
+[  285.041271] duos-nommu: heartbeat=275 allocation=OK time=7235272719
+[  285.621288] duos-opencv: alive result=PASS
+[  286.081273] duos-nommu: heartbeat=276 allocation=OK time=7261272785
+[  287.121270] duos-nommu: heartbeat=277 allocation=OK time=7287272712
+[  288.161280] duos-nommu: heartbeat=278 allocation=OK time=7313272964
+[  289.201271] duos-nommu: heartbeat=279 allocation=OK time=7339272723
+[  290.241270] duos-nommu: heartbeat=280 allocation=OK time=7365272714
+[  291.281271] duos-nommu: heartbeat=281 allocation=OK time=7391272739
+[  292.321271] duos-nommu: heartbeat=282 allocation=OK time=7417272731
+[  293.361271] duos-nommu: heartbeat=283 allocation=OK time=7443272739
+[  294.401271] duos-nommu: heartbeat=284 allocation=OK time=7469272730
+[  295.441270] duos-nommu: heartbeat=285 allocation=OK time=7495272709
+[  295.631277] duos-opencv: alive result=PASS
+[  296.481273] duos-nommu: heartbeat=286 allocation=OK time=7521272787
+[  297.521270] duos-nommu: heartbeat=287 allocation=OK time=7547272711
+[  298.561270] duos-nommu: heartbeat=288 allocation=OK time=7573272711
+[  299.601273] duos-nommu: heartbeat=289 allocation=OK time=7599272768
+[  300.641269] duos-nommu: heartbeat=290 allocation=OK time=7625272690
+[  301.681270] duos-nommu: heartbeat=291 allocation=OK time=7651272694
+[  302.721269] duos-nommu: heartbeat=292 allocation=OK time=7677272687
+[  303.761269] duos-nommu: heartbeat=293 allocation=OK time=7703272685
+[  304.801270] duos-nommu: heartbeat=294 allocation=OK time=7729272696
+[  305.641287] duos-opencv: alive result=PASS
+[  305.841274] duos-nommu: heartbeat=295 allocation=OK time=7755272793
+[  306.881270] duos-nommu: heartbeat=296 allocation=OK time=7781272707
+[  307.921271] duos-nommu: heartbeat=297 allocation=OK time=7807272720
+[  308.961271] duos-nommu: heartbeat=298 allocation=OK time=7833272723
+[  310.001271] duos-nommu: heartbeat=299 allocation=OK time=7859272738
+[  311.041270] duos-nommu: heartbeat=300 allocation=OK time=7885272703
+[  312.081270] duos-nommu: heartbeat=301 allocation=OK time=7911272711
+[  313.121270] duos-nommu: heartbeat=302 allocation=OK time=7937272713
+[  314.161270] duos-nommu: heartbeat=303 allocation=OK time=7963272711
+[  315.201270] duos-nommu: heartbeat=304 allocation=OK time=7989272719
+[  315.651281] duos-opencv: alive result=PASS
+[  316.241273] duos-nommu: heartbeat=305 allocation=OK time=8015272766
+[  317.281270] duos-nommu: heartbeat=306 allocation=OK time=8041272714
+[  318.321271] duos-nommu: heartbeat=307 allocation=OK time=8067272720
+[  319.361270] duos-nommu: heartbeat=308 allocation=OK time=8093272705
+[  320.401270] duos-nommu: heartbeat=309 allocation=OK time=8119272716
+[  321.441271] duos-nommu: heartbeat=310 allocation=OK time=8145272737
+[  322.481270] duos-nommu: heartbeat=311 allocation=OK time=8171272716
+[  323.521270] duos-nommu: heartbeat=312 allocation=OK time=8197272712
+[  324.561270] duos-nommu: heartbeat=313 allocation=OK time=8223272711
+[  325.601270] duos-nommu: heartbeat=314 allocation=OK time=8249272712
+[  325.661288] duos-opencv: alive result=PASS
+[  326.641274] duos-nommu: heartbeat=315 allocation=OK time=8275272808
+[  327.681270] duos-nommu: heartbeat=316 allocation=OK time=8301272720
+[  328.721270] duos-nommu: heartbeat=317 allocation=OK time=8327272716
+[  329.761271] duos-nommu: heartbeat=318 allocation=OK time=8353272739
+[  330.801270] duos-nommu: heartbeat=319 allocation=OK time=8379272716
+[  331.841270] duos-nommu: heartbeat=320 allocation=OK time=8405272709
+[  332.881270] duos-nommu: heartbeat=321 allocation=OK time=8431272710
+[  333.921270] duos-nommu: heartbeat=322 allocation=OK time=8457272712
+[  334.961270] duos-nommu: heartbeat=323 allocation=OK time=8483272719
+[  335.671278] duos-opencv: alive result=PASS
+[  336.001273] duos-nommu: heartbeat=324 allocation=OK time=8509272772
+[  337.041271] duos-nommu: heartbeat=325 allocation=OK time=8535272723
+[  338.081271] duos-nommu: heartbeat=326 allocation=OK time=8561272738
+[  339.121271] duos-nommu: heartbeat=327 allocation=OK time=8587272718
+[  340.161271] duos-nommu: heartbeat=328 allocation=OK time=8613272727
+[  341.201270] duos-nommu: heartbeat=329 allocation=OK time=8639272712
+[  342.241270] duos-nommu: heartbeat=330 allocation=OK time=8665272716
+[  343.281270] duos-nommu: heartbeat=331 allocation=OK time=8691272707
+[  344.321270] duos-nommu: heartbeat=332 allocation=OK time=8717272715
+[  345.361271] duos-nommu: heartbeat=333 allocation=OK time=8743272732
+[  345.681288] duos-opencv: alive result=PASS
+[  346.401273] duos-nommu: heartbeat=334 allocation=OK time=8769272784
+[  347.441271] duos-nommu: heartbeat=335 allocation=OK time=8795272719
+[  348.481270] duos-nommu: heartbeat=336 allocation=OK time=8821272720
+[  349.521271] duos-nommu: heartbeat=337 allocation=OK time=8847272726
+[  350.561271] duos-nommu: heartbeat=338 allocation=OK time=8873272723
+[  351.601270] duos-nommu: heartbeat=339 allocation=OK time=8899272714
+[  352.641271] duos-nommu: heartbeat=340 allocation=OK time=8925272721
+[  353.681270] duos-nommu: heartbeat=341 allocation=OK time=8951272719
+[  354.721271] duos-nommu: heartbeat=342 allocation=OK time=8977272738
+[  355.691278] duos-opencv: alive result=PASS
+[  355.761272] duos-nommu: heartbeat=343 allocation=OK time=9003272756
+[  356.801270] duos-nommu: heartbeat=344 allocation=OK time=9029272704
+[  357.841271] duos-nommu: heartbeat=345 allocation=OK time=9055272727
+[  358.881270] duos-nommu: heartbeat=346 allocation=OK time=9081272708
+[  359.921270] duos-nommu: heartbeat=347 allocation=OK time=9107272709
+[  360.961270] duos-nommu: heartbeat=348 allocation=OK time=9133272710
+[  362.001270] duos-nommu: heartbeat=349 allocation=OK time=9159272719
+[  363.041271] duos-nommu: heartbeat=350 allocation=OK time=9185272725
+[  364.081270] duos-nommu: heartbeat=351 allocation=OK time=9211272713
+[  365.121271] duos-nommu: heartbeat=352 allocation=OK time=9237272724
+[  365.701287] duos-opencv: alive result=PASS
+[  366.161272] duos-nommu: heartbeat=353 allocation=OK time=9263272764
+[  367.201270] duos-nommu: heartbeat=354 allocation=OK time=9289272708
+[  368.241271] duos-nommu: heartbeat=355 allocation=OK time=9315272717
+[  369.281270] duos-nommu: heartbeat=356 allocation=OK time=9341272707
+[  370.321271] duos-nommu: heartbeat=357 allocation=OK time=9367272722
+[  371.361271] duos-nommu: heartbeat=358 allocation=OK time=9393272743
+[  372.401270] duos-nommu: heartbeat=359 allocation=OK time=9419272707
+[  373.441270] duos-nommu: heartbeat=360 allocation=OK time=9445272699
+[  374.481271] duos-nommu: heartbeat=361 allocation=OK time=9471272729
+[  375.521270] duos-nommu: heartbeat=362 allocation=OK time=9497272709
+[  375.711284] duos-opencv: alive result=PASS
+[  376.561273] duos-nommu: heartbeat=363 allocation=OK time=9523272779
+[  377.601270] duos-nommu: heartbeat=364 allocation=OK time=9549272717
+[  378.641269] duos-nommu: heartbeat=365 allocation=OK time=9575272697
+[  379.681271] duos-nommu: heartbeat=366 allocation=OK time=9601272742
+[  380.721271] duos-nommu: heartbeat=367 allocation=OK time=9627272721
+[  381.761271] duos-nommu: heartbeat=368 allocation=OK time=9653272738
+[  382.801271] duos-nommu: heartbeat=369 allocation=OK time=9679272723
+[  383.841270] duos-nommu: heartbeat=370 allocation=OK time=9705272711
+[  384.881271] duos-nommu: heartbeat=371 allocation=OK time=9731272724
+[  385.721286] duos-opencv: alive result=PASS
+[  385.921273] duos-nommu: heartbeat=372 allocation=OK time=9757272787
+[  386.961270] duos-nommu: heartbeat=373 allocation=OK time=9783272720
+[  388.001272] duos-nommu: heartbeat=374 allocation=OK time=9809272747
+[  389.041270] duos-nommu: heartbeat=375 allocation=OK time=9835272712
+[  390.081270] duos-nommu: heartbeat=376 allocation=OK time=9861272714
+[  391.121270] duos-nommu: heartbeat=377 allocation=OK time=9887272707
+[  392.161270] duos-nommu: heartbeat=378 allocation=OK time=9913272705
+[  393.201271] duos-nommu: heartbeat=379 allocation=OK time=9939272734
+[  394.241270] duos-nommu: heartbeat=380 allocation=OK time=9965272715
+[  395.281270] duos-nommu: heartbeat=381 allocation=OK time=9991272710
+[  395.731278] duos-opencv: alive result=PASS
+[  396.321272] duos-nommu: heartbeat=382 allocation=OK time=10017272775

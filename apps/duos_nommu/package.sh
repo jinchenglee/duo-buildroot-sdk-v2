@@ -6,6 +6,7 @@ SDK_DIR="$(cd "${TASK_DIR}/../.." && pwd)"
 OUT="${TASK_DIR}/build"
 mkdir -p "${OUT}"
 if [ "${NOMMU_SHELL:-0}" = 1 ]; then export NOMMU_USERSPACE=1; fi
+if [ -n "${NOMMU_CXX_PROBE:-}" ]; then export NOMMU_USERSPACE=1; fi
 ARM="${SDK_DIR}/host-tools/gcc/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-"
 ARM_KERNEL="${SDK_DIR}/host-tools/gcc/gcc-linaro-7.3.1-2018.05-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-"
 RV="${SDK_DIR}/host-tools/gcc/riscv64-elf-x86_64/bin/riscv64-unknown-elf-"
@@ -32,6 +33,7 @@ FLAGS=(-O2 -std=gnu11 -march=rv64imafdc -mabi=lp64d -mcmodel=medany
 BUNDLE="${OUT}/bundle"
 if [ "${NOMMU_USERSPACE:-0}" = 1 ]; then BUNDLE="${OUT}/bundle-userspace"; fi
 if [ "${NOMMU_SHELL:-0}" = 1 ]; then BUNDLE="${OUT}/bundle-shell"; fi
+if [ -n "${NOMMU_CXX_PROBE:-}" ]; then BUNDLE="$OUT/bundle-$NOMMU_CXX_PROBE"; fi
 mkdir -p "${BUNDLE}"
 "${ARM}gcc" -O2 -std=gnu11 -Wall -Wextra "${TASK_DIR}/read_log.c" -o "${BUNDLE}/read_nommu_log"
 if [ "${NOMMU_SHELL:-0}" = 1 ]; then

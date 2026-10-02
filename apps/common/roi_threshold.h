@@ -6,13 +6,23 @@
 #include <stddef.h>
 #include <string.h>
 
+/* OpenCV 3.2 uses SHIFT=16; OpenCV 4.12 uses SHIFT=23 for the
+ * uint16 accumulator normalizer. Keep the production/A53 reference default.
+ * A separately compiled experiment may select its matching library precision. */
+#ifndef TT_THRESHOLD_FIXED_SHIFT
+#define TT_THRESHOLD_FIXED_SHIFT 16u
+#endif
+#if TT_THRESHOLD_FIXED_SHIFT != 16 && TT_THRESHOLD_FIXED_SHIFT != 23
+#error "Supported OpenCV fixed-point shifts are 16 and 23"
+#endif
+
 #define TT_THRESHOLD_MAX_WIDTH 1280u
 #define TT_THRESHOLD_MAX_HEIGHT 800u
 #define TT_THRESHOLD_MAX_KERNEL 63u
 
 /* Inputs/outputs must not overlap. Columns has at least width uint32_t items.
  * Borders replicate the ROI itself (OpenCV BORDER_REPLICATE|BORDER_ISOLATED).
- * Mean follows OpenCV 3.2's uint8 normalizer (fixed reciprocal for area<=256),
+ * Mean follows the selected OpenCV uint8 normalizer (fixed reciprocal for area<=256),
  * subtraction saturates at zero, comparison is >. See the experiment guide. */
 static inline int tt_roi_threshold(const uint8_t *__restrict src, uint32_t src_stride,
                                   uint8_t *__restrict dst, uint32_t dst_stride,
@@ -22,6 +32,7 @@ static inline int tt_roi_threshold(const uint8_t *__restrict src, uint32_t src_s
 {
     uint32_t x, y, i, radius_x, radius_y, area, divisor_scale = 0, divisor_delta = 0;
     uint32_t cutoff[256];
+    const uint32_t reciprocal = 1u << TT_THRESHOLD_FIXED_SHIFT;
     if (!src || !dst || !columns || !width || !height ||
         width > TT_THRESHOLD_MAX_WIDTH || height > TT_THRESHOLD_MAX_HEIGHT ||
         src_stride < width || dst_stride < width || !kernel ||
@@ -38,20 +49,20 @@ static inline int tt_roi_threshold(const uint8_t *__restrict src, uint32_t src_s
     radius_y = height == 1 ? 0 : kernel / 2u;
     area = (radius_x * 2u + 1u) * (radius_y * 2u + 1u);
     if (area > 1u && area <= 256u) {
-        divisor_scale = 65536u / area;
+        divisor_scale = reciprocal / area;
         divisor_delta = area / 2u;
-        if ((65536u % area) * 2u < area)
+        if ((reciprocal % area) * 2u < area)
             ++divisor_delta;
         else
             ++divisor_scale;
     }
     /* Invert the exact OpenCV comparison once for each possible input byte.
-     * floor((sum+delta)*scale/65536) > input+threshold iff sum >= cutoff[input].
+     * floor((sum+delta)*scale/reciprocal) > input+threshold iff sum >= cutoff[input].
      * This removes normalization, saturation and division from the pixel loop. */
     for (i = 0; i < 256u; ++i) {
         uint32_t target = i + (uint32_t)threshold + 1u;
         cutoff[i] = divisor_scale ?
-            (target * 65536u + divisor_scale - 1u) / divisor_scale - divisor_delta :
+            (target * reciprocal + divisor_scale - 1u) / divisor_scale - divisor_delta :
             target * area - area / 2u;
     }
     for (x = 0; x < width; ++x) {

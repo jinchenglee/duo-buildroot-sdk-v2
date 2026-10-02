@@ -386,3 +386,28 @@ trace shows `reboot: Restarting system`, then ROM/FSBL output, warm-reset
 reason `0x40f0003`, and DDR initialization. This verifies the targeted warm
 reset fix for the shell profile in two trials; longer stress remains untested.
 No RTC reset-driver or generic probe-wait bypass was required.
+
+## Next: OpenCV runtime and image-job transport
+
+See [the runtime and shared-buffer plan](opencv-runtime-plan.md) for OpenCV
+fork/upstream suitability, the conditional Rust option, physical-address
+registration, buffer lifetimes, cache maintenance and validation gates.
+These are planned follow-up capabilities, not features of the shell image.
+
+### C++ / OpenCV local-buffer probe profiles
+
+[Runtime probe instructions](runtime/README.md) describe `NOMMU_CXX_PROBE`:
+`runtime_probe` tests C++ allocation, software math, exceptions and clocks;
+`opencv_probe` validates 1890 threshold cases before matched local timings.
+Both compile as RV64IMAC/LP64 self-contained static PIE, with separate boot
+bundles and shell rollback pairs. Test the runtime profile first. Builds are
+verified structurally; board startup and performance are not yet verified.
+No shared image worker or live decoder behavior changes are included.
+
+### Hard-float follow-up
+
+The explicit FP32/FP64 instruction and 100 sleep/state tests passed on C906L.
+Separate RV64IMAFDC/LP64D runtime and OpenCV profiles now build and are uploaded,
+with SCP readback hashes verified. Their complete hardware execution/timing is
+pending. The [runtime README](runtime/README.md) covers test order, retained
+regression tests and the unchanged soft-float baseline.

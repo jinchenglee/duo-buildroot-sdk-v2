@@ -9,6 +9,12 @@ userspace = os.environ.get('NOMMU_USERSPACE') == '1'
 shell = os.environ.get('NOMMU_SHELL') == '1'
 bundle = out / ('bundle-shell' if shell else 'bundle-userspace' if userspace else 'bundle')
 archive_path = out / ('duos-nommu-shell.tar.gz' if shell else 'duos-nommu-userspace.tar.gz' if userspace else 'duos-nommu.tar.gz')
+cxx = os.environ.get('NOMMU_CXX_PROBE', '')
+if cxx:
+    assert cxx in ('runtime_probe', 'opencv_probe', 'fp_probe', 'runtime_hardfloat_probe', 'opencv_hardfloat_probe') and userspace and not shell
+    bundle = out / ('bundle-' + cxx)
+    archive_path = out / ('duos-nommu-' + cxx + '.tar.gz')
+
 # These vendor macros come from SDK make variables, not U-Boot's .config.
 # Without them the board boots to soph# with an empty boot command.
 uboot = (out / 'uboot/u-boot.bin').read_bytes()
@@ -79,6 +85,13 @@ assert (out / 'verify-main.dtb').read_bytes() == (fitout / 'sg2000_milkv_duos_gl
 shutil.copyfile(stock / 'fip.bin', bundle / 'fip-restore.bin')
 shutil.copyfile(stock / 'rawimages/boot.sd', bundle / 'boot-restore.sd')
 shutil.copyfile(task / 'README.md', bundle / 'README.md')
+if cxx:
+    shutil.copyfile(task / 'runtime/README.md', bundle / 'PROBE-README.md')
+    shutil.copyfile(out / (cxx + '-elf.txt'), bundle / 'probe-elf.txt')
+    shutil.copyfile(out / 'bundle-shell/fip-nommu.bin', bundle / 'fip-shell.bin')
+    # The updated main FIT disables the stale fast-image service for all profiles.
+    shutil.copyfile(bundle / 'boot-nommu.sd', bundle / 'boot-shell.sd')
+
 shutil.copyfile(task / 'run_stability.sh', bundle / 'run_stability.sh')
 if userspace:
     shutil.copyfile(out / 'userspace/init-elf.txt', bundle / 'init-elf.txt')
@@ -105,6 +118,8 @@ manifest = ['Verified: only BLCP_2ND and LOADER_2ND FIP payloads changed; DDR/BL
             ('Diagnostic shell tested; fast-image DT fix passed two warm reboots; longer stability unverified.' if shell else
              'Libc-free userspace init included; first userspace cold boot verified.'
              if userspace else 'Kernel-only probe; first cold boot verified, repeated boots and warm reset outstanding.')]
+if cxx:
+    manifest[-1] = f'{cxx}: C++ static PIE; this bundle hardware runtime/timings NOT YET VERIFIED.'
 (bundle / 'BUILD.txt').write_text('\n'.join(manifest)+'\n')
 files = sorted(p for p in bundle.iterdir() if p.is_file() and p.name != 'SHA256SUMS')
 (bundle / 'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in files))
