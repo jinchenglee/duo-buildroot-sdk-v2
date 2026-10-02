@@ -1,9 +1,9 @@
 # aruco_nano
 
-Pure ArUco Nano live detector for the Milk-V Duo S. It reads the **same** OV5647
-camera feed as `apps/tinytag_detect`'s live path and runs the **stock** ArUco
-Nano detector over the whole frame, so the two can be compared under identical
-acquisition conditions.
+Pure ArUco Nano live detector for the Milk-V Duo S. It reads the selected
+camera feed from `/mnt/data/sensor_cfg.ini` (OV5647 or OV9281) and runs the
+**stock** ArUco Nano detector over the whole frame. With matching sensor and
+orientation settings, it can be compared directly with `apps/tinytag_detect`.
 
 Where `tinytag_detect` is the two-stage detector (neural TPU proposals + per-ROI
 crop decode via `TagCropDecoder`), this app is stage-two only: it skips the
@@ -16,7 +16,7 @@ The capture path mirrors `apps/tinytag_detect/live_camera.cc` exactly (the
 verified, hardware-tuned setup):
 
 - OV5647 at 1920x1080@30 (opt-in 1280x720@60 with
-  `ARUCO_NANO_LIVE_OV5647_720P60=1`) -> VI -> ISP -> VPSS group 0.
+  `ARUCO_NANO_LIVE_OV5647_720P60=1`) or OV9281 at 1280x800@120 -> VI -> ISP -> VPSS group 0.
 - VPSS **channel 0 = 1280x720 YUV400** — the same full-resolution frame
   tinytag uses for crop decode (and for exact-luma preview).
 - `VI_OFFLINE_VPSS_ONLINE` (default), VPSS device 1, group 0.
@@ -25,9 +25,9 @@ verified, hardware-tuned setup):
   one capture period old), never a backlog.
 - The plane is mapped zero-copy with `CVI_SYS_MmapCache` and a persistent
   mapping cache keyed on the VPSS physical address (no mmap/munmap per frame).
-- VI **mirror correction defaults to 1**: the OV5647 module on this board
-  delivers a horizontally mirrored frame and AprilTag markers are chiral, so a
-  mirrored frame decodes zero tags.
+- VI mirror correction follows the selected sensor: OV5647 defaults to 1
+  (horizontally mirrored); OV9281 defaults to 0. `ARUCO_NANO_MIRROR=0|1`
+  overrides the detected setting.
 - Same live ISP control (stdin commands: `gain`, `exptime`, `ae auto`, `awb`,
   `max-exposure-us` cap via `--max-exposure-us N`).
 
@@ -77,7 +77,7 @@ aruco_nano [--mode strict|tolerant] [--mirror 0|1] [--flip 0|1]
 | variable | default | meaning |
 |---|---|---|
 | `ARUCO_NANO_MODE` | `strict` | `strict` or `tolerant` |
-| `ARUCO_NANO_MIRROR` | `1` | correct the horizontally-mirrored OV5647 |
+| `ARUCO_NANO_MIRROR` | sensor-based | `1` for mirrored OV5647; `0` for unmirrored OV9281 |
 | `ARUCO_NANO_FLIP` | `0` | correct a vertically-mirrored sensor |
 | `ARUCO_NANO_DEBUG` | `1` | verbosity |
 | `ARUCO_NANO_TAG_OUTPUT` | `0` | print a per-second batch of decoded tags on stdout |

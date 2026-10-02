@@ -1,8 +1,10 @@
 # TinyTag training for fewer expensive false ROI proposals
 
-Status: training proposal and decision record, 2026-09-30. No training or loss
-changes are implemented by this document. The training code is external to this
-repository; `tools/tinytag_cvimodel/` converts and validates trained models.
+Status: training proposal and decision record, updated 2026-09-30. The mixed
+six-channel fine-tuning code implements positive box-area cost alongside mined
+empty-proposal cost in `tinytag_mixed_finetune.py`; the notebook records the
+experiment settings. `tools/tinytag_cvimodel/` converts and validates trained
+models.
 
 Both training from random initialization and fine-tuning an existing checkpoint
 are supported by this proposal. Synthetic ground truth and the cost-weighted
@@ -55,7 +57,18 @@ oversized box predictions, margins, and temporal growth. This exceptional case
 should not drive the main design. Nevertheless, a proposal containing a
 supported real tag must not receive an empty-proposal label merely because its
 box has poor IoU with that tag. Correct excessive crop extent through coverage
-and localization supervision.
+and localization supervision, including a direct cost on predicted positive-box
+area. The existing containment and IoU terms preserve localization, but do not
+directly express the operational objective: fewer pixels passed to the crop
+decoder. A measured 971 comparison found that the fine-tuned model produced
+about one third as many ROIs as V4C while total crop pixels stayed similar; its
+mean crop area per ROI was about 2.9 times larger. A follow-up comparison used
+the proposal-first decoder and the same 1.25x expansion on both models, with all mask growth disabled: it
+reduced mean proposals from 13.34 to 4.04 per frame and crop pixels from 94,383
+to 43,196 per frame (54% lower). Its average crop was still about 1.5 times
+larger than V4C's, while decoded recall was 88.9% versus 91.4% (217 versus 223
+of 244 tags). This makes box area an independent optimization target even after
+bounded decoding removes much of the excess crop area.
 
 ## Synthetic data with known ground truth
 
@@ -99,13 +112,17 @@ padding. A small number of false mask cells can form a bridge that creates a
 large bounding box; ordinary pixel-error counts do not capture that cost.
 
 For each training image, extract proposals from the current student or a recent
-mining checkpoint. Identify proposals with no supported ground-truth tag and
-no overlap with ignored/uncertain tag regions. Do not use a low box IoU alone
-to declare a proposal empty. Initially use reviewed cases with clearly no tag
-in the crop. Refresh the mined examples as the model changes.
+mining checkpoint. A proposal that contains or partially overlaps a supported
+tag is not wholly treated as positive: exclude supported-tag cells from its
+negative region and continue mining the remaining empty cells. Exclude ignored
+or uncertain cells the same way. Do not use a low box IoU alone to declare a
+proposal empty. Initially use reviewed cases with clearly no tag in the crop,
+and refresh the mined proposals as the model changes.
 
-Let `R_j` be an empty proposal and `A_j` its full-resolution decoder crop area.
-Define its cost weight as:
+At the model grid resolution, let `R_j` be the proposal's cells that have no
+supported-tag coverage and are not ignored/uncertain, and let `A_j` be the
+proposal's full-resolution decoder crop area. If no eligible cells remain, the
+proposal contributes no false-proposal loss. Define its cost weight as:
 
 ```text
 w_j = clip(A_j / A_ref, w_min, w_max)
@@ -128,12 +145,42 @@ L_false,j = stop_gradient(w_j) * mean over i in R_j [-log(1 - p_i)]
 L_false   = sum of regional penalties / training batch size
 ```
 
+A proposal may overlap a real tag and still incur this penalty on its empty
+cells; cells covered by a supported tag's expanded training box are excluded.
+The current implementation makes this exclusion at stride-8 grid-cell
+resolution, so any cell touched by the supported box is exempt. Ignored and
+uncertain regions are also excluded cell by cell. This preserves positive mask
+supervision while encouraging the proposal mask to avoid unnecessary empty
+area around a tag.
+
 For a known empty region, the target is zero. Before cost weighting, a
 probability of 0.9 incurs loss 2.30, 0.5 incurs 0.69, and 0.1 incurs 0.11.
 Confident mistakes on expensive crops receive more emphasis. Averaging within
 the crop prevents counting crop area twice. Keep a fixed batch normalization;
 normalizing away all cost weights would defeat the intended emphasis. The
 precise reduction, clipping, and overlap handling require experiments.
+
+This mined-empty term alone cannot optimize the size of a crop that contains a
+supported tag: those proposal cells are excluded from false-proposal penalties,
+and proposal geometry is detached during mining. Add a separate differentiable
+positive-box area term, using each supervised target crop as the minimum
+supported area:
+
+```text
+A_pred   = predicted_width * predicted_height
+A_target = target_width * target_height
+L_area   = mean_positive [relu(A_pred - A_target) / A_target]
+L_total  = L_positive + lambda_false * L_false + lambda_area * L_area
+```
+
+The positive containment penalty remains active and penalizes any predicted
+edge that excludes target area; the area term therefore charges only avoidable
+oversize. It acts directly on box width and height, unlike `L_false`, which
+changes mask probability and only influences crop creation indirectly. When a
+fixed expansion ratio is applied at inference to both predicted and target
+boxes, their area ratio is unchanged. Keep the area weight separately
+configurable and validate recall and summed crop pixels on held-out real data;
+the initial notebook value is an experiment setting, not a calibrated constant.
 
 Treat proposal selection and its area as fixed for the step. Backpropagation
 flows through the selected mask probabilities, not through connected components

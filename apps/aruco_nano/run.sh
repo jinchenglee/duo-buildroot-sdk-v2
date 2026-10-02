@@ -6,7 +6,14 @@ set -eu
 
 BIN="${ARUCO_NANO_BIN:-/app/aruco_nano/aruco_nano}"
 MODE="${ARUCO_NANO_MODE:-strict}"
-MIRROR="${ARUCO_NANO_MIRROR:-1}"
+# OV5647 is horizontally mirrored on this board; OV9281 is not. Let an
+# explicit environment override win, otherwise follow the selected sensor.
+DEFAULT_MIRROR=1
+if [ -r /mnt/data/sensor_cfg.ini ] &&
+   grep -Eq '^name[[:space:]]*=[[:space:]]*OV_OV9281_' /mnt/data/sensor_cfg.ini; then
+    DEFAULT_MIRROR=0
+fi
+MIRROR="${ARUCO_NANO_MIRROR:-${DEFAULT_MIRROR}}"
 FLIP="${ARUCO_NANO_FLIP:-0}"
 DEBUG="${ARUCO_NANO_DEBUG:-1}"
 TAG_OUTPUT="${ARUCO_NANO_TAG_OUTPUT:-0}"
@@ -20,9 +27,8 @@ case ":${LD_LIBRARY_PATH:-}:" in
        export LD_LIBRARY_PATH ;;
 esac
 
-# Mirror defaults to 1: the OV5647 module on this board delivers a horizontally
-# mirrored frame, and AprilTag markers are chiral so a mirrored frame decodes
-# zero tags. Set ARUCO_NANO_MIRROR=0 to see the uncorrected image.
+# Mirror follows the selected sensor by default: OV5647 is horizontally
+# mirrored; OV9281 is not. Set ARUCO_NANO_MIRROR=0|1 to override.
 exec "${BIN}" \
     --mode "${MODE}" \
     --mirror "${MIRROR}" \

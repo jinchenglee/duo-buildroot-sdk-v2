@@ -59,7 +59,10 @@ include_directories(${CVI_RTSP_ROOT}/service/3rdparty/nlohmann_json/include)
 # cv::aruco::Dictionary. Compiling that TU standalone avoids pulling in the
 # whole objdetect -> calib3d -> features2d chain, which the board's OpenCV 3.2
 # does not have. See third_party/*/README.md.
+set(OV9281_SENSOR_DIR
+    ${MIDDLEWARE_SDK_ROOT}/component/isp/sensor/cv181x/ov_ov9281)
 include_directories(
+    ${OV9281_SENSOR_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/aruco_nano
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencv_aruco_dict
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencv_aruco_dict/opencv2/objdetect)
@@ -77,13 +80,14 @@ add_executable(aruco_nano
     ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_sensor.c
     ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_bin.c
     ${MIDDLEWARE_SDK_ROOT}/sample/common/sample_common_venc.c
-    ${MIDDLEWARE_SDK_ROOT}/component/isp/common/sensor_list.c)
+    ${MIDDLEWARE_SDK_ROOT}/component/isp/common/sensor_list.c
+    ${OV9281_SENSOR_DIR}/ov9281_cmos.c
+    ${OV9281_SENSOR_DIR}/ov9281_sensor_ctl.c)
 
 # sample_common_sensor.c gates each sensor's entry in its
-# SAMPLE_COMM_SNS_GetSnsObj() switch behind #if defined(SENSOR_xxx). This app
-# is intentionally OV5647-only, like tinytag_detect_live, so it uses the rebuilt
-# libsns_ov5647.so and the exact OV5647 image the tinytag live path sees.
-target_compile_definitions(aruco_nano PRIVATE SENSOR_OV_OV5647)
+# SAMPLE_COMM_SNS_GetSnsObj() switch behind #if defined(SENSOR_xxx). Keep both
+# J2 camera modules available so sensor_cfg.ini can select either one.
+target_compile_definitions(aruco_nano PRIVATE SENSOR_OV_OV5647 SENSOR_OV_OV9281)
 
 target_compile_options(aruco_nano PRIVATE -ffunction-sections -fdata-sections)
 target_link_options(aruco_nano PRIVATE -Wl,--gc-sections)
