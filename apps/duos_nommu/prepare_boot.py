@@ -25,6 +25,25 @@ memory = source / 'include/cvi_board_memmap.h'
 if memory.is_symlink(): memory.unlink()
 memory.write_text(header)
 (out / 'cvi_board_memmap.h').write_text(header)
+# Keep diagnostic access separate from allocator/relocation RAM.
+board = source / 'board/cvitek/cv181x/board.c'
+board_text = board.read_text()
+if 'NOMMU shared log mapping' not in board_text:
+    marker = '\t}, {\n\t\t/* List terminator */'
+    assert board_text.count(marker) == 1
+    board_text = board_text.replace(marker, '''\t}, {
+        /* NOMMU shared log mapping: console/log outside allocator RAM. */
+        .virt = 0x9ffe0000UL,
+        .phys = 0x9ffe0000UL,
+        .size = 0x20000UL,
+        .attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+                 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+\t}, {
+\t\t/* List terminator */''')
+board_text = board_text.replace('.virt = 0x9fff0000UL,', '.virt = 0x9ffe0000UL,')
+board_text = board_text.replace('.phys = 0x9fff0000UL,', '.phys = 0x9ffe0000UL,')
+board_text = board_text.replace('.size = 0x10000UL,', '.size = 0x20000UL,')
+board.write_text(board_text)
 ubout = out / 'uboot'
 ubout.mkdir(exist_ok=True)
 shutil.copyfile(normal / 'build/sg2000_milkv_duos_glibc_arm64_sd/.config', ubout / '.config')
@@ -52,6 +71,11 @@ dts, count = re.subn(r'(\n\s*ion\s*\{.*?compatible = "ion-region";).*?size = <[^
 assert count == 1
 # Reserve wired Ethernet for the later small-core port; USB/Wi-Fi are unchanged.
 dts, count = re.subn(r'(ethernet@4070000\s*\{)', r'\1\n\t\tstatus = "disabled";', dts, count=1)
+assert count == 1
+# NOMMU Linux supplies no FreeRTOS fast-image/ISP handover. The old node
+# points into small-core allocator RAM and its probe dereferences stale
+# firmware pointers, oopsing before the main probe counter is decremented.
+dts, count = re.subn(r'(fast_image\s*\{)', r'\1\n\t\tstatus = "disabled";', dts, count=1)
 assert count == 1
 (fitout / 'main.dts').write_text(dts)
 subprocess.run(['dtc', '-I', 'dts', '-O', 'dtb', '-o', str(fitout / 'sg2000_milkv_duos_glibc_arm64_sd.dtb'),

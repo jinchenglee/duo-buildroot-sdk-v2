@@ -9,8 +9,8 @@
     };
     memory@9e200000 {
         device_type = "memory";
-        /* Last 64 KiB is the shared log, outside allocator-owned RAM. */
-        reg = <0 0x9e200000 0 0x01df0000>;
+        /* Last 128 KiB holds console and log, outside allocator-owned RAM. */
+        reg = <0 0x9e200000 0 0x01de0000>;
     };
     cpus {
         #address-cells = <1>;

@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Pack and verify a matched experimental boot pair, keeping stock outputs intact."""
 from pathlib import Path
-import hashlib, importlib.util, re, shutil, struct, subprocess, tarfile
+import hashlib, importlib.util, os, re, shutil, struct, subprocess, tarfile
 task = Path(__file__).resolve().parent
 sdk = task.parents[1]
 out = task / 'build'
-bundle = out / 'bundle'
+userspace = os.environ.get('NOMMU_USERSPACE') == '1'
+shell = os.environ.get('NOMMU_SHELL') == '1'
+bundle = out / ('bundle-shell' if shell else 'bundle-userspace' if userspace else 'bundle')
+archive_path = out / ('duos-nommu-shell.tar.gz' if shell else 'duos-nommu-userspace.tar.gz' if userspace else 'duos-nommu.tar.gz')
+# These vendor macros come from SDK make variables, not U-Boot's .config.
+# Without them the board boots to soph# with an empty boot command.
+uboot = (out / 'uboot/u-boot.bin').read_bytes()
+assert b'bootcmd=run sdboot\0' in uboot, 'missing vendor SD autoboot environment'
+assert b'sdboot=' in uboot and b'boot.sd' in uboot
+assert b'root=root=/dev/mmcblk0p3 rootwait rw\0' in uboot, 'unexpected SD root arguments'
 stock = sdk / 'install/soc_sg2000_milkv_duos_glibc_arm64_sd'
 rv = sdk / 'host-tools/gcc/riscv64-elf-x86_64/bin/riscv64-unknown-elf-'
 def run(args, **kwargs):
@@ -20,7 +29,7 @@ dtb = (out / 'little.dtb').read_bytes()
 image = (out / 'kernel/arch/riscv/boot/Image').read_bytes()
 assert len(shim) < 0x10000 and len(dtb) < 0x10000
 offset, image_size = struct.unpack_from('<QQ', image, 8)
-assert offset == 0 and len(image) <= image_size < 0x01df0000
+assert offset == 0 and len(image) <= image_size < 0x01de0000
 payload = bytearray(0x200000 + len(image))
 payload[:len(shim)] = shim
 payload[0x20000:0x20000+len(dtb)] = dtb
@@ -70,17 +79,36 @@ assert (out / 'verify-main.dtb').read_bytes() == (fitout / 'sg2000_milkv_duos_gl
 shutil.copyfile(stock / 'fip.bin', bundle / 'fip-restore.bin')
 shutil.copyfile(stock / 'rawimages/boot.sd', bundle / 'boot-restore.sd')
 shutil.copyfile(task / 'README.md', bundle / 'README.md')
+shutil.copyfile(task / 'run_stability.sh', bundle / 'run_stability.sh')
+if userspace:
+    shutil.copyfile(out / 'userspace/init-elf.txt', bundle / 'init-elf.txt')
+    baseline = out / 'bundle'
+    assert 'CONFIG_DUOS_NOMMU_USER_PROBE=y' not in (baseline / 'small-kernel.config').read_text()
+    shutil.copyfile(baseline / 'fip-nommu.bin', bundle / 'fip-kernel-only.bin')
+    # Retain the earlier small-core FIP, but use the fixed main FIT. Earlier
+    # rollback FITs still advertise the invalid FreeRTOS fast-image node.
+    run([dump, '-T', 'flat_dt', '-p', '0', '-o', out / 'verify-rollback-kernel.lzma', baseline / 'boot-nommu.sd'])
+    assert (out / 'verify-rollback-kernel.lzma').read_bytes() == (fitout / 'Image.lzma').read_bytes()
+    shutil.copyfile(bundle / 'boot-nommu.sd', bundle / 'boot-kernel-only.sd')
+if shell:
+    baseline = out / 'bundle-userspace'
+    shutil.copyfile(baseline / 'fip-nommu.bin', bundle / 'fip-user-probe.bin')
+    run([dump, '-T', 'flat_dt', '-p', '0', '-o', out / 'verify-rollback-user.lzma', baseline / 'boot-nommu.sd'])
+    assert (out / 'verify-rollback-user.lzma').read_bytes() == (fitout / 'Image.lzma').read_bytes()
+    shutil.copyfile(bundle / 'boot-nommu.sd', bundle / 'boot-user-probe.sd')
 shutil.copyfile(out / 'kernel/.config', bundle / 'small-kernel.config')
 shutil.copyfile(out / 'kernel-size.txt', bundle / 'kernel-size.txt')
 manifest = ['Verified: only BLCP_2ND and LOADER_2ND FIP payloads changed; DDR/BL2/ATF retained.',
             'Verified: A53 compressed kernel byte-identical; no production rootfs changed.',
             f'Small Image file={len(image)} bytes; including BSS={image_size} bytes.',
             'A53 RAM 480 MiB; ION 140 MiB at 0x95400000; small reservation 32 MiB.',
-            'Built and packaged; hardware boot and userspace NOT yet verified.']
+            ('Diagnostic shell tested; fast-image DT fix passed two warm reboots; longer stability unverified.' if shell else
+             'Libc-free userspace init included; first userspace cold boot verified.'
+             if userspace else 'Kernel-only probe; first cold boot verified, repeated boots and warm reset outstanding.')]
 (bundle / 'BUILD.txt').write_text('\n'.join(manifest)+'\n')
 files = sorted(p for p in bundle.iterdir() if p.is_file() and p.name != 'SHA256SUMS')
 (bundle / 'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in files))
-with tarfile.open(out / 'duos-nommu.tar.gz', 'w:gz') as archive:
+with tarfile.open(archive_path, 'w:gz') as archive:
     archive.add(bundle, arcname='bundle')
 print('\n'.join(manifest))
-print(f'Ready: {out / "duos-nommu.tar.gz"}')
+print(f'Ready: {archive_path}')

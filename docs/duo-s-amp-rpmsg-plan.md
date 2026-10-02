@@ -363,7 +363,9 @@ no ordinary `fork()`, restricted `clone()` and `mmap()`, and contiguous backing
 allocations [13]. Linux threads and some POSIX interfaces may still be useful;
 MMU absence does not prohibit C++ or every threaded program. The port and
 dependency audit would decide whether it provides any advantage over an RTOS.
-No working SG2000 C906L NOMMU Linux image was verified in this investigation.
+At the initial investigation no working SG2000 C906L NOMMU image had been
+verified. The local kernel-only v6.18 probe subsequently passed one cold boot
+on 2026-10-02 (see the implementation status below).
 There is, however, a directly relevant prior bring-up report: Jisheng Zhang's
 April 2024 Linux patch series states that NOMMU Linux runs on the original
 CV1800B Milk-V Duo's little core with the patches and a suitable DTS [17].
@@ -401,6 +403,12 @@ The practical limitations are:
   use `BINFMT_FLAT`: investigate a static bFLT/elf2flt userspace build, rather
   than copying conventional ELF executables/shared libraries. This statement
   concerns this SDK tree, not every future RISC-V Linux version.
+  The separate v6.18 experiment does support RISC-V through
+  `BINFMT_ELF_FDPIC`, including non-FDPIC static ET_DYN binaries. Its optional
+  libc-free PIE `/init`, embedded in an initramfs, passed its first cold boot
+  on 2026-10-02: PID 1 user-mode entry, page allocation/check/release and
+  monotonic timing/sleep progressed alongside the kernel heartbeat. This does
+  not establish compatibility with existing libc or media libraries.
 - POSIX threads are not inherently excluded. This Buildroot's
   `package/uclibc/Config.in` offers LinuxThreads without MMU, while its NPTL
   choice has an MMU/FDPIC condition. Actual RISC-V runtime/toolchain behavior
@@ -455,8 +463,16 @@ for a NOMMU experiment; it does not establish Linux kernel or userspace support.
 
 **Candidate baseline: a separate Linux v6.18 tree with explicit T-Head timer
 fixes.** The opt-in implementation is now cross-built under
-[`apps/duos_nommu`](../apps/duos_nommu/README.md). Hardware boot and userspace
-are not yet verified.
+[`apps/duos_nommu`](../apps/duos_nommu/README.md). One hardware cold boot is
+verified: stage 3, 20 successful allocation heartbeats, a 25 MHz CLINT timer,
+zero recorded traps and a completed main-core boot mailbox reply, alongside
+responsive A53 Linux. A subsequent minimal userspace cold boot also passed:
+libc-free PIE PID 1, allocation cycles and monotonic timing/sleep progressed.
+The kernel-only one-minute check advanced heartbeat 845 to 903 without
+recorded traps. Repeated-boot and longer userspace stability remain unverified;
+warm reboot initially stalled because the old FreeRTOS fast-image DT node
+caused a probe oops, leaving the active probe count nonzero. Disabling that
+node in the experimental DT passed two warm reboots to the Linux prompt.
 
 - Audited upstream v6.12 still hardcodes the NOMMU RAM base and uses ordinary
   memory-mapped CLINT time reads plus RV64 compare writes. Do not assume the
@@ -577,8 +593,12 @@ Acceptance: main Linux remains responsive; repeated cold boots reach the
 chosen milestone; timer/scheduling works; no unexpected traps or memory
 overlap occurs. Record actual image/BSS/reserved/used RAM and console logs.
 Keep the original matched FIP/main-kernel/DT boot set available for recovery.
-The isolated kernel-only probe is built and packaged; its hardware boot has
-not yet been verified. The separate bare-metal threshold diagnostic has been
+The isolated kernel-only probe passed its first cold boot on 2026-10-02;
+the subsequent libc-free userspace probe also passed one cold boot. Repeated
+cold-boot stress and application/libc compatibility remain outstanding. The
+diagnostic shell passed, and the fast-image DT fix passed two warm resets. Missing
+vendor U-Boot SD autoboot flags and an unmapped diagnostic-log address were
+identified and corrected during bring-up. The separate bare-metal threshold diagnostic has been
 built and tested. Build, installation, log retrieval and recovery instructions
 are in [`apps/duos_nommu/README.md`](../apps/duos_nommu/README.md).
 

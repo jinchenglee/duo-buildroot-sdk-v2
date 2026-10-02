@@ -33,6 +33,7 @@ with (root / 'drivers/clocksource/timer-clint.c').open('a') as out:
     out.write('\nTIMER_OF_DECLARE(duos_clint, "thead,c900-clint", clint_timer_init_dt);\n')
 with (root / 'drivers/tty/serial/Makefile').open('a') as out:
     out.write('\nobj-$(CONFIG_DUOS_NOMMU_PROBE) += duos_nommu.o\n')
+    out.write('obj-$(CONFIG_DUOS_NOMMU_SHELL) += duos_nommu_console.o\n')
 with (root / 'drivers/tty/serial/Kconfig').open('a') as out:
     out.write('''
 config DUOS_NOMMU_PROBE
@@ -41,12 +42,23 @@ config DUOS_NOMMU_PROBE
 	select SERIAL_EARLYCON
 	select SERIAL_CORE
 	select SERIAL_CORE_CONSOLE
+
+config DUOS_NOMMU_USER_PROBE
+	bool "Run the isolated libc-free userspace init"
+	depends on DUOS_NOMMU_PROBE
+
+config DUOS_NOMMU_SHELL
+	bool "Shared-memory userspace diagnostic shell"
+	depends on DUOS_NOMMU_USER_PROBE
 ''')
 shutil.copyfile(source / 'platform.c', root / 'drivers/tty/serial/duos_nommu.c')
 shutil.copyfile(source / 'log.h', root / 'drivers/tty/serial/duos_nommu_log.h')
+shutil.copyfile(source / 'console.c', root / 'drivers/tty/serial/duos_nommu_console.c')
+shutil.copyfile(source / 'console.h', root / 'drivers/tty/serial/duos_nommu_console.h')
 # Keep kernel PID 1 alive without claiming a successful userspace boot.
 replace('init/main.c', '\tdo_sysctl_args();\n', '''\tdo_sysctl_args();
-	if (IS_ENABLED(CONFIG_DUOS_NOMMU_PROBE)) {
+	if (IS_ENABLED(CONFIG_DUOS_NOMMU_PROBE) &&
+	    !IS_ENABLED(CONFIG_DUOS_NOMMU_USER_PROBE)) {
 		pr_info("duos-nommu: PID 1 remains a kernel task; userspace not attempted\\n");
 		for (;;) msleep(1000);
 	}
